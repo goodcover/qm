@@ -93,6 +93,36 @@ publishing to a Goodcover-owned registry, and updating the immutable image
 references in ops after validation. No automatic deployment or image publishing
 pipeline is enabled by this setup.
 
+## Enable Claude Code alongside Codex
+
+The deployed core already includes the Claude Code harness. Adding a token to
+Keychain does not automatically approve the harness or connect the credential
+to core. These are separate settings:
+
+| Setting                                       | Value                                    |
+| --------------------------------------------- | ---------------------------------------- |
+| Keychain credential environment-variable name | `CLAUDE_CODE_OAUTH_TOKEN`                |
+| Core `CLAUDE_AUTH_CREDENTIAL`                 | The keychain entry's ID, never its token |
+| Organization `approved-harnesses`             | `codex` and `claude`                     |
+| Core `HARNESS`                                | `codex`, preserving the existing default |
+
+`CLAUDE_MODEL=claude-sonnet-5` sets Claude's fallback model. Core reads these
+configuration references at startup. Apply the ops ConfigMap and restart only
+core after active jobs finish. Set the organization approval through QM's admin
+API at `PUT /v1/admin/scopes/org%3Agoodcover/approved-harnesses` with
+`{"ids":["codex","claude"]}`, preserving any other intentionally approved IDs.
+
+After enabling, refresh QM, open the **Codex** harness picker beside the model
+picker in the chat composer, and select **Claude Code**, then a Claude model.
+In the compact/mobile layout, open **Session settings** to find **Harness**.
+This chooses the harness for the conversation; **Make default** changes the
+scope's default. Leave that action unused to retain the existing Codex default.
+
+Validate with an isolated Claude reply, QM title presence, and persisted turns;
+archive the verification conversation afterward. Keep token values in QM's
+encrypted keychain. The setup-token credential has no refresh token, so replace
+it when expired or revoked. The entry's ID is safe to keep in ops configuration.
+
 ## Upstream updates and CI
 
 `origin` points to `goodcover/qm`; `upstream` points to `yc-software/qm`. Only main
