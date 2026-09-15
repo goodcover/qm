@@ -1,3 +1,9 @@
+# Goodcover QM
+
+Private Goodcover source fork. Start with the [Goodcover runbook](deploy/layers/goodcover/README.md)
+for local builds and the existing GC4 EKS deployment. Production image pins and
+infrastructure remain in `goodcover/ops`. Upstream documentation follows.
+
 # qm
 
 A multiplayer agent harness for work. In Slack and on the web.

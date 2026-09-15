@@ -9,6 +9,7 @@ concurrency:
 
 jobs:
   preflight:
+    if: github.repository == 'yc-software/qm'
     name: Preflight
     runs-on: ubuntu-latest
     permissions:
@@ -53,6 +54,7 @@ jobs:
           printf 'tag=%s\nversion=%s\n' "$tag" "$version" >> "$GITHUB_OUTPUT"
 
   images:
+    if: github.repository == 'yc-software/qm'
     name: Images
     needs: preflight
     permissions:
@@ -62,6 +64,7 @@ jobs:
     uses: ./.github/workflows/release-package.yml
 
   cli:
+    if: github.repository == 'yc-software/qm'
     name: CLI
     needs:
       - preflight
@@ -75,6 +78,7 @@ jobs:
       version: ${{ needs.preflight.outputs.version }}
 
   release:
+    if: github.repository == 'yc-software/qm'
     name: Tag and publish the release
     needs:
       - preflight
