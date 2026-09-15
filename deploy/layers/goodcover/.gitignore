@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.example
+*.secret.yaml
+*.pem
+*.key
+.local/
+node_modules/
+*.tfstate
+*.tfstate.*
+*.tfplan
+.terraform/

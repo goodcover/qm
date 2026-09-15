@@ -1,0 +1,18 @@
+{
+  "qmVersion": "0.1.11",
+  "sourceCommit": "51bf455ea414a58f70274284ce212142518e556a",
+  "services": {
+    "core": "ghcr.io/yc-software/qm/core@sha256:5624e031ecbd00799040d3f614b9d70aee266895ecaf07a980357169054f51b7",
+    "web-ui": "ghcr.io/yc-software/qm/web-ui@sha256:8065caa09146a0b7af81f810d4e773bc839cfc94f3e08200075aa5986db143a4",
+    "portal": "ghcr.io/yc-software/qm/portal@sha256:767c4c36b2a8f1a477003e153b4057fc27324c08bb263e52e17bf1ce4c319e95"
+  },
+  "microvm": {
+    "imageArn": "arn:aws:lambda:us-west-2:008562636938:microvm-image:gc4-qm-sandbox",
+    "version": "4.0",
+    "architecture": "ARM_64",
+    "minimumMemoryInMiB": 2048,
+    "archiveSha256": "b4af33a280323ec53de3284d05d9610405226e5735e2cecaf89165f000c1604f",
+    "additionalOsCapabilities": ["ALL"],
+    "dnsGateway": "172.16.31.250"
+  }
+}

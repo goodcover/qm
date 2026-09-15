@@ -1,0 +1,106 @@
+# Goodcover QM
+
+QM source and customizations live in this private repository. The working checkout
+is `~/projects/qm`. Production is <https://qm.gc4.infra.goodcover.com>.
+
+## Repository responsibilities
+
+| Location                   | Owns                                                                                                |
+| -------------------------- | --------------------------------------------------------------------------------------------------- |
+| This source tree           | QM application changes and source builds                                                            |
+| `deploy/layers/goodcover/` | Goodcover sandbox customization and operator entry points                                           |
+| `../ops/gc4/packages/qm/`  | Live Kubernetes manifests, image pins, encrypted secrets, gateway operations and deployment history |
+| `../ops/gc4/env/qm*.tf`    | AWS resources, managed with GC4's Terraform 1.5.7 environment                                       |
+
+The ops checkout is required for production operations. Set `--ops-root` on the
+operator command when it is not a sibling of this checkout. Secrets stay in ops;
+this repository has no git-crypt configuration.
+
+The existing EKS deployment predates this source fork. It does not use the
+upstream CLI's AWS/ECS provisioning path. Do not run `qm up --target aws` to update
+GC4. No ECS infrastructure or new resources are needed for this repository setup.
+
+## Work locally
+
+```sh
+cd ~/projects/qm
+npm ci --ignore-scripts --no-audit --no-fund
+git switch -c goodcover/my-change
+npm run typecheck
+npm run lint
+```
+
+Run the tests affected by a change. Install plugin dependencies in the relevant
+plugin directory when working on a surface. Follow the root AGENTS.md review
+requirements before merging. Keep org configuration, skills, and sandbox changes
+under this layer; edit application source where the behavior belongs.
+
+## Operate the current deployment
+
+```sh
+python3 deploy/layers/goodcover/ops.py status
+python3 deploy/layers/goodcover/ops.py images
+```
+
+The following explicitly reapplies the existing ops manifests and restarts the
+three app services. It requires an authorized, decrypted ops checkout:
+
+```sh
+python3 deploy/layers/goodcover/ops.py deploy
+```
+
+`ops.py network-test` tests an already-created isolated canary. It does not create
+one or select a user's computer. Canary creation and retirement are documented
+in `../ops/gc4/packages/qm/network/README.md`.
+
+## Sandbox source builds
+
+`sandbox/microvm-runtime.mjs` carries the deployed DNS behavior: AWS run and resume
+hooks bind a guest-local resolver file over `/etc/resolv.conf`, directing DNS to
+the dedicated gateway at `172.16.31.250`. The image requires `ALL` additional guest
+OS capabilities. Gateway infrastructure and enrollment credentials stay in ops.
+
+Build an archive locally, using **this checkout's** `aws/microvm-agent/Dockerfile`
+and `agent.mjs`, plus the Goodcover wrapper:
+
+```sh
+python3 deploy/layers/goodcover/build-image.py
+```
+
+This prints its SHA-256 and saves `.local/gateway-image.zip`. It makes no AWS
+calls. After authorizing an image update, `--publish` uploads the archive to the
+existing bucket and creates a new version of the existing MicroVM image. It
+preserves the explicit CPU, memory, logging, capability, and lifecycle settings.
+It does not switch active computers or change production version pins. Wait for
+the image to become ACTIVE, test an isolated canary, then review the ops pin
+change and migration separately. Follow the snapshot and rollback procedure in
+the ops network runbook.
+
+The copied wrapper has formatting changes, so this source archive is not a
+byte-for-byte reproduction of deployed version 4.0. The original npm-pinned
+builder in ops remains the record of that release. New sandbox work belongs here.
+
+## Application builds and production versions
+
+`deployed-baseline.json` records the production pins at fork setup, including
+QM package 0.1.11, its source commit, and MicroVM version 4.0. It is historical;
+`ops.py images` reads the authoritative current pins from ops.
+
+The source checkout was seeded from upstream main. It is newer than the deployed
+release. Importing this source does not upgrade production. Application source
+changes require building the affected service Dockerfiles under `deploy/`,
+publishing to a Goodcover-owned registry, and updating the immutable image
+references in ops after validation. No automatic deployment or image publishing
+pipeline is enabled by this setup.
+
+## Upstream updates and CI
+
+`origin` points to `goodcover/qm`; `upstream` points to `yc-software/qm`. Only main
+was imported. Use the upstream `update-qm` skill for updates and preserve merge
+ancestry when landing sync PRs. Contributions upstream are optional and use the
+`upstream-pr` workflow to exclude private deployment material.
+
+GitHub Actions is disabled for this repository. The inherited release and package
+publishing jobs also require `github.repository == 'yc-software/qm'`. Review the
+remaining CI and publishing destinations before enabling Actions. This setup
+does not add credentials to GitHub or publish any images or packages.
