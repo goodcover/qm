@@ -14,7 +14,7 @@ function slice(from: string, to: string): string {
 
 function resolveView(pathname: string, search: string): string {
   const src = [
-    slice("const SECTIONS = [", "const DISABLED_VIEWS"),
+    slice("const SECTIONS = [", "function paritySubsection"),
     slice("const DEFAULT_VIEW = ", ";") + ";",
     slice("function decodePathSegment(seg) {", "let transcriptObserver"),
     "urlToState().view;",
@@ -177,4 +177,10 @@ test("cold catalog preserves the configured dynamic model and its provider", asy
   );
   assert.equal(elements["onboarding-model-provider"].value, "openrouter");
   assert.equal(elements["onboarding-model-id"].value, model.id);
+});
+
+test("upfront Slack links select connectors before launching, including completion", () => {
+  for (const step of ["setup", "install", "connected"])
+    assert.equal(resolveView("/admin", `?slack=${step}`), "connectors");
+  assert.equal(resolveView("/admin", "?slack=unknown"), "history");
 });

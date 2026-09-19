@@ -158,3 +158,12 @@ test("MCP server administration forwards OAuth configuration through the signed 
   assert.equal(calls.at(-1)!.url, "/v1/admin/mcp-servers");
   assert.equal((await fetch(`${base}/api/mcp-servers`)).status, 401);
 });
+
+test("GET credential usage forwards the scoped path with signed admin identity", async () => {
+  const response = await fetch(`${base}/api/scopes/org%3Aacme/credential-usage`, { headers: { cookie: ADMIN } });
+  assert.equal(response.status, 200);
+  const call = calls.at(-1)!;
+  assert.equal(call.url, "/v1/admin/scopes/org%3Aacme/credential-usage");
+  assert.equal(call.actor, "U-admin@acme");
+  assert.equal(call.signed, true);
+});

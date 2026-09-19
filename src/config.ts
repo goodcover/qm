@@ -1,3 +1,4 @@
+import { isStrongSigningSecret } from "./auth/source-auth.ts";
 import { parseScopeId } from "./types.ts";
 import type { SandboxScopeDefaults } from "./sandbox/sandbox-routing.ts";
 import { existsSync, readdirSync } from "node:fs";
@@ -41,9 +42,11 @@ import {
 import { resolveSwarmSettings, type SwarmSettings } from "./swarms/swarm-settings.ts";
 
 export interface Config {
+  productAnalytics?: { apiKey: string; host?: string };
   slackContextSource?: SlackContextSource;
   suggestedActivitiesEnabled?: boolean;
   suggestedActivitiesContext?: string;
+  swarmsEnabled?: boolean;
   swarmDefaults?: SwarmSettings;
   production: boolean;
   allowUnauthenticatedCore: boolean;
@@ -63,8 +66,9 @@ export interface Config {
   sandboxResourcesEnabled: boolean;
   sharingPosture: SharingPosture;
   sandboxScopeDefaults?: SandboxScopeDefaults;
-  sandboxBackend: "aws" | "local" | "sprites" | "smolmachines" | "e2b" | "modal" | "porter" | "agent37";
-  sandboxSecondaryBackend?: "aws" | "local" | "sprites" | "smolmachines" | "e2b" | "modal" | "porter" | "agent37";
+  sandboxBackend: "aws" | "local" | "sprites" | "smolmachines" | "e2b" | "modal" | "porter" | "agent37" | "superserve";
+  sandboxSecondaryBackend?:
+    "aws" | "local" | "sprites" | "smolmachines" | "e2b" | "modal" | "porter" | "agent37" | "superserve";
   deployProvider: "docker" | "aws" | "fly" | "porter";
   egressServiceHosts?: string[];
   brandingDefault?: OrgBranding;
@@ -113,6 +117,8 @@ export interface Config {
   backgroundJobTtlMs: number;
   backgroundJobTtlMaxMs: number;
   backgroundWorkEnabled: boolean;
+  backgroundDeploymentId?: string;
+  deploymentControlSecret?: string;
   buildSha?: string;
   ecsTaskProtection: boolean;
   ecsAgentUri?: string;
@@ -150,6 +156,7 @@ export interface Config {
   deployDialTimeoutMs: number;
   deployAppsSessionSecret?: string;
   deployAppsLoginUrl?: string;
+  deployAppsLoginPath?: "/auth/login" | "/auth/trusted/login";
   deepIdleMachineMs: number;
   devIdleMachineMs: number;
   cronFireConcurrency: number;
@@ -188,6 +195,7 @@ export interface Config {
   spritesSandbox: SpritesSandboxEnv;
   smolmachinesSandbox: SmolmachinesSandboxEnv;
   agent37Sandbox: Agent37SandboxEnv;
+  superserveSandbox: SuperserveSandboxEnv;
   e2bSandbox: E2bSandboxEnv;
   modalSandbox: ModalSandboxEnv;
   porterSandbox: PorterSandboxEnv;
@@ -594,6 +602,58 @@ function agent37SandboxEnv(env: NodeJS.ProcessEnv): Agent37SandboxEnv {
   };
 }
 
+interface SuperserveSandboxEnv {
+  apiKey?: string;
+  baseUrl?: string;
+  namePrefix?: string;
+  template?: string;
+  homeDir?: string;
+  idlePauseSec?: number;
+  retentionSec?: number;
+  egressAllow?: string[];
+  egressDeny?: string[];
+  defaultTimeoutSec?: number;
+  configGeneration?: number;
+}
+
+const csvList = (value: string | undefined): string[] | undefined => {
+  const items = (value ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return items.length ? items : undefined;
+};
+
+function superserveSandboxEnv(env: NodeJS.ProcessEnv): SuperserveSandboxEnv {
+  const egressAllow = csvList(env.SUPERSERVE_EGRESS_ALLOW);
+  const egressDeny = csvList(env.SUPERSERVE_EGRESS_DENY);
+  const configGeneration = numEnvStrict("SUPERSERVE_CONFIG_GENERATION", env.SUPERSERVE_CONFIG_GENERATION);
+  if (configGeneration !== undefined && (!Number.isSafeInteger(configGeneration) || configGeneration < 0)) {
+    throw new Error(
+      `SUPERSERVE_CONFIG_GENERATION=${JSON.stringify(env.SUPERSERVE_CONFIG_GENERATION)} must be a nonnegative safe integer, or unset it.`,
+    );
+  }
+  return {
+    ...(env.SUPERSERVE_API_KEY ? { apiKey: env.SUPERSERVE_API_KEY } : {}),
+    ...(env.SUPERSERVE_BASE_URL?.trim() ? { baseUrl: env.SUPERSERVE_BASE_URL.trim() } : {}),
+    ...(env.SUPERSERVE_NAME_PREFIX ? { namePrefix: env.SUPERSERVE_NAME_PREFIX } : {}),
+    ...(env.SUPERSERVE_TEMPLATE?.trim() ? { template: env.SUPERSERVE_TEMPLATE.trim() } : {}),
+    ...(env.SUPERSERVE_HOME_DIR ? { homeDir: env.SUPERSERVE_HOME_DIR } : {}),
+    ...(numEnvStrict("SUPERSERVE_IDLE_PAUSE_SEC", env.SUPERSERVE_IDLE_PAUSE_SEC) !== undefined
+      ? { idlePauseSec: numEnvStrict("SUPERSERVE_IDLE_PAUSE_SEC", env.SUPERSERVE_IDLE_PAUSE_SEC) }
+      : {}),
+    ...(numEnvStrict("SUPERSERVE_RETENTION_SEC", env.SUPERSERVE_RETENTION_SEC) !== undefined
+      ? { retentionSec: numEnvStrict("SUPERSERVE_RETENTION_SEC", env.SUPERSERVE_RETENTION_SEC) }
+      : {}),
+    ...(egressAllow ? { egressAllow } : {}),
+    ...(egressDeny ? { egressDeny } : {}),
+    ...(numEnvStrict("SANDBOX_TIMEOUT_SEC", env.SANDBOX_TIMEOUT_SEC) !== undefined
+      ? { defaultTimeoutSec: numEnvStrict("SANDBOX_TIMEOUT_SEC", env.SANDBOX_TIMEOUT_SEC) }
+      : {}),
+    ...(configGeneration !== undefined ? { configGeneration } : {}),
+  };
+}
+
 interface AwsDeployEnv {
   region: string;
   profile?: string;
@@ -620,7 +680,11 @@ interface AwsDeployEnv {
 function deployAppsEnv(
   env: NodeJS.ProcessEnv,
   defaultLoginUrl: string | undefined,
-): { deployAppsSessionSecret?: string; deployAppsLoginUrl?: string } {
+): {
+  deployAppsSessionSecret?: string;
+  deployAppsLoginUrl?: string;
+  deployAppsLoginPath?: "/auth/login" | "/auth/trusted/login";
+} {
   const explicit = env.DEPLOY_APPS_SESSION_SECRET;
   const shared = env.PORTAL_SESSION_SECRET;
   const loginUrl = env.DEPLOY_APPS_LOGIN_URL ?? (explicit || shared ? defaultLoginUrl : undefined);
@@ -631,8 +695,16 @@ function deployAppsEnv(
     throw new Error("DEPLOY_APPS_SESSION_SECRET needs a sign-in address — set DEPLOY_APPS_LOGIN_URL or PUBLIC_WEB_URL");
   }
   const secret = explicit ?? (loginUrl ? shared : undefined);
+  const loginPath = env.DEPLOY_APPS_LOGIN_PATH ?? "/auth/login";
+  if (loginPath !== "/auth/login" && loginPath !== "/auth/trusted/login") {
+    throw new Error("DEPLOY_APPS_LOGIN_PATH must be /auth/login or /auth/trusted/login");
+  }
   if (!secret || !loginUrl) return {};
-  return { deployAppsSessionSecret: secret, deployAppsLoginUrl: loginUrl.replace(/\/$/, "") };
+  return {
+    deployAppsSessionSecret: secret,
+    deployAppsLoginUrl: loginUrl.replace(/\/$/, ""),
+    deployAppsLoginPath: loginPath,
+  };
 }
 
 const SHARED_PLATFORM_SUFFIXES = [
@@ -870,6 +942,7 @@ export function enabledSandboxBackends(config: Config): Array<Config["sandboxBac
     sprites: Boolean(config.spritesSandbox?.token),
     smolmachines: Boolean(config.smolmachinesSandbox?.token),
     agent37: Boolean(config.agent37Sandbox?.apiKey),
+    superserve: Boolean(config.superserveSandbox?.apiKey && config.superserveSandbox?.template),
     e2b: Boolean(config.e2bSandbox?.apiKey),
     modal: Boolean(config.modalSandbox?.tokenId && config.modalSandbox?.tokenSecret),
     aws: Boolean(config.awsSandbox?.s3Bucket),
@@ -893,11 +966,12 @@ function sandboxBackendEnvStrict(value: string | undefined, name = "SANDBOX_BACK
     backend === "e2b" ||
     backend === "modal" ||
     backend === "agent37" ||
+    backend === "superserve" ||
     backend === "porter"
   )
     return backend;
   throw new Error(
-    `${name}=${JSON.stringify(value)} is not recognized — use aws, local, sprites, smolmachines, e2b, modal, porter, or agent37, or unset it.`,
+    `${name}=${JSON.stringify(value)} is not recognized — use aws, local, sprites, smolmachines, e2b, modal, porter, agent37, or superserve, or unset it.`,
   );
 }
 
@@ -1010,6 +1084,19 @@ function modelProviderEnvStrict(env: NodeJS.ProcessEnv): ModelProvider | undefin
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
+  if (env.BACKGROUND_DEPLOYMENT_ID !== undefined) {
+    if (!env.BACKGROUND_DEPLOYMENT_ID.trim() || env.BACKGROUND_DEPLOYMENT_ID.length > 256)
+      throw new Error("BACKGROUND_DEPLOYMENT_ID must be nonempty and at most 256 characters");
+    if (!env.DATABASE_URL) throw new Error("Background ownership requires DATABASE_URL");
+    if (
+      !isStrongSigningSecret(env.CORE_SIGNING_SECRET) ||
+      !isStrongSigningSecret(env.DEPLOYMENT_CONTROL_SECRET) ||
+      env.DEPLOYMENT_CONTROL_SECRET === env.CORE_SIGNING_SECRET
+    )
+      throw new Error(
+        "Background ownership requires a distinct DEPLOYMENT_CONTROL_SECRET of at least 32 characters and CORE_SIGNING_SECRET",
+      );
+  }
   const swarmDefaults = resolveSwarmSettings(
     env.SWARM_DEFAULTS === undefined ? undefined : JSON.parse(env.SWARM_DEFAULTS),
   );
@@ -1091,7 +1178,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   }
   if (env.NODE_ENV === "production" && !env.SANDBOX_BACKEND?.trim()) {
     throw new Error(
-      "SANDBOX_BACKEND must be set explicitly in production — use sprites, smolmachines, e2b, modal, porter, agent37, aws, or local.",
+      "SANDBOX_BACKEND must be set explicitly in production — use sprites, smolmachines, e2b, modal, porter, agent37, superserve, aws, or local.",
     );
   }
   const sandboxBackend = sandboxBackendEnvStrict(env.SANDBOX_BACKEND);
@@ -1106,6 +1193,20 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
         throw new Error("Invalid SANDBOX_SCOPE_BACKENDS entry: " + kind);
       sandboxScopeDefaults[parsed] = sandboxBackendEnvStrict(value, "SANDBOX_SCOPE_BACKENDS." + kind);
     }
+  }
+  const superserveSelected =
+    sandboxBackend === "superserve" || Object.values(sandboxScopeDefaults).includes("superserve");
+  if (superserveSelected && !env.SUPERSERVE_TEMPLATE?.trim()) {
+    throw new Error(
+      "SANDBOX_BACKEND=superserve requires SUPERSERVE_TEMPLATE, the ready qm-agent-<release> template that carries the agent toolchain.",
+    );
+  }
+  const superserveEnabled =
+    superserveSelected || Boolean(env.SUPERSERVE_API_KEY?.trim() && env.SUPERSERVE_TEMPLATE?.trim());
+  if (superserveEnabled && env.NODE_ENV === "production" && !env.DATABASE_URL?.trim()) {
+    throw new Error(
+      "the superserve sandbox backend requires DATABASE_URL in production: the config generation and the provisioning lock have to be durable across instances, or a blue-green rollout can destroy a scope's resident disk.",
+    );
   }
 
   if (env.SANDBOX_SECONDARY_BACKEND?.trim()) {
@@ -1166,7 +1267,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     throw new Error("SECURITY_SCREEN_TIMEOUT_MS must be a positive integer no greater than 2147483647");
   }
   const publicApiUrl = env.PUBLIC_API_URL ?? env.AGENT_API_URL;
-  const publicUrl = env.PUBLIC_WEB_URL ?? publicApiUrl;
+  const publicUrl = env.PUBLIC_WEB_URL || publicApiUrl;
   const deployProvider = env.DEPLOY_PROVIDER ?? "docker";
   if (
     deployProvider !== "aws" &&
@@ -1250,6 +1351,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     port: numEnvStrict("PORT", env.PORT) ?? CONFIG_DEFAULTS.port,
     dataDir,
     orgId: env.ORG_ID ?? DEFAULT_ORG_ID,
+    ...(env.POSTHOG_API_KEY?.trim()
+      ? { productAnalytics: { apiKey: env.POSTHOG_API_KEY.trim(), host: env.POSTHOG_HOST?.trim() } }
+      : {}),
     sessionStore: env.SESSION_STORE === "postgres" ? "postgres" : "memory",
     ...(env.DATABASE_URL ? { databaseUrl: env.DATABASE_URL } : {}),
     ...(env.DATABASE_POOL_URL ? { databasePoolUrl: env.DATABASE_POOL_URL } : {}),
@@ -1347,6 +1451,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     execTimeoutMaxMs:
       (numEnvStrict("EXEC_TIMEOUT_MAX_SEC", env.EXEC_TIMEOUT_MAX_SEC) ?? CONFIG_DEFAULTS.execTimeoutMaxSec) * 1000,
     turnWallClockMs,
+    swarmsEnabled: boolEnvStrict("SWARMS_ENABLED", env.SWARMS_ENABLED) ?? true,
     swarmDefaults,
     runMaxAgeMs,
     runWaitMs: (turnWallClockMs > 0 ? turnWallClockMs : runMaxAgeMs) + 60_000,
@@ -1358,6 +1463,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
         CONFIG_DEFAULTS.backgroundJobTtlMaxSec) * 1000,
     backgroundWorkEnabled:
       boolEnvStrict("BACKGROUND_WORK_ENABLED", env.BACKGROUND_WORK_ENABLED) ?? CONFIG_DEFAULTS.backgroundWorkEnabled,
+    ...(env.BACKGROUND_DEPLOYMENT_ID
+      ? { backgroundDeploymentId: env.BACKGROUND_DEPLOYMENT_ID, deploymentControlSecret: env.DEPLOYMENT_CONTROL_SECRET }
+      : {}),
     ...(env.GIT_SHA ? { buildSha: env.GIT_SHA } : {}),
     ecsTaskProtection: boolEnvStrict("ECS_TASK_PROTECTION", env.ECS_TASK_PROTECTION) ?? true,
     ...(env.ECS_AGENT_URI ? { ecsAgentUri: env.ECS_AGENT_URI } : {}),
@@ -1447,6 +1555,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     spritesSandbox: spritesSandboxEnv(env),
     smolmachinesSandbox: smolmachinesSandboxEnv(env),
     agent37Sandbox: agent37SandboxEnv(env),
+    superserveSandbox: superserveSandboxEnv(env),
     porterSandbox: porterSandboxEnv(env),
     porterDeploy: porterDeployEnv(env),
     e2bSandbox: e2bSandboxEnv(env),

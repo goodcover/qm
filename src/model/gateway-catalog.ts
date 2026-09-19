@@ -1,6 +1,6 @@
-import type { Api, Model } from "@earendil-works/pi-ai";
 import type { ModelGatewayTransportConfig } from "./provider-endpoints.ts";
-import { GATEWAY_MODEL_PREFIX, GATEWAY_PROVIDER, setGatewayModels } from "./gateway-models.ts";
+import { GATEWAY_MODEL_PREFIX, GATEWAY_PROVIDER, setGatewayModels, type GatewayModel } from "./gateway-models.ts";
+import { modelOfferedInWebui, selectableBaseModels } from "./pi-models.ts";
 
 const MAX_BYTES = 2 * 1024 * 1024;
 const MAX_MODELS = 1_000;
@@ -27,7 +27,7 @@ function price(value: unknown): number | undefined {
     : undefined;
 }
 
-function parseModel(value: unknown, allowed: Set<string>, baseUrl: string): Model<Api> | undefined {
+function parseModel(value: unknown, allowed: Set<string>, baseUrl: string): GatewayModel | undefined {
   const info = record(value);
   if (!info || !modelId(info.model_group) || !allowed.has(info.model_group)) return undefined;
   if (info.mode !== "chat" || info.supports_function_calling !== true) return undefined;
@@ -40,11 +40,21 @@ function parseModel(value: unknown, allowed: Set<string>, baseUrl: string): Mode
   const providers = Array.isArray(info.providers) ? info.providers : [];
   const anthropic = providers.length > 0 && providers.every((provider) => provider === "anthropic");
   const openai = providers.length > 0 && providers.every((provider) => provider === "openai" || provider === "azure");
+  const pdf =
+    providers.length > 0 &&
+    providers.every((provider) => ["anthropic", "openai", "azure", "gemini", "vertex_ai"].includes(String(provider)));
+  let api: GatewayModel["api"] = "openai-completions";
+  if (anthropic) api = "anthropic-messages";
+  else if (openai) api = "openai-responses";
+  let documentInput: GatewayModel["documentInput"];
+  if (openai) documentInput = "files";
+  else if (pdf) documentInput = "pdf";
   return {
+    documentInput,
     id: GATEWAY_MODEL_PREFIX + info.model_group,
     name: info.model_group,
     provider: GATEWAY_PROVIDER,
-    api: anthropic ? "anthropic-messages" : "openai-completions",
+    api,
     baseUrl: anthropic ? baseUrl.replace(/\/v1$/, "") : baseUrl,
     reasoning: (anthropic || openai) && info.supports_reasoning === true,
     input: info.supports_vision === true ? ["text", "image"] : ["text"],
@@ -159,7 +169,19 @@ export function createGatewayCatalog(
         discovered = true;
         expiresAt = now() + TTL_MS;
         retryAt = expiresAt;
-        setGatewayModels(models);
+        const offeredAliases = new Set(
+          selectableBaseModels()
+            .filter(({ id }) => modelOfferedInWebui(id))
+            .map(({ id }) => id),
+        );
+        setGatewayModels(
+          models,
+          Object.entries(config.models).flatMap(([id, target]) =>
+            !id.startsWith(GATEWAY_MODEL_PREFIX) && offeredAliases.has(id) && next[id]
+              ? [GATEWAY_MODEL_PREFIX + target]
+              : [],
+          ),
+        );
       } catch {
         retryAt = now() + RETRY_MS;
         if (discovered || Object.keys(config.models).length === 0) {

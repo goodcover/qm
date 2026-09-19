@@ -401,6 +401,13 @@ test("scope-selected providers require both Modal and Sprites credentials", () =
     assert.ok(required.includes(name), name);
 });
 
+test("a scope routed to superserve requires its API key even when it is not the primary backend", () => {
+  const config = makeConfig({
+    env: { core: { SANDBOX_BACKEND: "local", SANDBOX_SCOPE_BACKENDS: '{"channel":"superserve"}' } },
+  });
+  assert.equal(secretByName(config, "SUPERSERVE_API_KEY").required, true);
+});
+
 test("shared Fly publishing requires private peers only when selected", () => {
   for (const provider of ["fly", "aws"]) {
     for (const shared of [false, true]) {
@@ -418,4 +425,37 @@ test("shared Fly publishing requires private peers only when selected", () => {
       if (provider === "fly" && shared) assert.doesNotMatch(renderEnvExample(config), /tokens create org/);
     }
   }
+});
+
+test("deployment control credentials are conditional and cannot be delivered to plugins or sandboxes", () => {
+  assert.equal(
+    computedSecrets(makeConfig()).some((secret) => secret.name === "DEPLOYMENT_CONTROL_SECRET"),
+    false,
+  );
+  const aws = { backgroundWorkControl: true } as NonNullable<QmConfig["aws"]>;
+  const config = makeConfig({ target: "aws", aws });
+  const control = secretByName(config, "DEPLOYMENT_CONTROL_SECRET");
+  assert.equal(control.required, true);
+  assert.deepEqual(control.services, ["core"]);
+  assert.throws(
+    () =>
+      computedSecrets({
+        ...config,
+        plugins: [{ name: "external", secrets: [{ name: "DEPLOYMENT_CONTROL_SECRET" }] }],
+      }),
+    /only to core/,
+  );
+  assert.throws(
+    () => computedSecrets({ ...config, sandbox: { app: "sandbox", secretEnv: ["DEPLOYMENT_CONTROL_SECRET"] } }),
+    /only to core/,
+  );
+  assert.throws(
+    () =>
+      computedSecrets({
+        ...config,
+        services: ["core", "portal"],
+        secretEnv: { portal: { TOKEN: "DEPLOYMENT_CONTROL_SECRET" } },
+      }),
+    /only to core/,
+  );
 });

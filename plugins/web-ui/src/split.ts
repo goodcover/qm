@@ -1,8 +1,10 @@
 import { openSessionShare } from "./session-share";
+import { preserveTranscriptScroll } from "./transcript-viewport";
 import { html, nothing, render, type TemplateResult } from "lit";
 import { ref } from "lit/directives/ref.js";
 import {
   Archive,
+  ArrowUpLeft,
   Binoculars,
   Box,
   Brain,
@@ -29,6 +31,7 @@ import {
   type IDockviewPanel,
   type IGroupHeaderProps,
   type IHeaderActionsRenderer,
+  type DockviewIDisposable,
   type ITabRenderer,
   type SerializedDockview,
   type TabPartInitParameters,
@@ -188,7 +191,7 @@ function buildDock(): DockviewApi {
   toastEl.className = "split-toast-layer";
   host.appendChild(toastEl);
   const api = createDockview(dockEl, {
-    theme: { name: "qm", className: "dockview-theme-qm", gap: 10 },
+    theme: { name: "qm", className: "dockview-theme-qm", gap: 1 },
     createComponent: () => new PaneContent(),
     createTabComponent: () => new PaneTab(),
     createRightHeaderActionComponent: () => new GroupActions(),
@@ -197,6 +200,14 @@ function buildDock(): DockviewApi {
     disableFloatingGroups: true,
   });
   const inner = dockEl.querySelector(":scope > .dv-dockview") as HTMLElement | null;
+  let restoreScroll = () => {};
+  api.onWillMutateLayout(() => {
+    restoreScroll = preserveTranscriptScroll(host);
+  });
+  api.onDidMutateLayout(() => {
+    restoreScroll();
+    restoreScroll = () => {};
+  });
   const box = (inner ?? dockEl).getBoundingClientRect();
   if (box.width > 0) api.layout(box.width, box.height, true);
   const holdTileCap = (e: DockviewWillDropEvent): void => {
@@ -230,6 +241,7 @@ function buildDock(): DockviewApi {
       guarded.add(group);
       group.model.onWillDrop(holdTileCap);
     }
+    if (appState.currentView === "chats") syncUrlFromState();
     if (paneDrag) refreshPaneDrag();
     persistSoon();
   });
@@ -239,6 +251,7 @@ function buildDock(): DockviewApi {
   });
   api.onDidMaximizedGroupChange(() => {
     for (const a of groupActions) a.draw();
+    persistSoon();
   });
   dockEl.addEventListener("pointerdown", (e) => {
     if (!(e.target instanceof Element) || !e.target.closest(".dv-sash")) return;
@@ -791,7 +804,7 @@ function computeHeaderSignature(): string {
   return (dockApi?.panels ?? [])
     .map(
       (p) =>
-        `${p.id}|${paneSession(p)?.id ?? ""}|${paneCrumb(p) ?? ""}|${paneTitle(p)}|${paneIsWorking(p)}|${paneAwaitsInput(p)}|${paneBackground(p)?.label ?? ""}|${paneKindBadge(p)}`,
+        `${p.id}|${paneSession(p)?.id ?? ""}|${paneCrumb(p) ?? ""}|${paneTitle(p)}|${paneIsWorking(p)}|${paneAwaitsInput(p)}|${paneBackground(p)?.label ?? ""}|${paneKindBadge(p)}|${paneSession(p)?.parentSessionId ?? ""}|${sessionsState.list.find((row) => row.id === paneSession(p)?.parentSessionId)?.title ?? ""}`,
     )
     .join("~");
 }
@@ -808,6 +821,13 @@ function refreshHeaders(): void {
   for (const a of groupActions) a.draw();
   for (const c of paneContents.values()) c.syncTitle();
   syncDocumentTitle();
+  if (appState.currentView === "chats") syncUrlFromState();
+}
+
+export function singlePaneSessionId(): string | null {
+  if (!dockApi || dockApi.panels.length !== 1) return null;
+  const params = panelParams(dockApi.panels[0]!);
+  return paneKindEntry(params) ? null : (params.sessionId ?? null);
 }
 
 function paneSession(panel: IDockviewPanel): CoreSession | undefined {
@@ -853,8 +873,8 @@ function paneCrumb(panel: IDockviewPanel): string | null {
 
 const PANE_TOOLS: { tool: SessionTool; glyph: Parameters<typeof icon>[0]; label: string }[] = [
   { tool: "crons", glyph: Clock3, label: "Crons" },
-  { tool: "files", glyph: Files, label: "Files" },
   { tool: "apps", glyph: Rocket, label: "Apps" },
+  { tool: "files", glyph: Files, label: "Files" },
   { tool: "skills", glyph: Box, label: "Skills" },
   { tool: "memory", glyph: Brain, label: "Memory" },
   { tool: "keychain", glyph: KeyRound, label: "Your keychain" },
@@ -1054,9 +1074,30 @@ class PaneContent implements IContentRenderer {
   }
 }
 
-function sessionActions(sessionId: string, inTab: boolean): TemplateResult {
+function sessionActions(sessionId: string, inTab: boolean, panelId: string): TemplateResult {
   const cls = inTab ? "split-tab-close" : "split-group-session-action";
-  return html`<button
+  const parentId = sessionsState.list.find((row) => row.id === sessionId)?.parentSessionId;
+  const parent = parentId ? sessionsState.list.find((row) => row.id === parentId) : undefined;
+  return html`${
+      parent
+        ? html`<button
+            type="button"
+            class="icon-btn subtle ${cls}"
+            aria-label=${`Back to parent: ${sessionTitle(parent)}`}
+            ${tip(`Back to ${sessionTitle(parent)}`)}
+            @pointerdown=${(e: Event) => {
+              if (inTab) e.stopPropagation();
+            }}
+            @click=${(e: Event) => {
+              if (inTab) e.stopPropagation();
+              focusPane(panelId);
+              void openSession(parent);
+            }}
+          >
+            ${icon(ArrowUpLeft, 13)}
+          </button>`
+        : nothing
+    }<button
       type="button"
       class="icon-btn subtle ${cls} split-tab-share"
       ${tip("Share conversation")}
@@ -1176,7 +1217,7 @@ class PaneTab implements ITabRenderer {
         ${
           this.inStrip
             ? html`<span class="split-tab-actions">
-                ${sessionId ? sessionActions(sessionId, true) : nothing}
+                ${sessionId ? sessionActions(sessionId, true, panel.id) : nothing}
                 <button
                   class="icon-btn subtle split-tab-close"
                   type="button"
@@ -1244,6 +1285,7 @@ class StripDrop implements IHeaderActionsRenderer {
 
 class GroupActions implements IHeaderActionsRenderer {
   readonly element: HTMLElement;
+  private activePanelChange: DockviewIDisposable | null = null;
   private props: IGroupHeaderProps | null = null;
   private menuOpen = false;
 
@@ -1255,6 +1297,7 @@ class GroupActions implements IHeaderActionsRenderer {
   init(props: IGroupHeaderProps): void {
     this.props = props;
     groupActions.add(this);
+    this.activePanelChange = props.group.api.onDidActivePanelChange(() => this.draw());
     document.addEventListener("click", this.onDocClick);
     this.draw();
   }
@@ -1296,6 +1339,7 @@ class GroupActions implements IHeaderActionsRenderer {
       this.draw();
       if (p) openPaneTool(p, tool);
     };
+    if (single) this.menuOpen = false;
     const menu = this.menuOpen
       ? html`
           <div
@@ -1361,53 +1405,56 @@ class GroupActions implements IHeaderActionsRenderer {
     ];
     render(
       html`${
-          single
-            ? html`<span class="split-single-tools">
-                ${PANE_TOOLS.map((t) => {
-                  const count = scope ? scopeToolCount(t.tool, scope, () => this.draw()) : null;
-                  return html`<button
-                    class="session-tool"
-                    type="button"
-                    aria-label=${t.label}
-                    ${tip(t.label)}
-                    @click=${() => runTool(t.tool)}
-                  >
-                    ${icon(t.glyph, 15)}${count ? html`<span class="session-tool-count">${count}</span>` : nothing}
-                  </button>`;
-                })}
-              </span>`
-            : nothing
-        }
-        <span class="split-tools">
-          <button
-            class="icon-btn subtle split-tools-btn ${this.menuOpen ? "active" : ""}"
-            type="button"
-            ${tip("Tools")}
-            aria-label="Tools"
-            aria-haspopup="menu"
-            aria-expanded=${this.menuOpen ? "true" : "false"}
-            @click=${() => {
-              this.menuOpen = !this.menuOpen;
-              this.draw();
-            }}
-          >
-            ${icon(MoreHorizontal, 15)}
-          </button>
-          ${menu}
-        </span>
-        ${sessionId ? sessionActions(sessionId, false) : nothing}
-        ${buttons.map(
-          (b) =>
-            html`<button
-              class="icon-btn subtle${b.cls ?? ""}"
-              type="button"
-              ${tip(b.label)}
-              aria-label=${b.label}
-              @click=${b.run}
-            >
-              ${b.glyph}
-            </button>`,
-        )}`,
+        single
+          ? html`<span class="split-single-tools">
+              ${PANE_TOOLS.map((t) => {
+                const count = scope ? scopeToolCount(t.tool, scope, () => this.draw()) : null;
+                return html`<button
+                  class="session-tool"
+                  type="button"
+                  aria-label=${t.label}
+                  ${tip(t.label)}
+                  @click=${() => runTool(t.tool)}
+                >
+                  ${icon(t.glyph, 15)}${count ? html`<span class="session-tool-count">${count}</span>` : nothing}
+                </button>`;
+              })}
+            </span>`
+          : html`<span class="split-tools">
+              <button
+                class="icon-btn subtle split-tools-btn ${this.menuOpen ? "active" : ""}"
+                type="button"
+                ${tip("Tools")}
+                aria-label="Tools"
+                aria-haspopup="menu"
+                aria-expanded=${this.menuOpen ? "true" : "false"}
+                @click=${() => {
+                  this.menuOpen = !this.menuOpen;
+                  this.draw();
+                }}
+              >
+                ${icon(MoreHorizontal, 15)}
+              </button>
+              ${menu}
+            </span>`
+      }
+      ${sessionId ? sessionActions(sessionId, false, panel!.id) : nothing}
+      ${
+        single
+          ? nothing
+          : buttons.map(
+              (b) =>
+                html`<button
+                  class="icon-btn subtle${b.cls ?? ""}"
+                  type="button"
+                  ${tip(b.label)}
+                  aria-label=${b.label}
+                  @click=${b.run}
+                >
+                  ${b.glyph}
+                </button>`,
+            )
+      }`,
       this.element,
     );
   }
@@ -1415,6 +1462,7 @@ class GroupActions implements IHeaderActionsRenderer {
   dispose(): void {
     document.removeEventListener("click", this.onDocClick);
     groupActions.delete(this);
+    this.activePanelChange?.dispose();
     this.props = null;
   }
 }

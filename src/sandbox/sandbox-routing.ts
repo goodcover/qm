@@ -16,7 +16,8 @@ import {
   type TeardownOptions,
 } from "./sandbox.ts";
 
-export type SandboxBackendName = "sprites" | "aws" | "local" | "smolmachines" | "e2b" | "modal" | "porter" | "agent37";
+export type SandboxBackendName =
+  "sprites" | "aws" | "local" | "smolmachines" | "e2b" | "modal" | "porter" | "agent37" | "superserve";
 
 export type SandboxScopeDefaults = Partial<Record<ScopeKind, SandboxBackendName>>;
 
@@ -169,7 +170,7 @@ export function createSandboxRouter(opts: RoutingSandboxOptions): Sandbox {
         const routedLayers = layers.map((layer) =>
           layer.mode === "rw" ? { ...layer, scopeId: resource.backingScopeId } : layer,
         );
-        const handle = await opts.resources!.use(resource.id, () => sandbox.provision(routedLayers, provOpts));
+        const handle = await opts.resources!.use(resource.id, () => sandbox.provision(routedLayers, provOpts), true);
         return { ...handle, backend: resource.backend, scopeId: resource.ownerScopeId, resourceId: resource.id };
       }
       const { name, sandbox } = await pick(scope);
@@ -204,8 +205,19 @@ export function createSandboxRouter(opts: RoutingSandboxOptions): Sandbox {
       const remove = () => forHandle(handle).removeDir(handle, relDir);
       return useHandle(handle, remove);
     },
+    removeDirAndList(handle, removeRelDir, listRelDir) {
+      return useHandle(handle, async () => {
+        const sandbox = forHandle(handle);
+        if (sandbox.removeDirAndList) return sandbox.removeDirAndList(handle, removeRelDir, listRelDir);
+        await sandbox.removeDir(handle, removeRelDir);
+        return sandbox.listDir(handle, listRelDir);
+      });
+    },
     teardown(handle, tdOpts?: TeardownOptions): Promise<void> {
-      return useHandle(handle, () => forHandle(handle).teardown(handle, tdOpts));
+      const action = () => forHandle(handle).teardown(handle, tdOpts);
+      return handle.resourceId && opts.resources
+        ? opts.resources.use(handle.resourceId, action, handle.backend !== "modal" || !!tdOpts?.destroy)
+        : action();
     },
 
     ...(some(supportsProcessSessions)
@@ -277,7 +289,7 @@ export function createSandboxRouter(opts: RoutingSandboxOptions): Sandbox {
           restartComputer: async (scopeId: string) => {
             const target = await computerTarget(scopeId);
             const action = () => requireCap(target.sandbox, "restartComputer", scopeId).restartComputer(target.scopeId);
-            return target.resourceId && opts.resources ? opts.resources.use(target.resourceId, action) : action();
+            return target.resourceId && opts.resources ? opts.resources.use(target.resourceId, action, true) : action();
           },
         }
       : {}),

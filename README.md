@@ -74,9 +74,11 @@ flowchart LR
 ```
 
 For durability, set `DATABASE_URL` and `SESSION_STORE=postgres` — without it, sessions
-live in process memory and vanish on restart. To exercise a branch end to end — core,
-Slack, web, admin, portal, against a real model and real Postgres — run
-`npm run dev-instance`.
+live in process memory and vanish on restart. To exercise a branch against a real model and real Postgres, run
+`npm run dev-instance:web` for web/admin or `npm run dev-instance:slack` for Slack.
+Use `npm run dev-instance:both` when testing both surfaces together. Bare
+`npm run dev-instance` defaults to web for new instances and preserves the surface
+on reload. Switch an existing instance with an explicit surface command.
 
 ## Architecture
 
@@ -246,6 +248,7 @@ upstream source history to merge.
 - [`cli/README.md`](./cli/README.md) — the `qm` CLI and the deployment directory contract
 - [`docs/deploy-directory.md`](./docs/deploy-directory.md) — the deployment directory in full
 - [`docs/porter.md`](./docs/porter.md) — running qm on Porter
+- [`docs/superserve.md`](./docs/superserve.md) — using Superserve for agent sandboxes
 - [`.env.example`](./.env.example) — every knob, documented in place
 - [`plugins/`](./plugins) — the surfaces (Slack, web UI, admin, portal)
 
@@ -256,7 +259,9 @@ Except where otherwise noted, QM is available under the [MIT License](./LICENSE)
 ### Managed Slack installation
 
 A hosting provider can set `QM_SLACK_SERVICE_URL` (HTTPS),
-`QM_SLACK_SERVICE_TOKEN` (unique per deployment), and `QM_SLACK_APP_ID` on core.
+`QM_SLACK_SERVICE_TOKEN` (unique per deployment) on core. Optionally set
+`QM_SLACK_APP_ID` to pin a pre-existing app; otherwise the authenticated service
+assigns its app ID during installation. Events must match the stored app identity.
 Set `QM_SLACK_SERVICE_URL` on the admin/web service as well so its browser policy allows the installation form.
 The admin Slack card then offers **Add to Slack** through that service. Core calls
 `POST /install/start` with the deployment bearer credential and expects `{ "url":
