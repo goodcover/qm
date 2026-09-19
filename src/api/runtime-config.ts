@@ -15,6 +15,7 @@ import {
   modelUnavailableReason,
   thinkingLevelsForHarness,
   harnessSupportsFastMode,
+  codexProviderModelId,
   type HarnessId,
 } from "../model/pi-models.ts";
 import { builtInModelCatalog, selectableCatalogForHarness, selectableModelCatalog } from "../model/model-catalog.ts";
@@ -33,7 +34,7 @@ export type RuntimeDeps = Pick<
 
 export function runtimeFallback(ctx: { deps: RuntimeDeps }): { harnessId: HarnessId; modelId: string } {
   const harnessId = isHarnessId(ctx.deps.harnessId) ? ctx.deps.harnessId : "pi";
-  const gatewayIds = gatewayModelCatalog().map((model) => model.id);
+  const gatewayIds = gatewayModelCatalog(true).map((model) => model.id);
   const providers =
     gatewayIds.length && ctx.deps.providerKeys
       ? { ...ctx.deps.providerKeys, modelIds: new Set(gatewayIds) }
@@ -159,7 +160,7 @@ export function validateRuntimeChoice(choice: RuntimeChoice): string | null {
 }
 
 export async function webuiModelEnabled(ctx: { deps: RuntimeDeps }, modelId: string): Promise<boolean> {
-  modelId = modelId.replace(/^codex\//, "");
+  modelId = codexProviderModelId(modelId);
   const config = ctx.deps.config!;
   const picker = await config.getWebuiModelsDurable(orgScope(ctx.deps));
   if (picker == null || picker.includes(modelId)) return true;

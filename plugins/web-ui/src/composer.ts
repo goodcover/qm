@@ -1,3 +1,4 @@
+import { appEditSlug } from "./app-edit";
 import { getRuntimeConfig, loadRuntimeConfig, saveRuntimeConfig, subscribeRuntimeConfig } from "./runtime-config-store";
 import type { Agent, AgentMessage } from "@earendil-works/pi-agent-core";
 import { createFileDragState } from "./file-drag";
@@ -25,8 +26,8 @@ import {
 import {
   api,
   ApiError,
+  editQueuedRun,
   approvalBlocksComposer,
-  latestTranscriptSeq,
   MAX_ATTACHMENT_BYTES,
   MAX_FILES_PER_MESSAGE,
   mintSendKey,
@@ -36,14 +37,13 @@ import {
   tooManyFilesNote,
   uploadAttachments,
   userSendMessage,
-  verifySteerDelivered,
   withdrawRun,
   type ApprovalDecision,
   type CoreAttachment,
   type PendingApproval,
   type QueuedRun,
 } from "./core-bridge";
-import { errMessage, swallow } from "../../chassis/src/errors";
+import { errMessage } from "../../chassis/src/errors";
 import { fieldSelect, icon, modelMark } from "./ui";
 import {
   EFFORT_LEVELS,
@@ -51,6 +51,7 @@ import {
   defaultModelValue,
   effortLabel,
   getModelOptions,
+  getHarnessOptions,
   harnessSupportsEffort,
   harnessSupportsFastMode,
   harnessSupportsSteer,
@@ -215,6 +216,8 @@ export function resyncModelSelection(): void {
 }
 
 export function createComposerSurface(ctx: ConvCtx): ComposerSurface {
+  const refreshAccount = () => ctx.chat.drawActiveChat();
+  window.addEventListener("model-account-changed", refreshAccount);
   const loadoutMenuId = `composer-loadout-${crypto.randomUUID()}`;
   let runtimeRequest = 0;
   let runtimeIdentity = "";
@@ -290,6 +293,7 @@ export function createComposerSurface(ctx: ConvCtx): ComposerSurface {
   const pastedTextIds = new Set<string>();
 
   const queuedRuns = new Map<string, QueuedRun[]>();
+  let queuedEdit: { runId: string; threadRef: string; original: string; text: string; saving: boolean } | null = null;
 
   function queuedRunsFor(threadRef: string | null): QueuedRun[] {
     return (threadRef ? queuedRuns.get(threadRef) : undefined) ?? [];
@@ -504,7 +508,7 @@ export function createComposerSurface(ctx: ConvCtx): ComposerSurface {
     const runtimePending = activeRuntimeConfig === null;
     const inputBlocked = runtimePending || ctx.chat.state.resolvingApprovals.size > 0 || blockingPauses.length > 0;
     const attachingDisabled = inputBlocked;
-    let placeholder = "Ask anything";
+    let placeholder = appEditSlug(ctx.chat.state.threadRef, appState.me?.user) ? "Describe a change…" : "Ask anything";
     if (inputBlocked) placeholder = runtimePending ? "Loading runtime…" : "Approve or deny to continue";
     else if (agent.state.isStreaming) placeholder = "Queue a message for after this turn…";
     let composerNotice: TemplateResult | typeof nothing = nothing;
@@ -736,7 +740,6 @@ export function createComposerSurface(ctx: ConvCtx): ComposerSurface {
         ${icon(ArrowUp, 16)}
       </button>`;
     }
-    const canQueue = Boolean(composerState.draft.trim() || composerState.attachments.length);
     return html`
       <button
         class="stop-btn"
@@ -753,7 +756,7 @@ export function createComposerSurface(ctx: ConvCtx): ComposerSurface {
         type="submit"
         ${tip("Queue for after this turn")}
         aria-label="Queue for after this turn"
-        ?disabled=${!canQueue}
+        ?disabled=${!composerCanSend()}
       >
         ${icon(ArrowUp, 16)}
       </button>
@@ -761,44 +764,115 @@ export function createComposerSurface(ctx: ConvCtx): ComposerSurface {
   }
 
   function queuedStrip(agent: Agent): TemplateResult | typeof nothing {
-    const queued = queuedRunsFor(ctx.chat.state.threadRef);
+    const queued = [...queuedRunsFor(ctx.chat.state.threadRef)];
+    if (queuedEdit?.threadRef === ctx.chat.state.threadRef && !queued.some((q) => q.runId === queuedEdit?.runId))
+      queued.push({ runId: queuedEdit.runId, text: queuedEdit.original });
     if (!queued.length) return nothing;
     const steerable =
       agent.state.isStreaming && ctx.chat.hasLiveRun() && harnessSupportsSteer(currentModelOption()?.harnessId ?? "");
-    const steerTip = (q: QueuedRun): string => {
-      if (q.hasAttachments) return "This message carries files, which can't fold into a running task";
+    const steerTip = (): string => {
       if (steerable) return "Steer the running task with this instead of waiting";
       return "Nothing running can take this. It will go out as its own turn";
     };
     return html`
       <div class="queued-strip" role="list" aria-label="Queued messages">
-        ${queued.map(
-          (q) => html`
-            <div class="queued-chip" role="listitem">
-              <span class="queued-tag">Queued</span>
-              <span class="queued-text" dir="auto" ${tip(q.text || "Files, no text")}
-                >${q.text || (q.hasAttachments ? "(files)" : "")}</span
-              >
-              <button
-                type="button"
-                class="queued-steer"
-                ?disabled=${!steerable || q.hasAttachments}
-                ${tip(steerTip(q))}
-                @click=${() => void steerQueued(agent, q)}
-              >
-                ${icon(CornerDownRight, 13)}<span>Steer</span>
-              </button>
-              <button
-                type="button"
-                class="chip-x"
-                aria-label="Remove queued message"
-                ${tip("Remove")}
-                @click=${() => void removeQueued(agent, q)}
-              >
-                ${icon(X, 13)}
-              </button>
-            </div>
-          `,
+        ${queued.map((q) =>
+          queuedEdit?.runId === q.runId && queuedEdit.threadRef === ctx.chat.state.threadRef
+            ? html` <div class="queued-chip queued-editing" role="listitem">
+                <textarea
+                  class="queued-edit-input"
+                  aria-label="Edit queued message"
+                  rows="3"
+                  .value=${live(queuedEdit.text)}
+                  ?disabled=${queuedEdit.saving}
+                  @input=${(event: Event) => {
+                    if (queuedEdit) queuedEdit.text = (event.target as HTMLTextAreaElement).value;
+                  }}
+                  @keydown=${(event: KeyboardEvent) => {
+                    if (event.isComposing || queuedEdit?.saving) return;
+                    if (event.key === "Escape") {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      cancelQueuedEdit(agent);
+                    } else if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      void saveQueuedEdit(agent);
+                    }
+                  }}
+                ></textarea>
+                <button
+                  type="button"
+                  class="queued-steer"
+                  aria-keyshortcuts="Control+Enter Meta+Enter"
+                  ?disabled=${queuedEdit.saving}
+                  @click=${() => void saveQueuedEdit(agent)}
+                >
+                  Save
+                </button>
+                <button
+                  type="button"
+                  class="queued-steer"
+                  ?disabled=${queuedEdit.saving}
+                  @click=${() => cancelQueuedEdit(agent)}
+                >
+                  Cancel
+                </button>
+              </div>`
+            : html`
+                <div class="queued-chip" role="listitem">
+                  <span class="queued-tag">Queued</span>
+                  <span class="queued-text" dir="auto" ${tip(q.text || "Files, no text")}
+                    >${q.text || (q.hasAttachments ? "(files)" : "")}</span
+                  >
+                  <button
+                    type="button"
+                    class="queued-steer"
+                    ?disabled=${!steerable}
+                    ${tip(steerTip())}
+                    @click=${() => void steerQueued(agent, q)}
+                  >
+                    ${icon(CornerDownRight, 13)}<span>Steer</span>
+                  </button>
+                  <button
+                    type="button"
+                    class="queued-steer"
+                    aria-label="Edit queued message"
+                    @click=${() => {
+                      const edit = (queuedEdit = {
+                        runId: q.runId,
+                        threadRef: ctx.chat.state.threadRef!,
+                        original: q.text,
+                        text: q.text,
+                        saving: false,
+                      });
+                      ctx.chat.drawActiveChat(agent);
+                      requestAnimationFrame(() => {
+                        if (
+                          queuedEdit !== edit ||
+                          ctx.chat.state.threadRef !== edit.threadRef ||
+                          ctx.chat.state.agent !== agent
+                        )
+                          return;
+                        const input = ctx.chat.state.host?.querySelector<HTMLTextAreaElement>(".queued-edit-input");
+                        input?.focus();
+                        input?.setSelectionRange(input.value.length, input.value.length);
+                      });
+                    }}
+                  >
+                    Edit
+                  </button>
+                  <button
+                    type="button"
+                    class="chip-x"
+                    aria-label="Remove queued message"
+                    ${tip("Remove")}
+                    @click=${() => void removeQueued(agent, q)}
+                  >
+                    ${icon(X, 13)}
+                  </button>
+                </div>
+              `,
         )}
       </div>
     `;
@@ -1240,24 +1314,31 @@ export function createComposerSurface(ctx: ConvCtx): ComposerSurface {
       }
       ${
         loadoutSection === "harness"
-          ? compatibleHarnessOptions(getModelOptions(scopeKey()), selected.model.id).map(
-              (option) =>
-                html`<button
-                  class="loadout-effort"
-                  type="button"
-                  role="menuitemradio"
-                  aria-checked=${option.harnessId === selected.harnessId ? "true" : "false"}
-                  @click=${() => {
-                    closeLoadoutSection();
-                    selectHarness(option.harnessId, agent);
-                  }}
+          ? getHarnessOptions(scopeKey()).map((harness) => {
+              const compatible = compatibleHarnessOptions(getModelOptions(scopeKey()), selected.model.id).some(
+                (option) => option.harnessId === harness.value,
+              );
+              const reason = compatible ? "" : `${harness.label} cannot run ${selected.label}.`;
+              return html`<button
+                class="loadout-effort"
+                type="button"
+                role="menuitemradio"
+                aria-checked=${harness.value === selected.harnessId ? "true" : "false"}
+                aria-disabled=${compatible ? "false" : "true"}
+                aria-description=${reason || nothing}
+                ${tip(reason)}
+                @click=${() => {
+                  if (!compatible) return;
+                  closeLoadoutSection();
+                  selectHarness(harness.value, agent);
+                }}
+              >
+                <span class="loadout-harness-option"
+                  >${modelMark(harness.value, 15) ?? nothing}<span>${harness.label}</span></span
                 >
-                  <span class="loadout-harness-option"
-                    >${modelMark(option.harnessId, 15) ?? nothing}<span>${option.harnessLabel}</span></span
-                  >
-                  ${option.harnessId === selected.harnessId ? icon(Check, 15) : nothing}
-                </button>`,
-            )
+                ${harness.value === selected.harnessId ? icon(Check, 15) : nothing}
+              </button>`;
+            })
           : nothing
       }
       ${
@@ -1296,7 +1377,7 @@ export function createComposerSurface(ctx: ConvCtx): ComposerSurface {
   }
 
   function loadoutHarnessControl(selected: ModelOption): TemplateResult {
-    const options = compatibleHarnessOptions(getModelOptions(scopeKey()), selected.model.id);
+    const options = getHarnessOptions(scopeKey());
     const value = html`<span class="loadout-harness-option"
       >${modelMark(selected.harnessId, 15) ?? nothing}<span>${selected.harnessLabel}</span></span
     >`;
@@ -1645,7 +1726,7 @@ export function createComposerSurface(ctx: ConvCtx): ComposerSurface {
         return;
       }
       pendingComposerFocus = false;
-      ta.focus();
+      ta.focus({ preventScroll: true });
       ta.setSelectionRange(ta.value.length, ta.value.length);
     });
   }
@@ -1736,6 +1817,7 @@ export function createComposerSurface(ctx: ConvCtx): ComposerSurface {
     return (
       Boolean(composerState.draft.trim() || composerState.attachments.length) &&
       !composerState.processingFiles &&
+      !ctx.chat.isStopping() &&
       getRuntimeConfig(scopeKey()) !== null &&
       ctx.chat.state.resolvingApprovals.size === 0 &&
       !ctx.chat.hasUnresolvedApproval()
@@ -1745,10 +1827,7 @@ export function createComposerSurface(ctx: ConvCtx): ComposerSurface {
   function syncComposerControls(agent: Agent): void {
     if (!ctx.chat.state.host || agent !== ctx.chat.state.agent) return;
     const send = ctx.chat.state.host.querySelector<HTMLButtonElement>(".send-btn");
-    if (send)
-      send.disabled = agent.state.isStreaming
-        ? !composerState.draft.trim() && !composerState.attachments.length
-        : !composerCanSend();
+    if (send) send.disabled = !composerCanSend();
   }
 
   function clearComposerDom(agent: Agent): void {
@@ -1885,6 +1964,42 @@ export function createComposerSurface(ctx: ConvCtx): ComposerSurface {
     }
   }
 
+  function cancelQueuedEdit(agent: Agent): void {
+    if (queuedEdit?.saving) return;
+    queuedEdit = null;
+    composerState.error = "";
+    ctx.chat.drawActiveChat(agent);
+    focusComposerEnd();
+  }
+
+  async function saveQueuedEdit(agent: Agent): Promise<void> {
+    const edit = queuedEdit;
+    if (!edit || edit.saving) return;
+    edit.saving = true;
+    composerState.error = "";
+    ctx.chat.drawActiveChat(agent);
+    try {
+      await editQueuedRun(edit.runId, edit.text, edit.original);
+      setQueuedRuns(
+        edit.threadRef,
+        queuedRunsFor(edit.threadRef).map((q) => (q.runId === edit.runId ? { ...q, text: edit.text } : q)),
+      );
+      if (queuedEdit === edit) {
+        queuedEdit = null;
+        if (ctx.chat.state.threadRef === edit.threadRef && ctx.chat.state.agent === agent) focusComposerEnd();
+      }
+    } catch (error) {
+      if (ctx.chat.state.threadRef === edit.threadRef)
+        composerState.error =
+          error instanceof ApiError && error.status === 409
+            ? "That message changed or already started. Your edit was not saved."
+            : errMessage(error, "Could not edit the queued message.");
+    } finally {
+      edit.saving = false;
+      if (ctx.chat.state.threadRef === edit.threadRef) ctx.chat.drawActiveChat(agent);
+    }
+  }
+
   async function removeQueued(agent: Agent, queued: QueuedRun): Promise<void> {
     const threadRef = ctx.chat.state.threadRef;
     if (!threadRef) return;
@@ -1901,85 +2016,48 @@ export function createComposerSurface(ctx: ConvCtx): ComposerSurface {
     ctx.chat.drawActiveChat(agent);
   }
 
+  const pendingSteers = new Set<string>();
+
   async function steerQueued(agent: Agent, queued: QueuedRun): Promise<void> {
     const threadRef = ctx.chat.state.threadRef;
-    if (!threadRef || queued.hasAttachments) return;
-    if (!ctx.chat.hasLiveRun()) {
-      composerState.error = "That turn already finished. This message will run as its own turn.";
-      return ctx.chat.drawActiveChat(agent);
-    }
+    if (!threadRef || !ctx.chat.hasLiveRun() || pendingSteers.has(queued.runId)) return;
+    pendingSteers.add(queued.runId);
     composerState.error = "";
     try {
-      if (!(await withdrawRun(queued.runId))) return ctx.chat.drawActiveChat(agent);
-    } catch (err) {
-      const started = err instanceof ApiError && err.status === 409;
-      const gone = err instanceof ApiError && err.status === 404;
-      if (started) composerState.error = "That message already started. It's the running turn now.";
-      else if (gone) composerState.error = "That message was already removed in another tab.";
-      else composerState.error = errMessage(err, "Could not steer with that message.");
-      if (started || gone) forgetQueuedRun(threadRef, queued.runId);
-      return ctx.chat.drawActiveChat(agent);
-    }
-    forgetQueuedRun(threadRef, queued.runId);
-    bumpSessionActivity(threadRef);
-    agent.state.messages.push({
-      role: "user",
-      content: queued.text,
-      timestamp: Date.now(),
-      steered: true,
-    } as unknown as AgentMessage);
-    ctx.chat.drawActiveChat(agent);
-
-    const sentAt = Date.now();
-    const steerSessionId = ctx.chat.state.sessionId;
-    const sinceSeq = steerSessionId
-      ? await latestTranscriptSeq(steerSessionId).catch((e: unknown) => {
-          swallow("web-ui: steer baseline", e);
-          return undefined;
-        })
-      : undefined;
-    try {
-      const outcome = await ctx.chat.signalLiveRun("steer", queued.text);
-      if (!outcome.ok) await recoverEndedRunSteer(agent, queued.text, outcome);
-    } catch (err) {
-      if (steerSessionId && (await verifySteerDelivered(steerSessionId, queued.text, sentAt, undefined, sinceSeq))) {
-        composerState.error = "";
-        return ctx.chat.drawActiveChat(agent);
+      const outcome = await ctx.chat.signalLiveRun("steer", queued.text, queued.runId);
+      if (outcome.ok || outcome.replayed) {
+        forgetQueuedRun(threadRef, queued.runId);
+        bumpSessionActivity(threadRef);
+        if (agent === ctx.chat.state.agent && threadRef === ctx.chat.state.threadRef) {
+          agent.state.messages.push({
+            role: "user",
+            content: queued.text,
+            timestamp: Date.now(),
+            ...(outcome.ok ? { steered: true } : {}),
+          } as unknown as AgentMessage);
+        }
+      } else if (outcome.reason === "queued_changed") {
+        if (agent === ctx.chat.state.agent && threadRef === ctx.chat.state.threadRef)
+          composerState.error = "The queued message changed. Try steering it again.";
+      } else if (outcome.reason === "queued_started" || outcome.reason === "not_found") {
+        forgetQueuedRun(threadRef, queued.runId);
       }
-      composerState.error = errMessage(err, "Could not steer the running task.");
-      const last = agent.state.messages[agent.state.messages.length - 1] as
-        { role?: string; content?: unknown } | undefined;
-      if (last?.role === "user" && last.content === queued.text) agent.state.messages.pop();
-      if (!(await enqueueTurn(agent, threadRef, queued.text))) composerState.draft = queued.text;
-      ctx.chat.drawActiveChat(agent);
+    } catch (err) {
+      if (agent === ctx.chat.state.agent && threadRef === ctx.chat.state.threadRef)
+        composerState.error = errMessage(err, "Could not confirm steering. Try again.");
+    } finally {
+      pendingSteers.delete(queued.runId);
     }
-  }
-
-  async function recoverEndedRunSteer(agent: Agent, text: string, outcome: { replayed?: boolean }): Promise<void> {
-    const last = agent.state.messages[agent.state.messages.length - 1] as
-      { role?: string; content?: unknown; steered?: boolean } | undefined;
-    if (last?.role === "user" && last.content === text) {
-      if (outcome.replayed) delete last.steered;
-      else agent.state.messages.pop();
-    }
-    if (!outcome.replayed) composerState.draft = text;
+    if (agent !== ctx.chat.state.agent || threadRef !== ctx.chat.state.threadRef) return;
     ctx.chat.drawActiveChat(agent);
-    await agent.waitForIdle();
-    if (agent !== ctx.chat.state.agent) return;
-    if (outcome.replayed) ctx.chat.resumeIfIdle();
-    else if (composerState.draft === text) await sendPrompt(agent);
+    ctx.chat.resumeIfIdle();
   }
 
   async function sendPrompt(agent: Agent): Promise<void> {
-    if (!currentModelOption()) return;
-    if (composerState.processingFiles) return;
-    if (!getRuntimeConfig(scopeKey())) return;
+    if (!composerCanSend()) return;
     if (composerState.pasteView) closePasteView(agent);
-    if (ctx.chat.state.resolvingApprovals.size > 0) return;
-    if (ctx.chat.hasUnresolvedApproval()) return;
     if (agent.state.isStreaming) return queueDraft(agent);
     const text = composerState.draft.trim();
-    if (!text && composerState.attachments.length === 0) return;
     if (ctx.chat.state.threadRef) {
       bumpSessionActivity(ctx.chat.state.threadRef);
       ctx.chat.state.pendingSend = ctx.chat.state.threadRef;
@@ -1994,6 +2072,7 @@ export function createComposerSurface(ctx: ConvCtx): ComposerSurface {
     clearComposerDom(agent);
     try {
       if (ctx.chat.state.normalStreamFn) agent.streamFn = ctx.chat.state.normalStreamFn;
+      ctx.chat.scrollToBottom();
       await agent.prompt(userSendMessage(text, attachments.length ? attachments : undefined));
       restoreBlockedSend(agent, sentFromThread, text, attachments);
       restoreFailedAttachments(agent, text, attachments);
@@ -2358,6 +2437,7 @@ export function createComposerSurface(ctx: ConvCtx): ComposerSurface {
   }
 
   function dispose(): void {
+    window.removeEventListener("model-account-changed", refreshAccount);
     cancelLoadoutClose();
     unsubscribeRuntime?.();
     ++runtimeRequest;
@@ -2380,6 +2460,18 @@ export function createComposerSurface(ctx: ConvCtx): ComposerSurface {
     resetComposer,
     focusComposerEnd,
     fillSuggestedPrompt,
+    sendSuggestedPrompt: async (prompt: string, agent: Agent): Promise<void> => {
+      if (
+        agent !== ctx.chat.state.agent ||
+        agent.state.isStreaming ||
+        composerState.draft ||
+        composerState.attachments.length ||
+        composerState.processingFiles
+      )
+        return;
+      fillSuggestedPrompt(prompt, agent);
+      await sendPrompt(agent);
+    },
     resizeComposer,
     currentModelOption,
     carryModelPick,

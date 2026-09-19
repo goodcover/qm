@@ -2,6 +2,7 @@ import { isStrongSigningSecret } from "../auth/source-auth.ts";
 
 type SecretGate =
   | "production"
+  | "background-work-control"
   | "codex"
   | "postgres"
   | "sprites"
@@ -10,6 +11,7 @@ type SecretGate =
   | "modal"
   | "porter"
   | "agent37"
+  | "superserve"
   | "porter-deploy"
   | "fly-shared-deploy"
   | "fly-deploy"
@@ -31,6 +33,7 @@ export const CORE_SECRET_SPECS: readonly RuntimeSecretSpec[] = [
   { name: "CAPABILITY_SECRET", requiredWhen: "production" },
   { name: "CONNECTOR_SECRET_KEY", requiredWhen: "production" },
   { name: "CORE_SIGNING_SECRET", requiredWhen: "production" },
+  { name: "DEPLOYMENT_CONTROL_SECRET", requiredWhen: "background-work-control" },
   { name: "PORTAL_IDENTITY_SECRET", requiredWhen: "production" },
   { name: "SKILL_SIGNING_SECRET", requiredWhen: "production" },
   { name: "AUTH_ALLOWED_EMAILS", requiredWhen: "email-auth" },
@@ -41,6 +44,7 @@ export const CORE_SECRET_SPECS: readonly RuntimeSecretSpec[] = [
   { name: "SPRITES_TOKEN", requiredWhen: "sprites" },
   { name: "SMOLMACHINES_TOKEN", requiredWhen: "smolmachines" },
   { name: "AGENT37_API_KEY", requiredWhen: "agent37" },
+  { name: "SUPERSERVE_API_KEY", requiredWhen: "superserve" },
   { name: "E2B_API_KEY", requiredWhen: "e2b" },
   { name: "MODAL_TOKEN_ID", requiredWhen: "modal" },
   { name: "MODAL_TOKEN_SECRET", requiredWhen: "modal" },
@@ -63,6 +67,7 @@ function sandboxBackendSelected(env: NodeJS.ProcessEnv, backend: string): boolea
 
 const GATE_PREDICATES: Readonly<Record<SecretGate, (env: NodeJS.ProcessEnv) => boolean>> = {
   production: (env) => env.NODE_ENV === "production",
+  "background-work-control": (env) => Boolean(env.BACKGROUND_DEPLOYMENT_ID?.trim()),
   codex: (env) => env.HARNESS?.trim() === "codex" && !env.CODEX_AUTH_FILE?.trim() && !env.CODEX_AUTH_CREDENTIAL?.trim(),
   postgres: (env) => env.SESSION_STORE === "postgres" || env.RUN_STORE === "postgres",
   sprites: (env) => sandboxBackendSelected(env, "sprites"),
@@ -71,6 +76,7 @@ const GATE_PREDICATES: Readonly<Record<SecretGate, (env: NodeJS.ProcessEnv) => b
   modal: (env) => sandboxBackendSelected(env, "modal"),
   porter: (env) => sandboxBackendSelected(env, "porter"),
   agent37: (env) => sandboxBackendSelected(env, "agent37"),
+  superserve: (env) => sandboxBackendSelected(env, "superserve"),
   "porter-deploy": (env) => env.DEPLOY_PROVIDER === "porter",
   "fly-shared-deploy": (env) => env.DEPLOY_PROVIDER === "fly" && Boolean(env.FLY_DEPLOY_SHARED_APP_NAME?.trim()),
   "fly-deploy": (env) => env.DEPLOY_PROVIDER === "fly",
@@ -102,6 +108,7 @@ function isInvalidSecret(name: string, value: string | undefined): boolean {
   return (
     (name === "CONNECTOR_SECRET_KEY" ||
       name === "CORE_SIGNING_SECRET" ||
+      name === "DEPLOYMENT_CONTROL_SECRET" ||
       name === "SKILL_SIGNING_SECRET" ||
       name === "AWS_DEPLOY_GATE_SECRET") &&
     !isStrongSigningSecret(candidate)

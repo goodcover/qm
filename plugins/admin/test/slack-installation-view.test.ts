@@ -24,6 +24,7 @@ async function render(data: Record<string, unknown>) {
       return elements.get(id);
     },
     api: async () => ({ ok: true, data }),
+    slackLinkStarted: false,
     URLSearchParams,
     location: { search: "" },
   });
@@ -46,7 +47,7 @@ test("public QM leads with manifest setup and hides hosted actions and instructi
 
 test("hosted connection offers re-add and keeps custom setup secondary", async () => {
   const el = await render({ configured: true, source: "service", installAvailable: true, teamName: "Development YC" });
-  assert.equal(el("slack-installation-start").textContent, "Re-add to Slack");
+  assert.equal(el("slack-installation-start-label").textContent, "Re-add to Slack");
   assert.equal(el("slack-installation-start").disabled, false);
   assert.equal(el("slack-installation-state").textContent, "Development YC");
   assert.equal(el("slack-own-app-label").textContent, "Use your own Slack app");
@@ -57,4 +58,11 @@ test("custom connection cannot be replaced by hosted OAuth without disconnecting
   const el = await render({ configured: true, source: "admin", installAvailable: true });
   assert.equal(el("slack-installation-start").disabled, true);
   assert.equal(el("slack-installation-description").textContent, "Custom app");
+});
+
+test("managed credentials alone do not block retry of an unfinished route activation", () => {
+  assert.match(
+    html,
+    /r\.data\.configured && !\(r\.data\.source === "service" && r\.data\.setup\?\.connected === false\)/,
+  );
 });

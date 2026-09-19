@@ -64,7 +64,11 @@ interface ChatState {
 export interface ChatSurface {
   state: ChatState;
   hasLiveRun(): boolean;
-  signalLiveRun(kind: "abort" | "steer", text?: string): Promise<import("./core-bridge").SignalOutcome>;
+  signalLiveRun(
+    kind: "abort" | "steer",
+    text?: string,
+    queuedRunId?: string,
+  ): Promise<import("./core-bridge").SignalOutcome>;
   stopLiveRun(): Promise<void>;
   isStopping(): boolean;
   currentTurnOptions(): TurnOptions;
@@ -129,6 +133,7 @@ export interface ComposerSurface {
   resetComposer(): void;
   focusComposerEnd(): void;
   fillSuggestedPrompt(prompt: string, agent: Agent): void;
+  sendSuggestedPrompt(prompt: string, agent: Agent): Promise<void>;
   resizeComposer(): void;
   currentModelOption(): ModelOption | undefined;
   carryModelPick(fromThreadRef: string | null, toThreadRef: string): void;
