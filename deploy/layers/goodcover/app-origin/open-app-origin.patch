@@ -1,0 +1,98 @@
+--- a/src/api/routes/deployments.ts
++++ b/src/api/routes/deployments.ts
+@@ -92,7 +92,7 @@
+     }
+   }
+   const reach = await app.reachDeployment(id, principal);
+-  return proxyReach(ctx, reach, subPath, principal, { sandbox: true });
++  return proxyReach(ctx, reach, subPath, principal);
+ }
+ 
+ function adminDeploymentProxyParts(pathname: string): { id: string; subPath: string } | null {
+@@ -139,7 +139,7 @@
+     scopeLabel: deployment.ownerScopeId,
+   });
+   const reach = await app.reachDeployment(parts.id, "", { bypassAcl: true });
+-  return proxyReach(ctx, reach, parts.subPath, undefined, { sandbox: true });
++  return proxyReach(ctx, reach, parts.subPath);
+ }
+ 
+ const GATEWAY_AUTH_HEADERS = [
+@@ -193,11 +193,8 @@
+   return out;
+ }
+ 
+-const APP_SANDBOX_CSP = "sandbox allow-scripts allow-forms allow-popups allow-modals allow-downloads";
+-
+ function gatewaySafeResponseHeaders(
+   headers: Record<string, string | string[] | number | undefined>,
+-  sandbox = false,
+ ): Record<string, string | string[]> {
+   const normalized: Record<string, string | string[] | undefined> = {};
+   for (const [rawName, value] of Object.entries(headers)) {
+@@ -214,12 +211,6 @@
+     else delete out["set-cookie"];
+   }
+   delete out["clear-site-data"];
+-  if (sandbox) {
+-    const existing = out["content-security-policy"];
+-    out["content-security-policy"] = existing
+-      ? [...(Array.isArray(existing) ? existing : [existing]), APP_SANDBOX_CSP]
+-      : APP_SANDBOX_CSP;
+-  }
+   return out;
+ }
+ 
+@@ -285,7 +276,6 @@
+   subPath: string,
+   headers: Record<string, string | string[]>,
+   bufferedBody: Buffer | null,
+-  sandbox: boolean,
+ ): void {
+   const { req, res, deps, url, method } = ctx;
+   const { host, port, tls } = endpoint.endpoint;
+@@ -390,7 +380,7 @@
+       markUpstreamUp(`${host}:${port}`);
+       armThrottleShield(`${host}:${port}`, Number(responseHeaders[":status"] ?? 0), up);
+       const status = Number(responseHeaders[":status"] ?? 502);
+-      const safeHeaders = gatewaySafeResponseHeaders(responseHeaders, sandbox);
++      const safeHeaders = gatewaySafeResponseHeaders(responseHeaders);
+       res.writeHead(status, safeHeaders);
+       up.pipe(res, { end: false });
+     });
+@@ -481,7 +471,6 @@
+   reach: Awaited<ReturnType<App["reachDeployment"]>>,
+   subPath: string,
+   viewer?: string,
+-  opts?: { sandbox?: boolean },
+ ): Promise<void> {
+   const { req, res, deps, url, method } = ctx;
+   if (res.destroyed) return;
+@@ -534,7 +523,7 @@
+   }
+   if (res.destroyed) return;
+   if (reach.endpoint.httpVersion === "2") {
+-    proxyReachHttp2(ctx, reach, subPath, headers, bufferedBody, opts?.sandbox ?? false);
++    proxyReachHttp2(ctx, reach, subPath, headers, bufferedBody);
+     return;
+   }
+   const htmlNav = wantsWarmingPage(req, method);
+@@ -543,7 +532,7 @@
+     markUpstreamUp(upstreamKey);
+     upRes.on("error", () => res.destroy());
+     armThrottleShield(upstreamKey, upRes.statusCode ?? 0, upRes);
+-    const headers = gatewaySafeResponseHeaders(upRes.headers, opts?.sandbox ?? false);
++    const headers = gatewaySafeResponseHeaders(upRes.headers);
+     res.writeHead(upRes.statusCode ?? 502, headers);
+     upRes.pipe(res);
+   });
+--- a/plugins/web-ui/server/index.ts
++++ b/plugins/web-ui/server/index.ts
+@@ -2905,7 +2905,6 @@
+     delete outHeaders["content-length"];
+     res.writeHead(up.status, {
+       ...outHeaders,
+-      "content-security-policy": UNTRUSTED_CONTENT_SANDBOX_CSP,
+       "x-content-type-options": "nosniff",
+     });
+     return res.end(Buffer.from(await up.arrayBuffer()));

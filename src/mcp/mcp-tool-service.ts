@@ -13,7 +13,7 @@ import { createMcpClient, mcpResultText, type McpAuth, type McpClient, type McpF
 import type { McpServer, McpServerStore } from "./mcp-server-store.ts";
 
 const REFRESH_INTERVAL_MS = 5 * 60_000;
-const MAX_TOOLS_PER_SERVER = 64;
+const MAX_TOOLS_PER_SERVER = 128;
 const MAX_RESULT_CHARS = 60_000;
 
 export interface McpToolDescriptor {
@@ -82,9 +82,7 @@ export function createMcpToolService(opts: {
     return client;
   }
 
-  async function callerClient(server: McpServer, principalId?: string): Promise<McpClient> {
-    if ((server.credentialScope ?? "shared") === "shared") return clientFor(server);
-    if (server.credentialScope !== "per-user") throw new Error("invalid MCP credential scope");
+  async function tokenClient(server: McpServer, principalId?: string): Promise<McpClient> {
     if (!principalId || !server.credentialHost || !opts.userTokens) {
       throw new Error(`MCP server ${server.id} requires a connected user account`);
     }
@@ -102,12 +100,23 @@ export function createMcpToolService(opts: {
     });
   }
 
+  async function discoveryClient(server: McpServer): Promise<McpClient> {
+    return server.auth === "oauth" ? tokenClient(server, server.oauthPrincipalId) : clientFor(server);
+  }
+
+  async function callerClient(server: McpServer, principalId?: string): Promise<McpClient> {
+    const scope = server.credentialScope ?? "shared";
+    if (scope === "shared") return discoveryClient(server);
+    if (scope !== "per-user") throw new Error("invalid MCP credential scope");
+    return tokenClient(server, principalId);
+  }
+
   async function refresh(): Promise<void> {
     const servers = (await opts.servers.list()).filter((s) => s.enabled);
     const next: McpToolDescriptor[] = [];
     for (const server of servers) {
       try {
-        const tools = (await clientFor(server).listTools()).slice(0, MAX_TOOLS_PER_SERVER);
+        const tools = (await (await discoveryClient(server)).listTools()).slice(0, MAX_TOOLS_PER_SERVER);
         for (const tool of tools) {
           next.push({
             name: `${server.id}_${tool.name}`.replace(/[^a-zA-Z0-9_-]/g, "_"),
@@ -156,12 +165,7 @@ export function createMcpToolService(opts: {
     },
     refresh,
     async probe(server) {
-      const client = createMcpClient({
-        url: server.url,
-        auth: authOf(server),
-        ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
-        now,
-      });
+      const client = await discoveryClient(server);
       const tools = await client.listTools();
       return tools.map((t) => t.name);
     },

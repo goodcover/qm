@@ -1,5 +1,6 @@
 import { test, mock } from "node:test";
 import assert from "node:assert/strict";
+import { z } from "zod";
 import { createMemoryRunSignalStore } from "../src/runs/run-signal-store.ts";
 import type { HarnessLlmRequestRecord, HarnessTurnInput } from "../src/harness/harness.ts";
 import type { NewEntry } from "../src/sessions/session-store.ts";
@@ -8,6 +9,7 @@ import type { ScopeId, SessionEntry } from "../src/types.ts";
 type FakeSdkMessage = Record<string, unknown>;
 type Script = (prompts: AsyncIterable<{ message: { content: unknown } }>) => AsyncGenerator<FakeSdkMessage>;
 
+const toolShapes = new Map<string, z.ZodRawShape>();
 const toolHandlers = new Map<string, (args: unknown) => Promise<unknown>>();
 
 let currentScript: Script = async function* () {};
@@ -33,6 +35,7 @@ mock.module("@anthropic-ai/claude-agent-sdk", {
     },
     tool: (name: string, description: string, schema: unknown, handler: (args: unknown) => Promise<unknown>) => {
       toolHandlers.set(name, handler);
+      toolShapes.set(name, schema as z.ZodRawShape);
       return { name, description, schema, handler };
     },
     createSdkMcpServer: (config: unknown) => config,
@@ -349,3 +352,41 @@ test("Claude preserves a committed runtime handoff when SDK interruption returns
   assert.equal(entries.filter((entry) => entry.type === "assistant").length, 0);
   assert.ok(entries.some((entry) => entry.type === "tool_result"));
 });
+
+for (const dialect of ["legacy", "modern", "explicit"] as const) {
+  test(`Claude starts turns with ${dialect} MCP schema references and preserves validation`, async () => {
+    const defsKey = dialect === "modern" ? "$defs" : "definitions";
+    const inputSchema = {
+      type: "object",
+      ...(dialect === "explicit" ? { $schema: "http://json-schema.org/draft-07/schema#" } : {}),
+      properties: {
+        statuses: { type: "array", items: { $ref: `#/${defsKey}/Status` } },
+      },
+      required: ["statuses"],
+      [defsKey]: { Status: { type: "string", enum: ["TODO", "DONE"] } },
+    };
+    currentScript = async function* (prompts) {
+      await prompts[Symbol.asyncIterator]().next();
+      yield resultMessage("ready");
+    };
+    const harness = createClaudeHarness({
+      mcpTools: () => [
+        {
+          name: "plain_searchThreads",
+          serverId: "plain",
+          remoteName: "searchThreads",
+          description: "Search threads",
+          inputSchema,
+          readOnly: false,
+        },
+      ],
+    });
+    const { turn } = harnessTurn({ readOnly: false });
+    const result = await harness.turns.runTurn(turn);
+    assert.equal(result.reply, "ready");
+    const schema = z.object(toolShapes.get("plain_searchThreads")!);
+    assert.equal(schema.safeParse({ statuses: ["TODO"] }).success, true);
+    assert.equal(schema.safeParse({ statuses: ["INVALID"] }).success, false);
+    assert.equal(schema.safeParse({}).success, false);
+  });
+}

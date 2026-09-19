@@ -1,0 +1,11 @@
+--- a/src/mcp/mcp-tool-service.ts
++++ b/src/mcp/mcp-tool-service.ts
+@@ -13,7 +13,7 @@
+ import type { McpServer, McpServerStore } from "./mcp-server-store.ts";
+ 
+ const REFRESH_INTERVAL_MS = 5 * 60_000;
+-const MAX_TOOLS_PER_SERVER = 64;
++const MAX_TOOLS_PER_SERVER = 128;
+ const MAX_RESULT_CHARS = 60_000;
+ 
+ export interface McpToolDescriptor {

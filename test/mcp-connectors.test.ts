@@ -262,3 +262,83 @@ test("per-user connectors select an explicit account slot without falling back t
   await users.deleteConnectorToken(host, "internal:alice", "company");
   await assert.rejects(service.call("crm_query", {}, "internal:alice"), /Connect your account/);
 });
+
+test("OAuth MCP discovery refreshes its owner's token while calls use the selected credential scope", async (t) => {
+  const store = createMcpServerStore(createMemoryMap<McpServer>());
+  const requests: Array<{ method: string; auth: string | undefined }> = [];
+  const tokens = new Map([
+    ["admin", "admin-first"],
+    ["alice", "alice-only"],
+  ]);
+  const service = createMcpToolService({
+    servers: store,
+    userTokens: {
+      connectorAccessToken: async (host, principal, account) => {
+        assert.equal(host, "mcp.example.com");
+        assert.equal(account, "company");
+        return tokens.get(principal) ?? null;
+      },
+    },
+    fetchImpl: async (_url, init) => {
+      const req = JSON.parse(init.body);
+      requests.push({ method: req.method, auth: init.headers.authorization });
+      return jsonResponse({
+        id: req.id,
+        result: req.method === "tools/list" ? { tools: TOOLS } : { content: [{ type: "text", text: "ok" }] },
+      });
+    },
+  });
+  t.after(() => service.close());
+  const config = server({
+    auth: "oauth",
+    credentialScope: "per-user",
+    credentialHost: "mcp.example.com",
+    credentialAccountType: "company",
+    oauthPrincipalId: "admin",
+  });
+  await store.put(config);
+  await service.refresh();
+  assert.equal(requests.at(-1)?.auth, "Bearer admin-first");
+  tokens.set("admin", "admin-refreshed");
+  await service.probe(config);
+  assert.equal(requests.at(-1)?.auth, "Bearer admin-refreshed");
+  await service.call("crm_query", {}, "alice");
+  assert.equal(requests.at(-1)?.auth, "Bearer alice-only");
+  const calls = requests.length;
+  await assert.rejects(service.call("crm_query", {}, "bob"), /Connect your account/);
+  await assert.rejects(service.call("crm_query", {}), /requires a connected user account/);
+  assert.equal(requests.length, calls);
+  await store.put({ ...config, credentialScope: "shared" });
+  await service.refresh();
+  await service.call("crm_query", {}, "bob");
+  assert.equal(requests.at(-1)?.auth, "Bearer admin-refreshed");
+  tokens.delete("admin");
+  await service.refresh();
+  assert.deepEqual(service.toolDefs(), []);
+  await assert.rejects(service.probe(config), /Connect your account/);
+});
+
+test("MCP discovery retains callable tools beyond the first 64 entries", async () => {
+  const servers = createMcpServerStore(createMemoryMap<McpServer>());
+  await servers.put(server());
+  const tools = Array.from({ length: 77 }, (_, i) => ({ ...TOOLS[0]!, name: `tool_${i}` }));
+  const service = createMcpToolService({
+    servers,
+    fetchImpl: async (_url, init) => {
+      const request = JSON.parse(init.body);
+      return jsonResponse({
+        jsonrpc: "2.0",
+        id: request.id,
+        result:
+          request.method === "tools/list" ? { tools } : { content: [{ type: "text", text: request.params.name }] },
+      });
+    },
+  });
+  try {
+    await service.refresh();
+    assert.equal(service.toolDefs().length, 77);
+    assert.equal(await service.call("crm_tool_76", {}), "tool_76");
+  } finally {
+    service.close();
+  }
+});

@@ -80,25 +80,33 @@ async function fixture(
   return { port, close };
 }
 
-test("/d/ path serving sandboxes proxied HTML so an app cannot act on the portal's origin", async () => {
+test("/d/ path serving allows apps to use browser storage on the portal origin", async () => {
   const f = await fixture({});
   try {
     const page = await httpGet(f.port, "/d/mysite/", { "x-as-principal": "alice@example.com" });
     assert.equal(page.status, 200);
-    const csp = page.headers["content-security-policy"];
-    assert.match(String(csp), /^sandbox /, "proxied HTML carries a sandbox CSP");
-    assert.doesNotMatch(String(csp), /allow-same-origin/, "the sandbox must deny the portal origin to app code");
+    assert.equal(page.headers["content-security-policy"], undefined);
   } finally {
     await f.close();
   }
 });
 
-test("/d/ path serving sandboxes every response — content-type spoofing cannot dodge it", async () => {
-  const f = await fixture({}, "Text/HTML; charset=utf-8");
+test("/d/ path serving preserves an application-provided content security policy", async () => {
+  const f = await fixture({}, "Text/HTML; charset=utf-8", { "content-security-policy": "default-src 'self'" });
   try {
     const data = await httpGet(f.port, "/d/mysite/api", { "x-as-principal": "alice@example.com" });
     assert.equal(data.status, 200);
-    assert.match(String(data.headers["content-security-policy"]), /^sandbox /);
+    assert.equal(data.headers["content-security-policy"], "default-src 'self'");
+  } finally {
+    await f.close();
+  }
+});
+
+test("/d/ path serving still denies viewers outside the deployment scope", async () => {
+  const f = await fixture({});
+  try {
+    const page = await httpGet(f.port, "/d/mysite/", { "x-as-principal": "bob@example.com" });
+    assert.equal(page.status, 403);
   } finally {
     await f.close();
   }

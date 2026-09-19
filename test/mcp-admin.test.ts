@@ -86,6 +86,32 @@ test("MCP admin validates and preserves credential scope, without returning secr
   assert.equal((await store.get("crm"))?.credentialScope, "shared");
   assert.equal((await store.get("crm"))?.credentialHost, undefined);
   assert.equal((await store.get("crm"))?.credentialAccountType, undefined);
+  const oauth = await put({
+    auth: "oauth",
+    credentialScope: "per-user",
+    url: "https://mcp.plain.com/mcp",
+    oauthPrincipalId: "victim@example.com",
+  });
+  assert.equal(oauth.status, 200);
+  const oauthServer = ((await oauth.json()) as { server: McpServer & { hasBearerToken: boolean } }).server;
+  assert.equal(oauthServer.credentialHost, "mcp.plain.com");
+  assert.equal(oauthServer.oauthPrincipalId, "admin-alice");
+  assert.equal(oauthServer.hasBearerToken, false);
+  assert.equal(
+    (await put({ auth: "oauth", credentialHost: "mcp.plain.com", url: "https://evil.example/mcp" })).status,
+    400,
+  );
+  assert.equal(
+    (
+      await put({
+        auth: "oauth",
+        credentialHost: "mcp.plain.com",
+        url: "http://mcp.plain.com/mcp",
+        credentialScope: "shared",
+      })
+    ).status,
+    400,
+  );
 });
 
 test("production wiring never uses operator fallback tokens for per-user MCP calls", async (t) => {

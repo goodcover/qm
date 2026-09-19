@@ -9,7 +9,7 @@ import { sendJson } from "../../http.ts";
 import type { ApiCtx } from "../route.ts";
 import { audit, authorizeAdmin, orgScope } from "../shared.ts";
 
-const AUTH_MODES: McpServerAuthMode[] = ["none", "bearer", "client-credentials"];
+const AUTH_MODES: McpServerAuthMode[] = ["none", "bearer", "client-credentials", "oauth"];
 
 async function actor(ctx: ApiCtx) {
   const scope = orgScope(ctx.deps);
@@ -79,11 +79,18 @@ export async function putMcpServer(ctx: ApiCtx): Promise<void> {
     return sendJson(ctx.res, 400, { error: "bad_request", message: `auth must be one of ${AUTH_MODES.join(", ")}` });
   }
   const existing = await ctx.deps.mcpServers.get(id);
-  const credentialScope = b.credentialScope ?? existing?.credentialScope ?? "shared";
+  const credentialScope = b.credentialScope ?? existing?.credentialScope ?? (auth === "oauth" ? "per-user" : "shared");
   if (credentialScope !== "shared" && credentialScope !== "per-user") {
     return sendJson(ctx.res, 400, { error: "bad_request", message: "credentialScope must be shared or per-user" });
   }
-  const credentialHost = b.credentialHost ?? existing?.credentialHost;
+  const credentialHost =
+    b.credentialHost ?? existing?.credentialHost ?? (auth === "oauth" ? parsed.hostname : undefined);
+  if (auth === "oauth" && credentialHost !== parsed.hostname) {
+    return sendJson(ctx.res, 400, {
+      error: "bad_request",
+      message: "OAuth credentialHost must match the MCP server hostname",
+    });
+  }
   const credentialAccountType = b.credentialAccountType ?? existing?.credentialAccountType ?? "default";
   if (!["default", "personal", "company"].includes(credentialAccountType)) {
     return sendJson(ctx.res, 400, {
@@ -92,7 +99,7 @@ export async function putMcpServer(ctx: ApiCtx): Promise<void> {
     });
   }
   if (
-    credentialScope === "per-user" &&
+    (credentialScope === "per-user" || auth === "oauth") &&
     (typeof credentialHost !== "string" ||
       !credentialHost ||
       credentialHost !== credentialHost.trim() ||
@@ -102,7 +109,7 @@ export async function putMcpServer(ctx: ApiCtx): Promise<void> {
     return sendJson(ctx.res, 400, { error: "bad_request", message: "per-user credentials require a credentialHost" });
   }
   if (
-    credentialScope === "per-user" &&
+    (credentialScope === "per-user" || auth === "oauth") &&
     parsed.protocol !== "https:" &&
     !["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname)
   ) {
@@ -117,7 +124,8 @@ export async function putMcpServer(ctx: ApiCtx): Promise<void> {
     url,
     auth,
     credentialScope,
-    ...(credentialScope === "per-user" ? { credentialHost, credentialAccountType } : {}),
+    ...(credentialScope === "per-user" || auth === "oauth" ? { credentialHost, credentialAccountType } : {}),
+    ...(auth === "oauth" ? { oauthPrincipalId: existing?.oauthPrincipalId ?? authorized.id } : {}),
     ...(auth === "bearer"
       ? { bearerToken: typeof b.bearerToken === "string" && b.bearerToken ? b.bearerToken : existing?.bearerToken }
       : {}),

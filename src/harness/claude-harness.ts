@@ -319,7 +319,11 @@ export function createClaudeHarness(opts: ClaudeHarnessOptions = {}): Harness {
       controller.abort();
     };
     const definitions = bridged.map((definition) => {
-      const schema = fromJSONSchema(definition.parameters as Parameters<typeof fromJSONSchema>[0]) as ZodObject;
+      const parameters = definition.parameters as Parameters<typeof fromJSONSchema>[0];
+      const schema = fromJSONSchema(parameters, {
+        defaultTarget:
+          typeof parameters === "object" && parameters.definitions && !parameters.$defs ? "draft-7" : "draft-2020-12",
+      }) as ZodObject;
       return tool(definition.name, definition.description, schema.shape, async (args, extra) => {
         const callId = String(
           (extra as { toolUseId?: string } | undefined)?.toolUseId ?? randomBytes(8).toString("hex"),

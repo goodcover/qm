@@ -53,6 +53,7 @@ export interface OAuthProviderConfig {
   exchange?: OAuthExchangeAdapter;
   refresh?: OAuthRefreshAdapter | null;
   pkce?: boolean;
+  resource?: string;
 }
 
 export type FetchLike = (
@@ -124,6 +125,7 @@ function makeTokenAdapters(opts: {
           code,
           redirect_uri: redirectUri,
           ...clientBody(client),
+          ...(provider.resource ? { resource: provider.resource } : {}),
           ...(codeVerifier ? { code_verifier: codeVerifier } : {}),
         }).toString(),
       });
@@ -140,6 +142,7 @@ function makeTokenAdapters(opts: {
           grant_type: "refresh_token",
           refresh_token: token.refreshToken ?? "",
           ...clientBody(client),
+          ...(provider.resource ? { resource: provider.resource } : {}),
         }).toString(),
       });
       if (!res.ok) throw new Error(`${prefix}token refresh failed (${res.status})`);
@@ -213,6 +216,29 @@ const notionExchange: OAuthExchangeAdapter = async ({ provider, client, code, re
 };
 
 export const PROVIDERS: Record<string, OAuthProviderConfig> = {
+  plain: {
+    hosts: ["mcp.plain.com"],
+    authUrl: "https://signin.auth.plain.com/oauth2/authorize",
+    tokenUrl: "https://signin.auth.plain.com/oauth2/token",
+    scopes: ["openid", "offline_access"],
+    clientIdEnv: "PLAIN_OAUTH_CLIENT_ID",
+    clientSecretEnv: "PLAIN_OAUTH_CLIENT_SECRET",
+    redirectPath: "plain/callback",
+    consentMode: "standard",
+    egressRule: ["mcp.plain.com", "signin.auth.plain.com"],
+    pkce: true,
+    resource: "https://mcp.plain.com/mcp",
+    setupGuide: {
+      console: "Plain OAuth client registration",
+      url: "https://www.plain.com/docs/integrations/mcp-server",
+      steps: [
+        "Register a client at https://signin.auth.plain.com/oauth2/register using client_secret_post.",
+        "Include the redirect URI shown below and the authorization_code and refresh_token grant types.",
+        "Save the returned client ID and client secret, then connect your Plain account in Keychain.",
+      ],
+      scopesRationale: "openid identifies the connecting account; offline_access allows token refresh.",
+    },
+  },
   google: {
     hosts: [
       "gmail.googleapis.com",
@@ -561,6 +587,7 @@ export function authorizeUrl(
     q.set("code_challenge_method", "S256");
   }
   q.set(p.scopeParam ?? "scope", scopes.join(" "));
+  if (p.resource) q.set("resource", p.resource);
   for (const [k, v] of Object.entries(p.authParams ?? {})) q.set(k, v);
   if (accountType === "company" && opts.client.hostedDomain) q.set("hd", opts.client.hostedDomain);
   return `${p.authUrl}?${q.toString()}`;

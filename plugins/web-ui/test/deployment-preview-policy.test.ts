@@ -32,15 +32,12 @@ test.after(() => {
   core.close();
 });
 
-test("in-surface deployment preview is sandboxed to an opaque origin (no same-origin XSS)", async () => {
+test("in-surface deployment preview preserves the application content security policy", async () => {
   const identity = mintPortalIdentity({ p: "alice", exp: Date.now() + 60_000 }, "deployment-preview-test-secret");
   const r = await fetch(`${base}/deployments/some-app/`, { headers: { [PORTAL_IDENTITY_HEADER]: identity } });
   assert.equal(r.status, 200);
   const csp = r.headers.get("content-security-policy") ?? "";
-  assert.match(csp, /^sandbox\b/, "the response is served under a CSP sandbox");
-  assert.ok(!/allow-same-origin/.test(csp), "the sandbox never grants same-origin (opaque origin only)");
-  assert.match(csp, /allow-scripts/, "scripts still run inside the opaque origin");
-  assert.ok(!/default-src \*/.test(csp), "the surface CSP overrides the upstream's permissive one");
+  assert.equal(csp, "default-src *");
   assert.equal(r.headers.get("x-content-type-options"), "nosniff");
 });
 

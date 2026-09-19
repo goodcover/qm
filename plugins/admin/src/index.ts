@@ -292,6 +292,7 @@ const WRITES = new Map<string, string[]>([
   ["model-providers", ["PUT", "DELETE"]],
   ["model-registry", ["POST", "PUT", "DELETE"]],
   ["custom-providers", ["PUT", "DELETE"]],
+  ["mcp-servers", ["PUT", "DELETE"]],
 ]);
 
 const READS = [
@@ -319,6 +320,7 @@ const READS = [
   "model-providers",
   "model-registry",
   "custom-providers",
+  "mcp-servers",
 ];
 
 export async function handler(req: IncomingMessage, res: ServerResponse): Promise<void> {

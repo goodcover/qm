@@ -2860,7 +2860,6 @@ const routeRequest = async (req: IncomingMessage, res: ServerResponse) => {
     delete outHeaders["content-length"];
     res.writeHead(up.status, {
       ...outHeaders,
-      "content-security-policy": UNTRUSTED_CONTENT_SANDBOX_CSP,
       "x-content-type-options": "nosniff",
     });
     return res.end(Buffer.from(await up.arrayBuffer()));

@@ -135,3 +135,26 @@ test("grants/users require a signed-in cookie → 401 when absent (no core hop)"
   assert.equal((await fetch(`${base}/api/keychain`)).status, 401);
   assert.equal(calls.length, before, "a signed-out request is rejected at the surface, never forwarded");
 });
+
+test("MCP server administration forwards OAuth configuration through the signed admin proxy", async () => {
+  const body = {
+    name: "Plain",
+    url: "https://mcp.plain.com/mcp",
+    auth: "oauth",
+    credentialScope: "per-user",
+    validate: false,
+  };
+  const saved = await fetch(`${base}/api/mcp-servers/plain`, {
+    method: "PUT",
+    headers: { cookie: ADMIN, "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  assert.equal(saved.status, 200);
+  assert.equal(calls.at(-1)!.url, "/v1/admin/mcp-servers/plain");
+  assert.equal(calls.at(-1)!.signed, true);
+  assert.deepEqual(JSON.parse(calls.at(-1)!.body), body);
+  const listed = await fetch(`${base}/api/mcp-servers`, { headers: { cookie: ADMIN } });
+  assert.equal(listed.status, 200);
+  assert.equal(calls.at(-1)!.url, "/v1/admin/mcp-servers");
+  assert.equal((await fetch(`${base}/api/mcp-servers`)).status, 401);
+});

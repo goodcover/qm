@@ -1,0 +1,276 @@
+--- a/src/connectors/oauth.ts
++++ b/src/connectors/oauth.ts
+@@ -53,6 +53,7 @@
+   exchange?: OAuthExchangeAdapter;
+   refresh?: OAuthRefreshAdapter | null;
+   pkce?: boolean;
++  resource?: string;
+ }
+ 
+ export type FetchLike = (
+@@ -124,6 +125,7 @@
+           code,
+           redirect_uri: redirectUri,
+           ...clientBody(client),
++          ...(provider.resource ? { resource: provider.resource } : {}),
+           ...(codeVerifier ? { code_verifier: codeVerifier } : {}),
+         }).toString(),
+       });
+@@ -140,6 +142,7 @@
+           grant_type: "refresh_token",
+           refresh_token: token.refreshToken ?? "",
+           ...clientBody(client),
++          ...(provider.resource ? { resource: provider.resource } : {}),
+         }).toString(),
+       });
+       if (!res.ok) throw new Error(`${prefix}token refresh failed (${res.status})`);
+@@ -213,6 +216,29 @@
+ };
+ 
+ export const PROVIDERS: Record<string, OAuthProviderConfig> = {
++  plain: {
++    hosts: ["mcp.plain.com"],
++    authUrl: "https://signin.auth.plain.com/oauth2/authorize",
++    tokenUrl: "https://signin.auth.plain.com/oauth2/token",
++    scopes: ["openid", "offline_access"],
++    clientIdEnv: "PLAIN_OAUTH_CLIENT_ID",
++    clientSecretEnv: "PLAIN_OAUTH_CLIENT_SECRET",
++    redirectPath: "plain/callback",
++    consentMode: "standard",
++    egressRule: ["mcp.plain.com", "signin.auth.plain.com"],
++    pkce: true,
++    resource: "https://mcp.plain.com/mcp",
++    setupGuide: {
++      console: "Plain OAuth client registration",
++      url: "https://www.plain.com/docs/integrations/mcp-server",
++      steps: [
++        "Register a client at https://signin.auth.plain.com/oauth2/register using client_secret_post.",
++        "Include the redirect URI shown below and the authorization_code and refresh_token grant types.",
++        "Save the returned client ID and client secret, then connect your Plain account in Keychain.",
++      ],
++      scopesRationale: "openid identifies the connecting account; offline_access allows token refresh.",
++    },
++  },
+   google: {
+     hosts: [
+       "gmail.googleapis.com",
+@@ -561,6 +587,7 @@
+     q.set("code_challenge_method", "S256");
+   }
+   q.set(p.scopeParam ?? "scope", scopes.join(" "));
++  if (p.resource) q.set("resource", p.resource);
+   for (const [k, v] of Object.entries(p.authParams ?? {})) q.set(k, v);
+   if (accountType === "company" && opts.client.hostedDomain) q.set("hd", opts.client.hostedDomain);
+   return `${p.authUrl}?${q.toString()}`;
+--- a/src/mcp/mcp-server-store.ts
++++ b/src/mcp/mcp-server-store.ts
+@@ -7,13 +7,17 @@
+ 
+ import type { DurableMap } from "../persistence/durable-map.ts";
+ 
+-export type McpServerAuthMode = "none" | "bearer" | "client-credentials";
++export type McpServerAuthMode = "none" | "bearer" | "client-credentials" | "oauth";
+ 
+ export interface McpServer {
+   id: string;
+   name: string;
+   url: string;
+   auth: McpServerAuthMode;
++  credentialScope?: "shared" | "per-user";
++  credentialHost?: string;
++  oauthPrincipalId?: string;
++  credentialAccountType?: "default" | "personal" | "company";
+   bearerToken?: string;
+   clientId?: string;
+   clientSecret?: string;
+--- a/src/mcp/mcp-tool-service.ts
++++ b/src/mcp/mcp-tool-service.ts
+@@ -6,6 +6,7 @@
+ // namespaced `<serverId>_<toolName>` so two servers can't collide with each
+ // other or with built-in tools.
+ 
++import type { ConnectorTokenStore } from "../credentials/keychain.ts";
+ import type { AuditLog } from "../audit/audit-log.ts";
+ import { errMessage } from "../util/errors.ts";
+ import { createMcpClient, mcpResultText, type McpAuth, type McpClient, type McpFetch } from "./mcp-client.ts";
+@@ -47,6 +48,7 @@
+ export function createMcpToolService(opts: {
+   servers: McpServerStore;
+   audit?: AuditLog;
++  userTokens?: Pick<ConnectorTokenStore, "connectorAccessToken">;
+   fetchImpl?: McpFetch;
+   now?: () => number;
+   refreshIntervalMs?: number;
+@@ -80,12 +82,41 @@
+     return client;
+   }
+ 
++  async function tokenClient(server: McpServer, principalId?: string): Promise<McpClient> {
++    if (!principalId || !server.credentialHost || !opts.userTokens) {
++      throw new Error(`MCP server ${server.id} requires a connected user account`);
++    }
++    const token = await opts.userTokens.connectorAccessToken(
++      server.credentialHost,
++      principalId,
++      server.credentialAccountType,
++    );
++    if (!token) throw new Error(`Connect your account for MCP server ${server.id} before using this tool`);
++    return createMcpClient({
++      url: server.url,
++      auth: { mode: "bearer", token },
++      ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
++      now,
++    });
++  }
++
++  async function discoveryClient(server: McpServer): Promise<McpClient> {
++    return server.auth === "oauth" ? tokenClient(server, server.oauthPrincipalId) : clientFor(server);
++  }
++
++  async function callerClient(server: McpServer, principalId?: string): Promise<McpClient> {
++    const scope = server.credentialScope ?? "shared";
++    if (scope === "shared") return discoveryClient(server);
++    if (scope !== "per-user") throw new Error("invalid MCP credential scope");
++    return tokenClient(server, principalId);
++  }
++
+   async function refresh(): Promise<void> {
+     const servers = (await opts.servers.list()).filter((s) => s.enabled);
+     const next: McpToolDescriptor[] = [];
+     for (const server of servers) {
+       try {
+-        const tools = (await clientFor(server).listTools()).slice(0, MAX_TOOLS_PER_SERVER);
++        const tools = (await (await discoveryClient(server)).listTools()).slice(0, MAX_TOOLS_PER_SERVER);
+         for (const tool of tools) {
+           next.push({
+             name: `${server.id}_${tool.name}`.replace(/[^a-zA-Z0-9_-]/g, "_"),
+@@ -123,7 +154,7 @@
+       const server = await opts.servers.get(def.serverId);
+       if (!server || !server.enabled) throw new Error(`MCP server ${def.serverId} is not available`);
+       try {
+-        const result = await clientFor(server).callTool(def.remoteName, args);
++        const result = await (await callerClient(server, principalId)).callTool(def.remoteName, args);
+         record("call", `${def.serverId}/${def.remoteName}`, "ok", principalId);
+         const text = mcpResultText(result) || JSON.stringify(result.structuredContent ?? "") || "";
+         return text.length > MAX_RESULT_CHARS ? `${text.slice(0, MAX_RESULT_CHARS)}\n[truncated]` : text;
+@@ -134,12 +165,7 @@
+     },
+     refresh,
+     async probe(server) {
+-      const client = createMcpClient({
+-        url: server.url,
+-        auth: authOf(server),
+-        ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
+-        now,
+-      });
++      const client = await discoveryClient(server);
+       const tools = await client.listTools();
+       return tools.map((t) => t.name);
+     },
+--- a/src/api/routes/admin/mcp-servers.ts
++++ b/src/api/routes/admin/mcp-servers.ts
+@@ -9,7 +9,7 @@
+ import type { ApiCtx } from "../route.ts";
+ import { audit, authorizeAdmin, orgScope } from "../shared.ts";
+ 
+-const AUTH_MODES: McpServerAuthMode[] = ["none", "bearer", "client-credentials"];
++const AUTH_MODES: McpServerAuthMode[] = ["none", "bearer", "client-credentials", "oauth"];
+ 
+ async function actor(ctx: ApiCtx) {
+   const scope = orgScope(ctx.deps);
+@@ -79,11 +79,53 @@
+     return sendJson(ctx.res, 400, { error: "bad_request", message: `auth must be one of ${AUTH_MODES.join(", ")}` });
+   }
+   const existing = await ctx.deps.mcpServers.get(id);
++  const credentialScope = b.credentialScope ?? existing?.credentialScope ?? (auth === "oauth" ? "per-user" : "shared");
++  if (credentialScope !== "shared" && credentialScope !== "per-user") {
++    return sendJson(ctx.res, 400, { error: "bad_request", message: "credentialScope must be shared or per-user" });
++  }
++  const credentialHost =
++    b.credentialHost ?? existing?.credentialHost ?? (auth === "oauth" ? parsed.hostname : undefined);
++  if (auth === "oauth" && credentialHost !== parsed.hostname) {
++    return sendJson(ctx.res, 400, {
++      error: "bad_request",
++      message: "OAuth credentialHost must match the MCP server hostname",
++    });
++  }
++  const credentialAccountType = b.credentialAccountType ?? existing?.credentialAccountType ?? "default";
++  if (!["default", "personal", "company"].includes(credentialAccountType)) {
++    return sendJson(ctx.res, 400, {
++      error: "bad_request",
++      message: "credentialAccountType must be default, personal, or company",
++    });
++  }
++  if (
++    (credentialScope === "per-user" || auth === "oauth") &&
++    (typeof credentialHost !== "string" ||
++      !credentialHost ||
++      credentialHost !== credentialHost.trim() ||
++      credentialHost.length > 253 ||
++      /[\s/\\?#@]/.test(credentialHost))
++  ) {
++    return sendJson(ctx.res, 400, { error: "bad_request", message: "per-user credentials require a credentialHost" });
++  }
++  if (
++    (credentialScope === "per-user" || auth === "oauth") &&
++    parsed.protocol !== "https:" &&
++    !["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname)
++  ) {
++    return sendJson(ctx.res, 400, {
++      error: "bad_request",
++      message: "per-user credentials require HTTPS (except loopback)",
++    });
++  }
+   const server: McpServer = {
+     id,
+     name: typeof b.name === "string" && b.name.trim() ? b.name.trim().slice(0, 80) : id,
+     url,
+     auth,
++    credentialScope,
++    ...(credentialScope === "per-user" || auth === "oauth" ? { credentialHost, credentialAccountType } : {}),
++    ...(auth === "oauth" ? { oauthPrincipalId: existing?.oauthPrincipalId ?? authorized.id } : {}),
+     ...(auth === "bearer"
+       ? { bearerToken: typeof b.bearerToken === "string" && b.bearerToken ? b.bearerToken : existing?.bearerToken }
+       : {}),
+--- a/src/wiring.ts
++++ b/src/wiring.ts
+@@ -739,8 +739,6 @@
+     },
+   });
+   const mcpServers = createMcpServerStore(artifactMap<McpServer>("mcp_servers"));
+-  const mcpToolService = createMcpToolService({ servers: mcpServers, audit: auditLog });
+-  const mcpTools = () => mcpToolService.toolDefs();
+   const errors = config.databaseUrl ? createPostgresErrorLog(config.databaseUrl) : createErrorLog();
+   const sandboxOnError = (e: { category: string; code: string; message: string; scopeLabel?: string }) =>
+     errors.record({
+@@ -1057,6 +1055,12 @@
+   // every other personal credential.
+   const userModelCredentials = createUserModelCredentialStore({ keychain: credentialStore });
+   const keychain: Keychain | undefined = keychainKeyMaterial ? credentialStore : undefined;
++  const mcpToolService = createMcpToolService({
++    servers: mcpServers,
++    audit: auditLog,
++    ...(keychain ? { userTokens: keychain } : {}),
++  });
++  const mcpTools = () => mcpToolService.toolDefs();
+   const browserSessionStore: BrowserSessionStore | undefined = keychainKeyMaterial
+     ? createBrowserSessionStore({ sessions: artifactMap<StoredBrowserSession>("browser_sessions"), key: credentialKey })
+     : undefined;
+--- a/plugins/admin/src/index.ts
++++ b/plugins/admin/src/index.ts
+@@ -290,6 +290,7 @@
+   ["model-providers", ["PUT", "DELETE"]],
+   ["model-registry", ["POST", "PUT", "DELETE"]],
+   ["custom-providers", ["PUT", "DELETE"]],
++  ["mcp-servers", ["PUT", "DELETE"]],
+ ]);
+ 
+ const READS = [
+@@ -317,6 +318,7 @@
+   "model-providers",
+   "model-registry",
+   "custom-providers",
++  "mcp-servers",
+ ];
+ 
+ export async function handler(req: IncomingMessage, res: ServerResponse): Promise<void> {

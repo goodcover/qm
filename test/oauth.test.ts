@@ -386,9 +386,9 @@ test("authorizeUrl adds code_challenge + S256 only when a challenge is supplied"
   assert.equal(without.searchParams.get("code_challenge_method"), null);
 });
 
-test("only X opts into PKCE; the other providers leave the seam inert (regression guard)", () => {
+test("X and Plain opt into PKCE; other providers keep their existing behavior", () => {
   for (const [name, p] of Object.entries(PROVIDERS)) {
-    if (name === "x") assert.equal(p.pkce, true, "X requires PKCE");
+    if (name === "x" || name === "plain") assert.equal(p.pkce, true, `${name} requires PKCE`);
     else assert.notEqual(p.pkce, true, `${name} must not enable PKCE`);
   }
 });
@@ -504,4 +504,56 @@ test("oauth flow store — a short opaque state resolves once, then expires", as
   const stale = createOAuthFlowStore(createMemoryMap<OAuthState>(), { now: () => 1_000, ttlMs: 10 });
   const staleId = await stale.start({ provider: "x", principalId: "U1", redirectUri: "https://example.test/cb" }, 0);
   assert.equal(await stale.finish(staleId), null, "expired");
+});
+
+test("Plain authorization, exchange, and refresh retain the MCP resource and rotate tokens", async () => {
+  const client: ResolvedClient = { id: "plain-client", secret: "plain-secret", clientRef: "org:test:plain" };
+  const resource = "https://mcp.plain.com/mcp";
+  const url = new URL(
+    authorizeUrl("plain", {
+      redirectUri: "https://qm.example/v1/connectors/oauth/plain/callback",
+      state: "state",
+      client,
+      codeChallenge: codeChallengeS256("verifier"),
+    }),
+  );
+  assert.equal(url.origin, "https://signin.auth.plain.com");
+  assert.equal(url.searchParams.get("resource"), resource);
+  assert.equal(url.searchParams.get("scope"), "openid offline_access");
+  assert.equal(url.searchParams.get("code_challenge_method"), "S256");
+  const bodies: URLSearchParams[] = [];
+  const fetchImpl: FetchLike = async (target, init) => {
+    assert.equal(target, "https://signin.auth.plain.com/oauth2/token");
+    const body = new URLSearchParams(init.body);
+    bodies.push(body);
+    assert.equal(body.get("resource"), resource);
+    assert.equal(body.get("client_id"), client.id);
+    assert.equal(body.get("client_secret"), client.secret);
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        access_token: `access-${bodies.length}`,
+        refresh_token: `refresh-${bodies.length}`,
+        expires_in: 300,
+      }),
+    };
+  };
+  const first = await exchangeCode("plain", "code", "https://qm.example/callback", {
+    client,
+    fetchImpl,
+    codeVerifier: "verifier",
+    now: 1000,
+  });
+  assert.deepEqual(first.hosts, ["mcp.plain.com"]);
+  assert.equal(bodies[0]!.get("code_verifier"), "verifier");
+  assert.equal(first.token.expiresAt, 301000);
+  const second = await makeRefresh({ resolveClient: async () => client, fetchImpl, now: () => 2000 })(
+    "mcp.plain.com",
+    first.token,
+  );
+  assert.equal(bodies[1]!.get("grant_type"), "refresh_token");
+  assert.equal(bodies[1]!.get("refresh_token"), "refresh-1");
+  assert.equal(second.refreshToken, "refresh-2");
+  assert.equal(second.accessToken, "access-2");
 });

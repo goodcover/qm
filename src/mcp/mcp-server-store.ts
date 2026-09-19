@@ -7,7 +7,7 @@
 
 import type { DurableMap } from "../persistence/durable-map.ts";
 
-export type McpServerAuthMode = "none" | "bearer" | "client-credentials";
+export type McpServerAuthMode = "none" | "bearer" | "client-credentials" | "oauth";
 
 export interface McpServer {
   id: string;
@@ -16,6 +16,7 @@ export interface McpServer {
   auth: McpServerAuthMode;
   credentialScope?: "shared" | "per-user";
   credentialHost?: string;
+  oauthPrincipalId?: string;
   credentialAccountType?: "default" | "personal" | "company";
   bearerToken?: string;
   clientId?: string;
