@@ -93,6 +93,13 @@ publishing to a Goodcover-owned registry, and updating the immutable image
 references in ops after validation. No automatic deployment or image publishing
 pipeline is enabled by this setup.
 
+The Goodcover Slack bot is configured through QM's admin settings. Its encrypted
+installation lives in Postgres and core starts the Socket Mode connection. Keep
+the existing database, `ORG_ID`, and `CONNECTOR_SECRET_KEY` during upgrades; do not
+create a second connection with production bot credentials for local QA. The
+0.1.12 source update accepts the existing 0.1.11 installation without migration
+or token re-entry. Ops owns the release's immutable image pins and rollout record.
+
 ## Enable Claude Code alongside Codex
 
 The deployed core already includes the Claude Code harness. Adding a token to

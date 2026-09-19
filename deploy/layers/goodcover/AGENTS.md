@@ -12,7 +12,9 @@ Do not run `qm init` over it or `qm up --target aws` for GC4.
 Material infrastructure additions need Dan's high-level approval. Creating this
 source repository does not authorize a production upgrade or new infrastructure.
 Keep Google Workspace login and the existing subscription credential for chats
-and background jobs. No API-key fallback or Slack bot is configured.
+and background jobs. No API-key fallback is configured. Preserve the existing
+Goodcover Slack bot stored through QM's admin configuration in Postgres; its
+absence from Kubernetes environment variables does not mean Slack is disabled.
 
 Never copy decrypted secrets, `.local` records, credentials, workspace snapshots,
 or Terraform state from ops into this repository. Only ops has git-crypt setup.
