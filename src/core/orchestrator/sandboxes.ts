@@ -334,23 +334,27 @@ export function createTurnSandboxes(ctx: TurnSandboxContext) {
       void deps.skills.recordUse(resolution.skill.id).catch((e) => swallow("orchestrator: skill recordUse", e));
     return { content, sourceScopeId: resolution.skill.scopeId };
   };
-  const laidTrees = new Set<string>();
-  const materializeSkillTree = async (handle: SandboxHandle, r: SkillResolution, sandboxId?: string): Promise<void> => {
+  const materializeSkillTree = async (
+    handle: SandboxHandle,
+    r: SkillResolution,
+    currentSkills = visibleSkillsForTurn,
+    required = false,
+  ): Promise<void> => {
     const skillDir = safeSkillDirName(r.skill!.manifest.name);
-    const treeKey = `${sandboxId ?? "default"}:${skillDir}`;
-    if (laidTrees.has(treeKey)) return;
     const start = Date.now();
     try {
       await skillMaterializer.materializeTree(deps.sandbox, handle, r, [], async () => {
-        const latest = (await visibleSkillsForTurn()).find(
+        const latest = (await currentSkills()).find(
           (candidate) => candidate.skill && safeSkillDirName(candidate.skill.manifest.name) === skillDir,
         );
-        if (!latest) return null;
+        if (!latest) {
+          if (required) throw new Error("global skill is no longer available in the owner-auth sandbox");
+          return null;
+        }
         const bundles =
           latest.screenedBundles ?? (deps.skillBundles ? await loadActiveBundles(deps.skillBundles, [latest]) : []);
         return { resolution: latest, bundles };
       });
-      laidTrees.add(treeKey);
       if (r.skill && deps.skills)
         void deps.skills.recordUse(r.skill.id).catch((e) => swallow("orchestrator: skill recordUse", e));
     } catch (err) {
@@ -364,12 +368,28 @@ export function createTurnSandboxes(ctx: TurnSandboxContext) {
         },
         err,
       );
+      if (required) throw err;
     } finally {
       emitGapWork("skills_materialize", start, Date.now());
     }
   };
-  const ensureSkillTree = async (skillDir: string, sandboxId?: string): Promise<void> => {
-    const current = await visibleSkillsForTurn();
+  const ensureSkillTree = async (
+    skillDir: string,
+    target?: { sandboxId?: string; ownerAuth?: boolean },
+  ): Promise<void> => {
+    const currentSkills = async () => {
+      const current = await visibleSkillsForTurn();
+      return target?.ownerAuth
+        ? current.filter(
+            (r) =>
+              r.skill &&
+              resolution.layers.some(
+                (layer) => layer.mode === "ro" && layer.mountPath === "global" && layer.scopeId === r.skill!.scopeId,
+              ),
+          )
+        : current;
+    };
+    const current = await currentSkills();
     const requested = current.filter(
       (r) =>
         r.skill &&
@@ -377,9 +397,22 @@ export function createTurnSandboxes(ctx: TurnSandboxContext) {
           ? r.skill.pack?.packId === skillDir.slice(".packs/".length)
           : r.skill.manifest.name === skillDir),
     );
-    const handle = sandboxId ? await provisionResource(sandboxId) : await provision();
+    if (!requested.length) {
+      if (target?.ownerAuth) {
+        if (ownerAuthBox.handle)
+          await skillMaterializer.reconcileIndex(deps.sandbox, ownerAuthBox.handle, current, currentSkills);
+        throw new Error("only current global skills are available in the owner-auth sandbox");
+      }
+      return;
+    }
+    if (target?.ownerAuth && !provisionOwnerAuth) throw new Error("owner-auth sandbox is unavailable");
+    let handle: SandboxHandle;
+    if (target?.ownerAuth) handle = await provisionOwnerAuth!();
+    else if (target?.sandboxId) handle = await provisionResource(target.sandboxId);
+    else handle = await provision();
+    if (target?.ownerAuth) await skillMaterializer.reconcileIndex(deps.sandbox, handle, current, currentSkills);
     for (const r of requested) {
-      await materializeSkillTree(handle, r, sandboxId);
+      await materializeSkillTree(handle, r, currentSkills, target?.ownerAuth);
     }
   };
   const provisionResource = (id: string): Promise<SandboxHandle> => {
@@ -710,7 +743,6 @@ export function createTurnSandboxes(ctx: TurnSandboxContext) {
       box.handle = null;
       box.pending = null;
       provisionInFlight = null;
-      laidTrees.clear();
     },
   };
 }
