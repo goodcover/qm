@@ -4,7 +4,7 @@ import { createToolContext } from "../src/tools/primitives.ts";
 import type { Sandbox, SandboxHandle } from "../src/sandbox/sandbox.ts";
 import { scopeId } from "../src/types.ts";
 
-function ctx(onEnsure: (dir: string) => void) {
+function ctx(onEnsure: (dir: string, target?: { sandboxId?: string; ownerAuth?: boolean }) => void) {
   const materialized = new Set<string>();
   const runCommand = (command: string) => {
     const wants = /(?:^|[\s'"=(&|;])(?:\.\/)?skills\/([^/\s'"&|;)]+)/.exec(command)?.[1];
@@ -32,9 +32,10 @@ function ctx(onEnsure: (dir: string) => void) {
   return createToolContext({
     sandbox,
     provision: async () => ({ id: "h", rootDir: "/workspace" }) as SandboxHandle,
-    ensureSkillTree: async (dir: string) => {
+    provisionOwnerAuth: async () => ({ id: "owner", rootDir: "/workspace" }) as SandboxHandle,
+    ensureSkillTree: async (dir: string, target?: { sandboxId?: string; ownerAuth?: boolean }) => {
       materialized.add(dir);
-      onEnsure(dir);
+      onEnsure(dir, target);
     },
     backgroundBroker: backgroundBroker as never,
     layers: [{ scopeId: scopeId("personal", "U1"), mountPath: "", mode: "rw" }],
@@ -110,4 +111,14 @@ test("pack file access selects only the named pack", async () => {
   await tc.execute("python skills/.packs/selected/script.py");
   await tc.backgroundStart("sh skills/.packs/selected/job.sh");
   assert.deepEqual(seen, [".packs/selected", ".packs/selected", ".packs/selected"]);
+});
+
+test("owner execution loads skill files in the credential sandbox before running", async () => {
+  const seen: unknown[] = [];
+  const tc = ctx((dir, target) => seen.push({ dir, target }));
+  const result = await tc.execute("python3 skills/commander/scripts/install_qm.py -- --help", {
+    ownerAuth: true,
+  });
+  assert.equal(result.code, 0);
+  assert.deepEqual(seen, [{ dir: "commander", target: { sandboxId: undefined, ownerAuth: true } }]);
 });

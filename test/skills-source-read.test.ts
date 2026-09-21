@@ -173,7 +173,7 @@ test("a source-only read avoids sandbox work and a subsequent asset request mate
   const beforeResource = new Map(files);
   await turn.provisionResource("resource-1");
   assert.deepEqual(files, beforeResource);
-  await turn.ensureSkillTree(".packs/pack", "resource-1");
+  await turn.ensureSkillTree(".packs/pack", { sandboxId: "resource-1" });
   assert.deepEqual(sandboxIds, [undefined, "resource-1"]);
   assert.equal(files.get("skills/.packs/pack/lib.txt"), "PACK_RESOURCE");
   assert.equal(
@@ -194,4 +194,98 @@ test("pack assets remain readable and executable on later turns after source-onl
   assert.equal(await b.turn("!read skills/.packs/source-pack/example.sh"), "printf PACK_ASSET");
   await b.skills.archive(skill.id);
   assert.match(await b.turn("!read skills/.packs/source-pack/example.sh"), /no file/);
+});
+
+test("owner sandbox loads current global skill sources separately and removes revoked trees", async () => {
+  const { createTurnSandboxes } = await import("../src/core/orchestrator/sandboxes.ts");
+  const { createSkillMaterializer } = await import("../src/skills/materialize.ts");
+  type TurnSandboxContext = import("../src/core/orchestrator/sandboxes.ts").TurnSandboxContext;
+  type SkillResolution = import("../src/skills/skill-store.ts").SkillResolution;
+  const disks = new Map<string, Map<string, string>>();
+  const provisions: string[] = [];
+  const skill = (name: string, scopeId: string): SkillResolution =>
+    ({
+      skill: {
+        id: name,
+        scopeId,
+        pack: { packId: "pack", commit: "c", upstreamName: name },
+        manifest: { name, body: name, files: [{ path: "scripts/run.py", content: name }] },
+      },
+      shadowed: [],
+    }) as unknown as SkillResolution;
+  let current = [skill("commander", "org:default-org"), skill("room-helper", "channel:room")];
+  let failWrites = false;
+  let reads = 0;
+  let revokeAtRead = 0;
+  const turn = createTurnSandboxes({
+    deps: {
+      skills: { recordUse: async () => {} },
+      sandbox: {
+        provision: async (_layers: unknown, options?: { scratch?: unknown }) => {
+          const id = options?.scratch ? "owner" : "shared";
+          provisions.push(id);
+          disks.set(id, new Map());
+          return { id, rootDir: "/workspace" };
+        },
+        listDir: async () => [],
+        removeDir: async (h: { id: string }, path: string) => {
+          const files = disks.get(h.id)!;
+          for (const key of files.keys()) if (key === path || key.startsWith(`${path}/`)) files.delete(key);
+        },
+        readFile: async (h: { id: string }, path: string) => disks.get(h.id)?.get(path) ?? null,
+        writeFile: async (h: { id: string }, path: string, content: string) => {
+          if (failWrites && path.endsWith("scripts/run.py")) throw new Error("fixture write failed");
+          disks.get(h.id)!.set(path, content);
+        },
+      },
+    },
+    input: { origin: { kind: "human" } },
+    actor: { id: "U1" },
+    session: { id: "s" },
+    resolution: {
+      layers: [
+        { scopeId: "org:default-org", mountPath: "global", mode: "ro" },
+        { scopeId: "channel:room", mountPath: "", mode: "rw" },
+      ],
+    },
+    scopeId: "channel:room",
+    memoryScopeId: "channel:room",
+    turnSessionDir: "turn/s",
+    turnFilesDir: "turn/s/t",
+    transferId: "t",
+    connectorEnv: {},
+    ownerAuthAvailable: true,
+    ownerAuthEnv: {},
+    ownerEnvCredentialIds: [],
+    credentialCutoverServices: [],
+    visibleSkills: current,
+    visibleSkillsForTurn: async () => {
+      if (++reads === revokeAtRead) current = [];
+      return current;
+    },
+    skillMaterializer: createSkillMaterializer(),
+    emitGapWork: () => {},
+    perf: { credsMs: 0 },
+  } as unknown as TurnSandboxContext);
+  await assert.rejects(turn.ensureSkillTree("room-helper", { ownerAuth: true }), /only current global skills/);
+  assert.deepEqual(provisions, []);
+  await turn.ensureSkillTree("commander");
+  await turn.ensureSkillTree(".packs/pack", { ownerAuth: true });
+  assert.deepEqual(provisions, ["shared", "owner"]);
+  assert.equal(disks.get("shared")!.get("skills/commander/scripts/run.py"), "commander");
+  assert.equal(disks.get("owner")!.get("skills/commander/scripts/run.py"), "commander");
+  assert.ok(![...disks.get("owner")!.keys()].some((path) => path.includes("room-helper")));
+  current = [];
+  await assert.rejects(turn.ensureSkillTree("commander", { ownerAuth: true }), /only current global skills/);
+  assert.ok(!disks.get("owner")!.has("skills/commander/scripts/run.py"));
+  assert.equal(disks.get("shared")!.get("skills/commander/scripts/run.py"), "commander");
+  current = [skill("commander", "org:default-org")];
+  failWrites = true;
+  await assert.rejects(turn.ensureSkillTree("commander", { ownerAuth: true }), /fixture write failed/);
+  failWrites = false;
+  current = [skill("new-helper", "org:default-org")];
+  reads = 0;
+  revokeAtRead = 3;
+  await assert.rejects(turn.ensureSkillTree("new-helper", { ownerAuth: true }), /no longer available/);
+  assert.ok(!disks.get("owner")!.has("skills/new-helper/scripts/run.py"));
 });

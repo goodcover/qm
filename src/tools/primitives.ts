@@ -436,7 +436,7 @@ export interface ToolContextDeps {
   ownerAuthCommand?: (command: string) => string;
   scopedCommand?: (command: string) => string;
   readSkill?: (path: string) => Promise<ReadResult>;
-  ensureSkillTree?: (skillDir: string, sandboxId?: string) => Promise<void>;
+  ensureSkillTree?: (skillDir: string, target?: { sandboxId?: string; ownerAuth?: boolean }) => Promise<void>;
   reach?: {
     resolveChannel(query: string): Promise<ReachResolution>;
     provisionFor(scopeId: ScopeId): Promise<SandboxHandle>;
@@ -787,9 +787,9 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
             }
           : undefined;
       const local = !scratch && !ownerAuth && reached === undefined && !execOpts?.sandboxId;
-      if ((local || execOpts?.sandboxId) && deps.ensureSkillTree) {
+      if ((local || ownerAuth || execOpts?.sandboxId) && deps.ensureSkillTree) {
         for (const skillDir of skillTreeDirsInCommand(command))
-          await deps.ensureSkillTree(skillDir, execOpts?.sandboxId);
+          await deps.ensureSkillTree(skillDir, { sandboxId: execOpts?.sandboxId, ownerAuth });
       }
       return once(async () => {
         if (reached) {
@@ -1161,7 +1161,8 @@ export function createToolContext(deps: ToolContextDeps): ToolContext {
         throw new NeedsApproval(command, reason ?? "requires approval", "approval", matched, approvalKey);
       }
       if (deps.ensureSkillTree) {
-        for (const skillDir of skillTreeDirsInCommand(command)) await deps.ensureSkillTree(skillDir, opts?.sandboxId);
+        for (const skillDir of skillTreeDirsInCommand(command))
+          await deps.ensureSkillTree(skillDir, { sandboxId: opts?.sandboxId });
       }
       return once(
         () =>
