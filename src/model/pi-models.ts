@@ -62,6 +62,7 @@ interface ModelEntry {
   auxiliary?: boolean;
   clone?: {
     template: string;
+    thinkingLevelMap?: PiModel["thinkingLevelMap"];
     input: number;
     output: number;
     cacheRead?: number;
@@ -79,7 +80,12 @@ interface ModelEntry {
   };
 }
 
-const GPT_56_CLONE = { template: "gpt-5.5", contextWindow: 1_050_000, maxTokens: 128_000 } as const;
+const GPT_56_CLONE = {
+  template: "gpt-5.5",
+  thinkingLevelMap: { max: "max" },
+  contextWindow: 1_050_000,
+  maxTokens: 128_000,
+} as const;
 
 export const MODEL_REGISTRY: readonly ModelEntry[] = [
   {
@@ -99,6 +105,23 @@ export const MODEL_REGISTRY: readonly ModelEntry[] = [
     },
   },
   { id: "claude-fable-5", name: "Claude Fable 5", fastMode: false, webui: true, base: true },
+  {
+    id: "claude-opus-5-5",
+    name: "Claude Opus 5.5",
+    fastMode: true,
+    webui: true,
+    base: true,
+    clone: {
+      template: "claude-opus-4-8",
+      thinkingLevelMap: { off: null },
+      input: 4,
+      output: 20,
+      cacheRead: 0.2,
+      cacheWrite: 5,
+      contextWindow: 1_000_000,
+      maxTokens: 128_000,
+    },
+  },
   {
     id: "claude-opus-5",
     name: "Claude Opus 5",
@@ -172,11 +195,44 @@ export const MODEL_REGISTRY: readonly ModelEntry[] = [
     base: true,
     clone: {
       ...GPT_56_CLONE,
+      thinkingLevelMap: { ...GPT_56_CLONE.thinkingLevelMap, off: null },
       input: 10,
       output: 50,
       cacheRead: 1,
       cacheWrite: 12.5,
       tiers: [{ inputTokensAbove: 272_000, input: 20, output: 75, cacheRead: 2, cacheWrite: 25 }],
+    },
+  },
+  {
+    id: "gpt-6-sol",
+    buttonLabel: "6 Sol",
+    name: "GPT-6 Sol",
+    fastMode: true,
+    webui: true,
+    base: true,
+    clone: {
+      ...GPT_56_CLONE,
+      input: 2,
+      output: 10,
+      cacheRead: 0.2,
+      cacheWrite: 2.5,
+      tiers: [{ inputTokensAbove: 272_000, input: 4, output: 15, cacheRead: 0.4, cacheWrite: 5 }],
+    },
+  },
+  {
+    id: "gpt-6-luna",
+    buttonLabel: "6 Luna",
+    name: "GPT-6 Luna",
+    fastMode: true,
+    webui: true,
+    base: true,
+    clone: {
+      ...GPT_56_CLONE,
+      input: 0.1,
+      output: 0.5,
+      cacheRead: 0.01,
+      cacheWrite: 0.125,
+      tiers: [{ inputTokensAbove: 272_000, input: 0.2, output: 0.75, cacheRead: 0.02, cacheWrite: 0.25 }],
     },
   },
   { id: "openrouter/auto", name: "OpenRouter Auto", fastMode: false, webui: true, base: true },
@@ -335,7 +391,9 @@ function cloneModel(model: PiModel, id: string, name: string, overrides: Partial
     input: [...model.input],
     cost: structuredClone(overrides.cost ?? model.cost),
     ...(model.headers ? { headers: { ...model.headers } } : {}),
-    ...(model.thinkingLevelMap ? { thinkingLevelMap: { ...model.thinkingLevelMap } } : {}),
+    ...(model.thinkingLevelMap || overrides.thinkingLevelMap
+      ? { thinkingLevelMap: { ...model.thinkingLevelMap, ...overrides.thinkingLevelMap } }
+      : {}),
     ...(model.compat ? { compat: { ...(model.compat as Record<string, unknown>) } as PiModel["compat"] } : {}),
   };
 }
@@ -391,6 +449,7 @@ export function resolveBuiltinModel(id: string): PiModel | undefined {
 
             tiers: entry.clone.tiers ? entry.clone.tiers.map((t) => ({ ...t })) : undefined,
           },
+          ...(entry.clone.thinkingLevelMap ? { thinkingLevelMap: entry.clone.thinkingLevelMap } : {}),
         })
       : undefined;
   }
