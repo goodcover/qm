@@ -12,8 +12,8 @@ import {
   templateNameForRelease,
 } from "./common.ts";
 
-const CLAUDE_CODE_VERSION = "2.1.210";
-const CODEX_VERSION = "0.155.1";
+const CLAUDE_CODE_VERSION = "2.1.280";
+const CODEX_VERSION = "0.156.1";
 const GH_VERSION = "2.93.0";
 const GH_SHA256_AMD64 = "02d1290eba130e0b896f3709ffff22e1c75a51475ddb70476a85abc6b5807af0";
 const AWSCLI_VERSION = "2.34.54";
