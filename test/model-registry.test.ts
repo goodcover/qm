@@ -12,6 +12,7 @@ import {
   modelProviderAvailabilityFor,
 } from "../src/model/pi-models.ts";
 import { validateWebTurnModelOptions } from "../src/core/turn-options.ts";
+import { clampThinkingLevel, getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 
 test("registry model identifiers are unique", () => {
   const ids = MODEL_REGISTRY.map((model) => model.id);
@@ -88,6 +89,22 @@ test("new Claude and Codex models are selectable with published rates", () => {
     );
     assert.ok(DEFAULT_WEBUI_MODEL_IDS.includes(id));
     assert.equal(validateWebTurnModelOptions({ model: id }, null), null);
+  }
+});
+
+test("cloned models expose their actual reasoning levels", () => {
+  for (const id of ["claude-fable-5-1", "claude-opus-5-5", "gpt-6-astra"]) {
+    const model = resolveModel(id)!;
+    assert.ok(!getSupportedThinkingLevels(model).includes("off"), `${id} must not disable thinking`);
+    assert.equal(model.thinkingLevelMap?.off, null);
+  }
+  for (const id of ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"]) {
+    const model = resolveModel(id)!;
+    assert.ok(getSupportedThinkingLevels(model).includes("max"), `${id} must offer max effort`);
+    assert.equal(clampThinkingLevel(model, "max"), "max");
+  }
+  for (const id of ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-sol", "gpt-6-luna"]) {
+    assert.ok(getSupportedThinkingLevels(resolveModel(id)!).includes("off"), `${id} supports no reasoning`);
   }
 });
 

@@ -62,6 +62,7 @@ interface ModelEntry {
   auxiliary?: boolean;
   clone?: {
     template: string;
+    thinkingLevelMap?: PiModel["thinkingLevelMap"];
     input: number;
     output: number;
     cacheRead?: number;
@@ -79,7 +80,12 @@ interface ModelEntry {
   };
 }
 
-const GPT_56_CLONE = { template: "gpt-5.5", contextWindow: 1_050_000, maxTokens: 128_000 } as const;
+const GPT_56_CLONE = {
+  template: "gpt-5.5",
+  thinkingLevelMap: { max: "max" },
+  contextWindow: 1_050_000,
+  maxTokens: 128_000,
+} as const;
 
 export const MODEL_REGISTRY: readonly ModelEntry[] = [
   {
@@ -107,6 +113,7 @@ export const MODEL_REGISTRY: readonly ModelEntry[] = [
     base: true,
     clone: {
       template: "claude-opus-4-8",
+      thinkingLevelMap: { off: null },
       input: 4,
       output: 20,
       cacheRead: 0.2,
@@ -188,6 +195,7 @@ export const MODEL_REGISTRY: readonly ModelEntry[] = [
     base: true,
     clone: {
       ...GPT_56_CLONE,
+      thinkingLevelMap: { ...GPT_56_CLONE.thinkingLevelMap, off: null },
       input: 10,
       output: 50,
       cacheRead: 1,
@@ -383,7 +391,9 @@ function cloneModel(model: PiModel, id: string, name: string, overrides: Partial
     input: [...model.input],
     cost: structuredClone(overrides.cost ?? model.cost),
     ...(model.headers ? { headers: { ...model.headers } } : {}),
-    ...(model.thinkingLevelMap ? { thinkingLevelMap: { ...model.thinkingLevelMap } } : {}),
+    ...(model.thinkingLevelMap || overrides.thinkingLevelMap
+      ? { thinkingLevelMap: { ...model.thinkingLevelMap, ...overrides.thinkingLevelMap } }
+      : {}),
     ...(model.compat ? { compat: { ...(model.compat as Record<string, unknown>) } as PiModel["compat"] } : {}),
   };
 }
@@ -439,6 +449,7 @@ export function resolveBuiltinModel(id: string): PiModel | undefined {
 
             tiers: entry.clone.tiers ? entry.clone.tiers.map((t) => ({ ...t })) : undefined,
           },
+          ...(entry.clone.thinkingLevelMap ? { thinkingLevelMap: entry.clone.thinkingLevelMap } : {}),
         })
       : undefined;
   }
