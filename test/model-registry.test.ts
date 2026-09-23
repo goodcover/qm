@@ -71,6 +71,26 @@ test("gpt-6-astra is offered with its published context, output ceiling, and rat
   assert.equal(validateWebTurnModelOptions({ model: "gpt-6-astra" }, null), null);
 });
 
+test("new Claude and Codex models are selectable with published rates", () => {
+  for (const [id, provider, input, output, cacheRead, cacheWrite] of [
+    ["claude-opus-5-5", "anthropic", 4, 20, 0.2, 5],
+    ["gpt-6-sol", "openai", 2, 10, 0.2, 2.5],
+    ["gpt-6-luna", "openai", 0.1, 0.5, 0.01, 0.125],
+  ] as const) {
+    const model = resolveModel(id);
+    assert.ok(model, `${id} must resolve`);
+    assert.equal(model.provider, provider);
+    assert.equal(model.contextWindow, provider === "anthropic" ? 1_000_000 : 1_050_000);
+    assert.equal(model.maxTokens, 128_000);
+    assert.deepEqual(
+      { input: model.cost.input, output: model.cost.output, cacheRead: model.cost.cacheRead, cacheWrite: model.cost.cacheWrite },
+      { input, output, cacheRead, cacheWrite },
+    );
+    assert.ok(DEFAULT_WEBUI_MODEL_IDS.includes(id));
+    assert.equal(validateWebTurnModelOptions({ model: id }, null), null);
+  }
+});
+
 test("FAST_MODE_MODEL_IDS derives from the registry — the web-ui client reads this, keeps no copy", () => {
   assert.deepEqual(
     [...FAST_MODE_MODEL_IDS].sort(),
