@@ -1,5 +1,7 @@
+import { loadMessageTranscript, messageLinkSeq } from "./message-link.ts";
 import { initializeBrowserErrors, stopBrowserErrors } from "./browser-errors";
 import { initializeAnalytics, capturePageview, stopAnalytics } from "./product-analytics";
+import { captureSlackReturn } from "./slack-account";
 import { captureConnectionReturn } from "./connection-return";
 import { renderModelConnectGate } from "./model-connect";
 import { html, nothing, render, type TemplateResult } from "lit";
@@ -45,7 +47,7 @@ import { brandMark, brandName, icon } from "./ui";
 import { PHONE_MAX_WIDTH, trackVisualViewport } from "./viewport";
 import { markConnectorConnected } from "./chat";
 import { clearSkillsCache, resyncModelSelection } from "./composer";
-import { ensureDeliveryStream, mainConversation, onExitCanvas } from "./conversations";
+import { allConversations, ensureDeliveryStream, mainConversation, onExitCanvas } from "./conversations";
 import { clearAllDrafts, saveDraft, storedDraft } from "./drafts";
 import { deepLinkPath, isPlainLeftClick, parseDeepLink, UI_BASE } from "./deep-link";
 import {
@@ -132,6 +134,7 @@ function signOutFromMenu(): void {
 
 let authMode: AuthMode = "portal";
 let shellMounted = false;
+let pendingCanvasRestore: Promise<void> | null = null;
 
 setSigninRequiredHandler((detail) => {
   authMode = detail.mode ?? authMode;
@@ -151,7 +154,10 @@ export function syncUrlFromState(sessionOverride?: string | null): void {
   const fromState =
     sessionOverride !== undefined ? sessionOverride : (chatState.sessionId ?? chatState.rememberedSessionId);
   const sessionId = splitState.active ? singlePaneSessionId() : fromState;
-  const next = deepLinkPath(UI_BASE, appState.currentView, sessionId, contextsState.selected);
+  let next = deepLinkPath(UI_BASE, appState.currentView, sessionId, contextsState.selected);
+  const linked = parseDeepLink(UI_BASE, location.pathname, location.search);
+  const seq = messageLinkSeq(location.search);
+  if (appState.currentView === "chats" && linked.session === sessionId && seq !== null) next += `?seq=${seq}`;
   if (`${location.pathname}${location.search}` !== next) history.replaceState(null, "", next);
 }
 
@@ -503,7 +509,6 @@ export function mountShell(): void {
           role="separator"
           aria-orientation="vertical"
           aria-label="Resize sidebar"
-          ${tip("Drag to resize · double-click to reset")}
           @pointerdown=${startSidebarResize}
           @dblclick=${resetSidebarWidth}
         ></div>
@@ -695,11 +700,22 @@ export function switchView(v: View): void {
   syncUrlFromState();
   resetActiveDetail(v);
   switch (v) {
-    case "chats":
-      if (mountRestoredCanvas()) drawCanvas();
-      else void renderChatsPage();
-      renderList();
+    case "chats": {
+      const seq = appState.viewRenderSeq;
+      const showChats = () => {
+        if (appState.currentView !== "chats" || appState.viewRenderSeq !== seq) return;
+        if (mountRestoredCanvas()) drawCanvas();
+        else void renderChatsPage();
+        renderList();
+      };
+      if (pendingCanvasRestore) {
+        appState.mainEl?.replaceChildren(
+          Object.assign(document.createElement("div"), { className: "empty", textContent: "Loading conversations…" }),
+        );
+        void pendingCanvasRestore.then(showChats);
+      } else showChats();
       break;
+    }
     case "inbox":
       void renderInbox();
       break;
@@ -997,7 +1013,9 @@ export async function bootSafely(): Promise<void> {
 }
 
 export async function boot(): Promise<void> {
+  if (new URLSearchParams(location.search).get("themeOnly") === "1") return;
   captureConnectionReturn(location.href);
+  captureSlackReturn(location.href);
   const params = new URLSearchParams(location.search);
   const {
     view: wanted,
@@ -1008,8 +1026,9 @@ export async function boot(): Promise<void> {
   const chatsLink = wanted === null || wanted === "chats";
   const linkedId = wantedSession && chatsLink ? wantedSession : null;
   let transcriptUnavailable = false;
+  const wantedSeq = messageLinkSeq(location.search);
   const loadLinkedTranscript = (id: string) =>
-    fetchTranscript(id, { tailTurns: TAIL_TURNS }).catch((error: unknown) => {
+    loadMessageTranscript((window) => fetchTranscript(id, window), wantedSeq, TAIL_TURNS).catch((error: unknown) => {
       transcriptUnavailable = !(error instanceof ApiError && (error.status === 404 || error.status === 403));
       return null;
     });
@@ -1046,6 +1065,7 @@ export async function boot(): Promise<void> {
     renderModelConnectGate();
     return;
   }
+  const sessions = refreshSessions({ showLoading: true });
   const personalScope = `personal:${appState.me.user}`;
   const prefetchedConfig = await runtimeConfigFetch;
   const runtimeConfig =
@@ -1055,21 +1075,28 @@ export async function boot(): Promise<void> {
   }
   resyncModelSelection();
   mountShell();
+  renderList();
   shellMounted = true;
   ensureDeliveryStream();
   warmDeferredChunks();
   void refreshInbox({ silent: true });
-  loadPersistedSplit();
-  await adoptRemoteSplit(remoteSplitFetch);
-
   const connectedProvider = params.get("status") === "connected" ? params.get("connector") : null;
   if (connectedProvider) markConnectorConnected(connectedProvider);
   const viewIntent = isView(wanted) && canView(wanted) && wanted !== "chats";
+  loadPersistedSplit();
+  if (!wantedSession && wanted !== "app-edit") {
+    const restore = adoptRemoteSplit(remoteSplitFetch).then(async () => {
+      if (viewIntent && restoredCanvasNeedsSessionList()) await sessions;
+    });
+    pendingCanvasRestore = restore;
+    void restore.then(() => {
+      if (pendingCanvasRestore === restore) pendingCanvasRestore = null;
+    });
+    if (!viewIntent) await restore;
+  }
 
   const bareEntry = !viewIntent && !wantedSession && wanted !== "app-edit" && !connectedProvider;
   if (bareEntry && !restoredCanvasNeedsSessionList()) mountRestoredCanvas(true);
-
-  const sessions = refreshSessions({ showLoading: true });
 
   if (wantedSession && !viewIntent && wanted !== "app-edit") {
     const transcript = entriesPrefetch ?? loadLinkedTranscript(wantedSession);
@@ -1079,6 +1106,11 @@ export async function boot(): Promise<void> {
       if (!sessionsState.list.some((s) => s.id === linked.id)) sessionsState.list = [linked, ...sessionsState.list];
       revealSessionSurface(linked);
       await openSession(linked, transcript, approvalsPrefetch ?? undefined);
+      if (wantedSeq !== null)
+        requestAnimationFrame(() => {
+          for (const conversation of allConversations())
+            if (conversation.state.sessionId === linked.id) conversation.revealEntry(wantedSeq);
+        });
       return;
     }
     await sessions;
@@ -1090,6 +1122,26 @@ export async function boot(): Promise<void> {
     } else {
       showConversationError(transcriptUnavailable);
     }
+    return;
+  }
+
+  if (viewIntent) {
+    if (wanted === "keychain") {
+      const provider = params.get("connector");
+      const status = params.get("status");
+      if (provider && status) noteConnectorResult(provider, status);
+    }
+    if (wanted === "contexts" || wanted === "files" || wanted === "deploys") {
+      const scope =
+        params.get("scope") ?? (wantedItem ? resolveProjectScope(await ensureContexts(), wantedItem) : null);
+      if (scope) contextsState.selected = scope;
+    }
+    if (wanted === "deploys" && wantedItem) openDeployById(wantedItem);
+    if (wanted === "crons" && wantedItem) openCronById(wantedItem);
+    if (wanted === "webhooks" && wantedItem) openWebhookById(wantedItem);
+    if (wanted === "skills" && wantedItem) openSkillById(wantedItem);
+    switchView(wanted as View);
+    if (wanted === "inbox") routeInboxHistory(wantedItem);
     return;
   }
 
@@ -1105,24 +1157,7 @@ export async function boot(): Promise<void> {
     return;
   }
 
-  if (wanted === "keychain") {
-    const provider = params.get("connector");
-    const status = params.get("status");
-    if (provider && status) noteConnectorResult(provider, status);
-    switchView("keychain");
-  } else if (viewIntent) {
-    if (wanted === "contexts" || wanted === "files" || wanted === "deploys") {
-      const scope =
-        params.get("scope") ?? (wantedItem ? resolveProjectScope(await ensureContexts(), wantedItem) : null);
-      if (scope) contextsState.selected = scope;
-    }
-    if (wanted === "deploys" && wantedItem) openDeployById(wantedItem);
-    if (wanted === "crons" && wantedItem) openCronById(wantedItem);
-    if (wanted === "webhooks" && wantedItem) openWebhookById(wantedItem);
-    if (wanted === "skills" && wantedItem) openSkillById(wantedItem);
-    switchView(wanted as View);
-    if (wanted === "inbox") routeInboxHistory(wantedItem);
-  } else if (connectedProvider && sessionsState.list.length) {
+  if (connectedProvider && sessionsState.list.length) {
     const recent = [...sessionsState.list].sort((a, b) => activityOf(b) - activityOf(a))[0]!;
     exitSplitIfActive();
     await openSession(recent);

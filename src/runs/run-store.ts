@@ -84,6 +84,7 @@ export interface RunStore {
   latestForThread(threadRef: string, opts?: { excludePrivateMessages?: boolean }): Promise<Run | null>;
   pendingReturns(limit?: number, afterId?: string): Promise<Run[]>;
   markReturned(runId: string): Promise<void>;
+  deferReturn(runId: string, delayMs: number): Promise<void>;
 
   onTerminal(listener: (run: Run) => void): void;
 
@@ -93,7 +94,7 @@ export interface RunStore {
 
   inFlightForThread(sessionId: string): Promise<Run[]>;
 
-  withdraw(runId: string): Promise<boolean>;
+  withdraw(runId: string, opts?: { unstartedOnly?: boolean }): Promise<boolean>;
   steerQueued(queuedRunId: string, targetRunId: string, signal: RunSignal, signals: RunSignalStore): Promise<boolean>;
 
   editPendingText(runId: string, text: string, expectedText: string): Promise<boolean>;
