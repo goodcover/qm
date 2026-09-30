@@ -145,6 +145,10 @@ The source build uses upstream Pi security.4 and patched HTTP, URI, IP parsing,
 glob expansion, and Mermaid dependencies so production dependency audits pass.
 The core image retains its build-time security audit.
 
+The GPT-6.1 Sol addition upgrades Codex to 0.159.2 for its native model catalog.
+The organization and personal defaults remain unchanged. Axios is pinned by the
+lockfile at 1.20.0 so Slack dependencies pass the production security audit.
+
 All three application services need source builds for this release, including the
 admin UI's new Lit dependencies. The AWS MicroVM agent and Dockerfile are unchanged
 from 0.1.12, so GC4 keeps sandbox version 4.0. Postgres 17 supports the new session
