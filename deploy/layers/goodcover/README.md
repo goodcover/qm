@@ -141,6 +141,10 @@ excluded. Owner commands serialize synchronization and execution so concurrent
 commands cannot replace scripts another command is still using. Usage timestamps
 do not invalidate files, and skill revocation or failed writes remove stale trees.
 
+The source build uses upstream Pi security.4 and patched HTTP, URI, IP parsing,
+glob expansion, and Mermaid dependencies so production dependency audits pass.
+The core image retains its build-time security audit.
+
 All three application services need source builds for this release, including the
 admin UI's new Lit dependencies. The AWS MicroVM agent and Dockerfile are unchanged
 from 0.1.12, so GC4 keeps sandbox version 4.0. Postgres 17 supports the new session

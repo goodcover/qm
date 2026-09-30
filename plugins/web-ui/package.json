@@ -49,6 +49,7 @@
     "@earendil-works/pi-web-ui": {
       "@earendil-works/pi-ai": "$@earendil-works/pi-ai"
     },
+    "lodash-es": "4.18.1",
     "@mariozechner/mini-lit": {
       "marked": "^18.0.5"
     }
