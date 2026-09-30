@@ -132,6 +132,21 @@ it when expired or revoked. The entry's ID is safe to keep in ops configuration.
 
 ## Upstream updates and CI
 
+The 0.1.13 source merge retains Goodcover's Codex 0.156.1 and Claude Agent SDK
+0.3.280, Plain OAuth and MCP catalog support, model reasoning capabilities,
+and deployed apps on the QM origin. Upstream's per-turn skill directories replace
+the old workspace skill projection. Owner credential sandboxes synchronize current
+global skills into the same turn directories; room and personal skill files remain
+excluded. Owner commands serialize synchronization and execution so concurrent
+commands cannot replace scripts another command is still using. Usage timestamps
+do not invalidate files, and skill revocation or failed writes remove stale trees.
+
+All three application services need source builds for this release, including the
+admin UI's new Lit dependencies. The AWS MicroVM agent and Dockerfile are unchanged
+from 0.1.12, so GC4 keeps sandbox version 4.0. Postgres 17 supports the new session
+status, history indexes, and spend-reporting migrations. Preserve a database backup
+before rollout; reverting service images does not reverse schema migrations.
+
 `origin` points to `goodcover/qm`; `upstream` points to `yc-software/qm`. Only main
 was imported. Use the upstream `update-qm` skill for updates and preserve merge
 ancestry when landing sync PRs. Contributions upstream are optional and use the
