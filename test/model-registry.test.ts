@@ -78,6 +78,7 @@ test("gpt-6-astra is offered with its published context, output ceiling, and rat
 test("new Claude and Codex models are selectable with published rates", () => {
   for (const [id, provider, input, output, cacheRead, cacheWrite] of [
     ["claude-opus-5-5", "anthropic", 4, 20, 0.2, 5],
+    ["gpt-6.1-sol", "openai", 2, 10, 0.1, 2.5],
     ["gpt-6-sol", "openai", 2, 10, 0.2, 2.5],
     ["gpt-6-luna", "openai", 0.1, 0.5, 0.01, 0.125],
   ] as const) {
@@ -101,12 +102,20 @@ test("new Claude and Codex models are selectable with published rates", () => {
 });
 
 test("cloned models expose their actual reasoning levels", () => {
-  for (const id of ["claude-fable-5-1", "claude-opus-5-5", "gpt-6-astra"]) {
+  for (const id of ["claude-fable-5-1", "claude-opus-5-5", "gpt-6-astra", "gpt-6.1-sol"]) {
     const model = resolveModel(id)!;
     assert.ok(!getSupportedThinkingLevels(model).includes("off"), `${id} must not disable thinking`);
     assert.equal(model.thinkingLevelMap?.off, null);
   }
-  for (const id of ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"]) {
+  for (const id of [
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-6-astra",
+    "gpt-6.1-sol",
+    "gpt-6-sol",
+    "gpt-6-luna",
+  ]) {
     const model = resolveModel(id)!;
     assert.ok(getSupportedThinkingLevels(model).includes("max"), `${id} must offer max effort`);
     assert.equal(clampThinkingLevel(model, "max"), "max");
@@ -219,4 +228,30 @@ test("fast-mode support is registry-driven", () => {
   assert.equal(modelSupportsFastMode("gpt-5.6-sol"), true);
   assert.equal(modelSupportsFastMode(undefined), false);
   assert.equal(modelSupportsFastMode("nonexistent-model"), false);
+});
+
+test("GPT-6.1 Sol is selectable through subscription Codex with its own rates and reasoning", () => {
+  const id = "gpt-6.1-sol";
+  const model = resolveModel(id)!;
+  assert.equal(model.api, "openai-responses");
+  assert.deepEqual(model.input, ["text", "image"]);
+  assert.equal(model.reasoning, true);
+  assert.deepEqual((model.cost as { tiers?: unknown }).tiers, [
+    { inputTokensAbove: 272_000, input: 4, output: 15, cacheRead: 0.2, cacheWrite: 5 },
+  ]);
+  assert.deepEqual(getSupportedThinkingLevels(model), ["low", "medium", "high", "xhigh", "max"]);
+  assert.ok(SELECTABLE_BASE_MODELS.some((entry) => entry.id === id));
+  assert.equal(safeModelMetadata(id)?.label, "GPT-6.1 Sol");
+  assert.equal(safeModelMetadata(id)?.buttonLabel, "6.1 Sol");
+  assert.equal(modelSupportsFastMode(id), true);
+  assert.equal(modelSupportedByHarness(id, "codex"), true);
+  assert.equal(modelSupportedByHarness(id, "claude"), false);
+  const providers = modelProviderAvailabilityFor("codex", {
+    anthropic: false,
+    openai: false,
+    openrouter: false,
+    codexOAuth: true,
+  });
+  assert.equal(validateWebTurnModelOptions({ model: id }, null, providers), null);
+  assert.equal(defaultModelForHarness("codex"), "gpt-5.6-sol");
 });
