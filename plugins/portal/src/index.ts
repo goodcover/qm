@@ -10,7 +10,7 @@ import { reportBackendError } from "../../chassis/src/error-reporting.ts";
 import "./instrument.ts";
 import { provisionTrustedAdmin } from "./trusted-admin.ts";
 import { createHash } from "node:crypto";
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createServer, METHODS, type IncomingMessage, type ServerResponse } from "node:http";
 import { pathToFileURL } from "node:url";
 import { ADMIN_LOGIN_SCRIPT, ADMIN_LOGIN_SCRIPT_HASH, openAdminLogin } from "./admin-login.ts";
 import { LRUCache } from "lru-cache";
@@ -960,7 +960,19 @@ function renewSessionCookie(req: IncomingMessage, res: ServerResponse): SessionC
 }
 
 const server = createServer((req, res) => {
+  const startedAt = performance.now();
+  let errorLogged = false;
+  res.once("finish", () => {
+    if (res.statusCode >= 500 && !errorLogged)
+      console.error(
+        "[portal] %d %s response (%d ms)",
+        res.statusCode,
+        METHODS.includes(req.method ?? "") ? req.method : "?",
+        Math.round(performance.now() - startedAt),
+      );
+  });
   void handle(req, res).catch((err: unknown) => {
+    errorLogged = true;
     reportBackendError(err);
     console.error("[portal] 500 %s %s: %s", req.method ?? "?", (req.url ?? "?").split("?")[0], String(err));
     if (!res.headersSent) json(res, 500, { error: "internal_error" });
@@ -1018,6 +1030,27 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   if (pathname === "/auth/desktop" || pathname === "/auth/desktop/redeem") return desktopLogin(req, res, url);
   if (pathname === "/auth/invite") return inviteLogin(req, res);
   if (pathname === "/auth/admin-login") return adminLogin(req, res);
+  if (pathname === "/auth/signed-out" && method === "GET") {
+    if (currentSession(req))
+      return sendHtml(
+        res,
+        409,
+        connectPage({
+          title: "Still signed in",
+          body: "Use Sign out from the account menu to end this session.",
+          action: `<a class="btn" href="/">Back to the portal</a>`,
+        }),
+      );
+    return sendHtml(
+      res,
+      200,
+      connectPage({
+        title: "Signed out",
+        body: "You have signed out of this portal.",
+        action: `<a class="btn" href="/auth/login">Sign in</a>`,
+      }),
+    );
+  }
   if (pathname === "/auth/logout" && method === "POST") {
     if (!sameOriginRequest(req)) return json(res, 403, { error: "forbidden" });
     if (AUTH_BROKER_UPSTREAM && url.searchParams.get("everywhere") === "1") {
@@ -1045,8 +1078,11 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       }
     }
     const signedOutSession = currentSession(req);
+    const redirectTo = !AUTH_BROKER_UPSTREAM && signedOutSession && !signedOutSession.anon ? "/auth/signed-out" : "/";
     setSession(res, [
       ...(signedOutSession ? loginProviderCookie(signedOutSession.sub) : []),
+      clearCookie("portal_impersonate", "/", SECURE_COOKIES),
+      clearCookie("portal_trusted_tmp", "/auth/trusted", SECURE_COOKIES),
       clearCookie("portal_session", "/", SECURE_COOKIES, COOKIE_DOMAIN),
       clearCookie(FRAME_SESSION_COOKIE, "/", SECURE_COOKIES, COOKIE_DOMAIN),
       ...(COOKIE_DOMAIN
@@ -1059,10 +1095,10 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         : []),
     ]);
     if (wantsHtml(req)) {
-      res.writeHead(303, { location: "/", "cache-control": "no-store" });
+      res.writeHead(303, { location: redirectTo, "cache-control": "no-store" });
       return void res.end();
     }
-    return json(res, 200, { ok: true });
+    return json(res, 200, { ok: true, redirectTo });
   }
 
   if (brokerPath) {

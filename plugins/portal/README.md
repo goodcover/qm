@@ -146,9 +146,17 @@ disposable test deployment: the test redeems real links for its configured admin
 - **Surface isolation.** The private surface hop carries a signed portal identity; core verifies
   it independently, so a synthesized cookie alone confers no user authority. User deployments
   stay on a dedicated apps hostname and are never proxied through the portal or admin origin.
-- **Stateless logout.** `POST /auth/logout` clears the cookie but can't revoke an already-issued
-  session before `exp`; the core's `canAdminister` (re-read per request) remains the live admin
-  revocation path. Slack has no RP-initiated end-session, so SSO re-login is silent.
+- **Local logout.** `POST /auth/logout` clears the portal cookies and returns
+  `redirectTo`; browsers follow it to `/auth/signed-out`, a terminal page that
+  never redirects to the provider. Sign-out is local to this portal: it does not
+  contact the OIDC provider or end the provider session, so choosing **Sign in**
+  may complete silently through an existing provider session. Sign out of the
+  provider directly to end it everywhere. Built-in broker and anonymous logout
+  retain their existing flows. Local-development logout also stops on the
+  signed-out page until the user chooses **Sign in**.
+- **Stateless session limits.** Clearing browser cookies does not revoke a copied
+  portal session before `exp`; the core's `canAdminister` (re-read per request)
+  remains the live admin revocation path.
 
 ## Playground mode
 
