@@ -6,17 +6,25 @@ infrastructure remain in `goodcover/ops`. Upstream documentation follows.
 
 # qm
 
-A multiplayer agent harness for work. In Slack and on the web.
+<p align="center">
+  <img src="docs/images/qm-logo.png" alt="QM" width="120">
+</p>
 
-## Setup
+<div align="center">
 
-Tell your coding agent of choice `Let's deploy https://github.com/yc-software/qm`. From here, it should follow the deployment guide in this repo.
+**A multiplayer agent harness for work. In Slack and on the web.**<br>
+Run it in your own cloud, with your own models and keys.
 
-You can also try out a 3rd-party hosted version of QM [here](https://www.agent37.com/qm).
+[![CI](https://img.shields.io/github/actions/workflow/status/yc-software/qm/cicd.yml?branch=main&label=CI&style=flat-square)](https://github.com/yc-software/qm/actions/workflows/cicd.yml)
+[![license](https://img.shields.io/badge/license-MIT-4c1?style=flat-square)](./LICENSE)
+[![node](https://img.shields.io/badge/node-24.15%2B-3178c6?style=flat-square)](./package.json)
+[![npm](https://img.shields.io/npm/v/@yc-software/qm?label=npm&color=000&style=flat-square)](https://www.npmjs.com/package/@yc-software/qm)
 
-If you're an infra provider interested in offering a hosted version of QM, feel free to reach out.
+[Deploy](#deploy-it-for-your-org) · [How it works](#how-it-works) · [Security model](#security-and-secrets) · [Customize](#customize-your-instance) · [Contribute](#contributing) · [Documentation](#going-deeper)
 
-## What is QM?
+</div>
+
+## Overview
 
 Most agents are designed like personal assistants. You can make one work for a whole
 company, but it quickly gets complex. QM is designed for startups. Employees each get
@@ -28,6 +36,14 @@ crons, web apps, and durable sandbox.
 It's built with open source in mind. Pick your own harness and model and switch between
 them. Pi, OpenCode, Codex, and Claude Code all drive the same core, so a deployment
 isn't tied to any single vendor.
+
+## Setup
+
+Tell your coding agent of choice `Let's deploy https://github.com/yc-software/qm`. From here, it should follow the deployment guide in this repo.
+
+You can also try out a 3rd-party hosted version of QM [here](https://www.agent37.com/qm).
+
+If you're an infra provider interested in offering a hosted version of QM, feel free to reach out.
 
 ## Features
 
@@ -76,7 +92,7 @@ Use `npm run dev-instance:both` when testing both surfaces together. Bare
 `npm run dev-instance` defaults to web for new instances and preserves the surface
 on reload. Switch an existing instance with an explicit surface command.
 
-## Architecture
+## How it works
 
 Every turn runs through a central core, which can use a variety of models and harnesses
 to generate the response. A Postgres persistence layer holds user data, session history,
@@ -106,14 +122,15 @@ can only tighten:
 
 - **Strict** — every harness tool call pauses for human approval, except the two
   no-effect turn enders.
-- **Auto** (default) — blocks private-network access and uses a content screener when
-  the deployment configures one. Model screening is off by default; deployments can
-  use an external proxy or explicitly opt into the built-in model classifier.
-- **Dangerous** — no posture-based content screening or tool approval gates.
+- **Auto** (default) — blocks private-network access.
+- **Dangerous** — no tool approval gates, and content screening only observes.
 
-Deployments can set `securityScreen.allPostures: true` to require external-content
-screening under every posture, including Dangerous and Strict, without changing tool
-approvals or private-network policy. Flagged content still requires release approval.
+Content screening is a deployment setting, `securityScreen.mode`: `off` (default),
+`observe`, or `enforce`, with `securityScreen.classifier` choosing the built-in
+`model` or an external `proxy`. When on, it classifies external content under every
+posture. `observe` only records verdicts in the audit log. `enforce` quarantines
+flagged content pending release approval, except under Dangerous, which caps
+screening at `observe`.
 
 The predeclared command policy — approval rules and hard denials for things like
 recursive deletes or destructive SQL — applies in every posture, Dangerous included.

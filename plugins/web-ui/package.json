@@ -41,7 +41,7 @@
     "@types/jsdom": "^28.0.3",
     "@types/node": "^24.0.0",
     "jsdom": "^29.1.1",
-    "katex": "^0.16.47",
+    "katex": "0.18.2",
     "typescript": "^5.8.2",
     "vite": "^7.1.6"
   },
@@ -52,6 +52,7 @@
     "lodash-es": "4.18.1",
     "@mariozechner/mini-lit": {
       "marked": "^18.0.5"
-    }
+    },
+    "katex": "$katex"
   }
 }

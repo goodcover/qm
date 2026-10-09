@@ -1,6 +1,7 @@
 import { unsafeSVG } from "lit/directives/unsafe-svg.js";
 import { html, nothing, type TemplateResult } from "lit";
 import { live } from "lit/directives/live.js";
+import { tip } from "./tooltip.ts";
 import { Check, ChevronDown, Download, createElement, type IconNode } from "lucide";
 
 export function brandName(): string {
@@ -43,6 +44,12 @@ export function waveLoader(
       <path d=${SWELL_PATH} fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="2.6" />
     </svg>
   </span>`;
+}
+
+export function sheenLabel(label: string, active: boolean): TemplateResult {
+  return html`<span class="sheen-label ${active ? "thinking-sheen" : ""}" data-sheen=${active ? label : ""}
+    >${label}</span
+  >`;
 }
 
 export function workingWave(): TemplateResult {
@@ -234,6 +241,7 @@ export function fieldSelect(props: {
   value?: string;
   id?: string;
   ariaLabel?: string;
+  ariaDescription?: string;
   describedBy?: string;
   focusKey?: string;
   disabled?: boolean;
@@ -246,6 +254,7 @@ export function fieldSelect(props: {
     <select
       id=${props.id ?? nothing}
       aria-label=${props.ariaLabel ?? nothing}
+      aria-description=${props.ariaDescription ?? nothing}
       aria-describedby=${props.describedBy ?? nothing}
       data-focus-key=${props.focusKey ?? nothing}
       .value=${props.value === undefined ? nothing : live(props.value)}
@@ -262,6 +271,7 @@ export interface MenuSelectOption {
   value: string | null;
   label: string;
   glyph?: IconNode;
+  disabledHint?: string;
 }
 
 export function menuSelect(props: {
@@ -282,8 +292,12 @@ export function menuSelect(props: {
         type="button"
         role="menuitemradio"
         aria-checked=${active ? "true" : "false"}
+        aria-disabled=${o.disabledHint ? "true" : nothing}
+        aria-description=${o.disabledHint || nothing}
+        ${tip(o.disabledHint ?? "")}
         @click=${(e: Event) => {
           e.stopPropagation();
+          if (o.disabledHint) return;
           closeFormMenus();
           props.onSelect(o.value ?? null);
         }}
