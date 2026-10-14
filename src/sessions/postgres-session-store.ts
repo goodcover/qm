@@ -1298,10 +1298,17 @@ export function createPostgresSessionStore(connectionString: string, opts: Store
                  ELSE EXCLUDED.valid_from_seq END,
                valid_to_seq = NULL,
                title = COALESCE(EXCLUDED.title, participants.title)
-           WHERE participants.valid_to IS NOT NULL
+           WHERE NOT $6 AND (participants.valid_to IS NOT NULL
               OR EXCLUDED.title IS NOT NULL
-              OR ($5 AND (participants.valid_from_seq IS DISTINCT FROM 0 OR participants.valid_from <> 0))`,
-        [sessionId, principalId, includeHistory ? 0 : now(), title ?? null, includeHistory],
+              OR ($5 AND (participants.valid_from_seq IS DISTINCT FROM 0 OR participants.valid_from <> 0)))`,
+        [
+          sessionId,
+          principalId,
+          includeHistory ? 0 : now(),
+          title ?? null,
+          includeHistory,
+          opts?.onlyIfAbsent === true,
+        ],
       );
     },
 

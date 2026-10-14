@@ -469,6 +469,7 @@ export function createMemorySessionStore(opts: StoreOptions = {}): SessionStore 
     },
 
     async addParticipant(sessionId, principalId, title, opts) {
+      if (opts?.onlyIfAbsent && windows.get(sessionId)?.has(principalId)) return;
       const includeHistory = opts?.includeHistory === true;
       let set = participants.get(principalId);
       if (!set) {

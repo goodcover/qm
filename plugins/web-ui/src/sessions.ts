@@ -54,6 +54,7 @@ import {
 } from "./core-bridge";
 import { deepLinkPath, isPlainLeftClick, sessionLink, UI_BASE } from "./deep-link";
 import {
+  sessionContextScope,
   activityOf,
   chatBrowseStatusMatches,
   bumpActivity,
@@ -258,7 +259,10 @@ function projectName(scopeId: string): string | null {
 }
 
 function projectOf(scopeId: string): CoreProject | null {
-  return contextsState.list.find((context) => context.scopeId === scopeId)?.project ?? null;
+  return (
+    contextsState.list.find((context) => context.scopeId === sessionContextScope(scopeId, contextsState.list))
+      ?.project ?? null
+  );
 }
 
 function projectMenuKey(scopeId: string): string {
@@ -631,7 +635,7 @@ export function drawChatsPage(): void {
   const matches = sidebarSessions(sessionsState.list)
     .filter((s) => chatBrowseStatusMatches(s, chatsPageStatus))
     .filter((s) => chatsPageSurface === "all" || surfaceOf(s) === chatsPageSurface)
-    .filter((s) => (chatsPageScope ? s.scopeId === chatsPageScope : true))
+    .filter((s) => (chatsPageScope ? sessionContextScope(s.scopeId, contextsState.list) === chatsPageScope : true))
     .filter((s) => !q || chatMatches(s, q))
     .sort((a, b) => activityOf(b) - activityOf(a));
   const rows = matches.slice(0, chatsPageLimit).map((s) => chatPageRow(s));

@@ -17,6 +17,7 @@ export interface RecentProjectSeed {
   scopeId: string;
   name: string | null;
   kind?: RecentGroupKind;
+  aliases?: string[];
 }
 
 export type RecentItem =
@@ -49,22 +50,39 @@ export function chatBrowseStatusMatches(
   return status === "waiting" ? Boolean(session.awaitingInput) : !session.awaitingInput;
 }
 
+export function sessionContextScope(scopeId: string, contexts: readonly ProjectAwareContext[]): string {
+  return (
+    contexts.find(
+      (context) => context.project?.slackChannel && scopeId === `channel:${context.project.slackChannel.channelId}`,
+    )?.scopeId ?? scopeId
+  );
+}
+
 export function recentProjectSeeds(contexts: readonly ProjectAwareContext[]): RecentProjectSeed[] {
-  return contexts.map((context): RecentProjectSeed => {
-    if (context.project)
-      return { scopeId: context.scopeId, name: context.project.name.trim() || null, kind: "project" };
-    if (context.kind === "personal") return { scopeId: context.scopeId, name: "Personal", kind: "personal" };
-    if (context.kind === "group")
-      return { scopeId: context.scopeId, name: sharedContextLabel(context.scopeId, context.name), kind: "group" };
-    return { scopeId: context.scopeId, name: sharedContextLabel(context.scopeId, context.name), kind: "channel" };
-  });
+  return contexts
+    .filter((context) => sessionContextScope(context.scopeId, contexts) === context.scopeId)
+    .map((context): RecentProjectSeed => {
+      if (context.project)
+        return {
+          scopeId: context.scopeId,
+          name: context.project.name.trim() || null,
+          kind: "project",
+          ...(context.project.slackChannel ? { aliases: [`channel:${context.project.slackChannel.channelId}`] } : {}),
+        };
+      if (context.kind === "personal") return { scopeId: context.scopeId, name: "Personal", kind: "personal" };
+      if (context.kind === "group")
+        return { scopeId: context.scopeId, name: sharedContextLabel(context.scopeId, context.name), kind: "group" };
+      return { scopeId: context.scopeId, name: sharedContextLabel(context.scopeId, context.name), kind: "channel" };
+    });
 }
 
 export function groupProjectSessions(
   sessions: readonly CoreSession[],
   projectSeeds: readonly RecentProjectSeed[],
 ): RecentItem[] {
-  const seeds = new Map(projectSeeds.map((seed) => [seed.scopeId, seed]));
+  const seeds = new Map(
+    projectSeeds.flatMap((seed) => [seed.scopeId, ...(seed.aliases ?? [])].map((scope) => [scope, seed] as const)),
+  );
   const projects = new Map<string, Extract<RecentItem, { kind: "project" }>>();
   const items: RecentItem[] = [];
   for (const session of [...sessions].sort((a, b) => activityOf(b) - activityOf(a))) {
@@ -73,16 +91,16 @@ export function groupProjectSessions(
       items.push({ kind: "session", session });
       continue;
     }
-    let project = projects.get(session.scopeId);
+    let project = projects.get(seed.scopeId);
     if (!project) {
       project = {
         kind: "project",
-        scopeId: session.scopeId,
+        scopeId: seed.scopeId,
         name: seed.name,
         groupKind: seed.kind ?? "project",
         sessions: [],
       };
-      projects.set(session.scopeId, project);
+      projects.set(seed.scopeId, project);
       items.push(project);
     }
     project.sessions.push(session);

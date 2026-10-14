@@ -697,6 +697,7 @@ export function entryDeliveryKey(entry: Pick<SessionEntry, "payload">): string |
 }
 
 interface AddParticipantOptions {
+  onlyIfAbsent?: boolean;
   includeHistory?: boolean;
 }
 

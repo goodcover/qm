@@ -1261,3 +1261,177 @@ test("Slack-linked project turns use the inherited channel roster", async () => 
   await runNowSettled(built.scheduler, inactiveCron.id);
   assert.equal((await built.crons.get(inactiveCron.id))?.enabled, false);
 });
+
+test("linked channel web history is visible only to current project and channel members", async () => {
+  const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "linked-web-history-")) }));
+  try {
+    await built.app.upsertDirectory(
+      ["owner", "member", "manual", "outsider"].map((principalId) => ({
+        principalId,
+        displayName: principalId,
+        type: "internal" as const,
+      })),
+    );
+    const channels = [{ channelId: "C-LEGACY", name: "legacy", isPrivate: true }];
+    await built.app.upsertChannels(
+      channels,
+      ["owner", "member"].map((principalId) => ({ channelId: "C-LEGACY", principalId })),
+    );
+    const project = await built.app.createProject("owner", "Business");
+    assert.ok(project);
+    assert.equal((await built.app.setProjectSlackChannel(project.id, "owner", "legacy")).status, "ok");
+    await built.app.addProjectMember(project.id, "owner", "manual");
+    const session = await built.sessions.getOrCreateByThread(
+      "web:owner:legacy",
+      "channel",
+      "channel:C-LEGACY",
+      "legacy",
+      "web",
+    );
+    await built.sessions.addParticipant(session.id, "owner");
+    await built.sessions.updateTitle(session.id, "Shared legacy work");
+    const { lease } = await built.sessions.acquireLease(session.id, "turn");
+    assert.ok(lease);
+    await built.sessions.append(lease, {
+      type: "assistant",
+      payload: { text: "Shared answer" },
+      scopeLabel: "channel:C-LEGACY",
+    });
+    await built.sessions.releaseLease(lease);
+    const searchFirst = await built.app.searchSessions("member", "Shared");
+    assert.ok(searchFirst.some((hit) => hit.sessionId === session.id));
+    const direct = await built.app.getSessionForViewer(session.id, "member");
+    assert.ok(direct);
+    assert.equal((direct.entries.at(-1)?.payload as { text?: string })?.text, "Shared answer");
+    assert.ok((await built.app.listSessions("member")).some((s) => s.id === session.id));
+    const context = (await built.app.listContexts("member")).find((c) => c.project?.id === project.id);
+    assert.equal(context?.sessionCount, 1);
+    const add = built.sessions.addParticipant.bind(built.sessions);
+    let writes = 0;
+    built.sessions.addParticipant = async (...args) => {
+      writes++;
+      return add(...args);
+    };
+    await built.app.listSessions("member");
+    await built.app.listContexts("member");
+    assert.equal(writes, 0);
+    built.sessions.addParticipant = add;
+    await built.sessions.removeParticipant(session.id, "member");
+    const closed = await built.sessions.participantWindowsOf(session.id);
+    await built.app.listSessions("member");
+    await built.app.listContexts("member");
+    assert.deepEqual(await built.sessions.participantWindowsOf(session.id), closed);
+    await built.sessions.addParticipant(session.id, "member");
+    const restricted = await built.sessions.participantWindowsOf(session.id);
+    await built.app.listSessions("member");
+    await built.app.listContexts("member");
+    assert.deepEqual(await built.sessions.participantWindowsOf(session.id), restricted);
+    assert.equal((await built.app.getSessionForViewer(session.id, "member"))?.entries.length, 0);
+    assert.deepEqual(await built.app.searchSessions("member", "Shared"), []);
+    const fork = await built.sessions.getOrCreateByThread(
+      "web:owner:fork",
+      "channel",
+      "channel:C-LEGACY",
+      "legacy",
+      "web",
+    );
+    await built.sessions.addParticipant(fork.id, "owner");
+    await built.sessions.updateForkProvenance(fork.id, {
+      forkedFrom: { sessionId: session.id, title: "Fork" },
+      forkBoundarySeq: 0,
+    });
+    assert.equal(await built.app.getSessionForViewer(fork.id, "member"), null);
+    await built.app.listSessions("member");
+    assert.ok(!(await built.sessions.participantsOf(fork.id)).includes("member"));
+
+    assert.equal(await built.app.getSessionForViewer(session.id, "manual"), null);
+    assert.equal(await built.app.getSessionForViewer(session.id, "outsider"), null);
+    const child = await built.sessions.getOrCreateByThread(
+      "agent:main:subagent:private",
+      "channel",
+      "channel:C-LEGACY",
+      "legacy",
+      "web",
+    );
+    await built.sessions.setParentSession(child.id, session.id);
+    await built.sessions.addParticipant(child.id, "owner");
+    assert.equal(await built.app.getSessionForViewer(child.id, "member"), null);
+    await built.app.upsertChannels(channels, [{ channelId: "C-LEGACY", principalId: "owner" }]);
+    assert.equal(await built.app.getSessionForViewer(session.id, "member"), null);
+    assert.ok(!(await built.app.listSessions("member")).some((s) => s.id === session.id));
+    await built.app.setProjectSlackChannel(project.id, "owner", null);
+    assert.equal(await built.app.getSessionForViewer(session.id, "member"), null);
+    await built.sessions.addParticipant(child.id, "member", undefined, { includeHistory: true });
+    assert.equal(await built.app.getSessionForViewer(child.id, "member"), null);
+    assert.deepEqual(await built.app.searchSessions("member", "Shared"), []);
+  } finally {
+    await built.runtime.stop();
+  }
+});
+
+test("public channel creators retain participant access without joining the channel", async () => {
+  const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "public-channel-viewer-")) }));
+  try {
+    await built.app.upsertDirectory([{ principalId: "viewer", displayName: "Viewer", type: "internal" }]);
+    await built.app.upsertChannels([{ channelId: "C-PUBLIC", name: "public", isPrivate: false }], []);
+    const created = await built.app.spawnSession("viewer", { scopeId: "channel:C-PUBLIC", title: "Public work" });
+    assert.ok(created);
+    assert.ok(await built.app.getSessionForViewer(created.session.id, "viewer"));
+    assert.ok((await built.app.listSessions("viewer")).some((session) => session.id === created.session.id));
+  } finally {
+    await built.runtime.stop();
+  }
+});
+
+test("insert-only participant enrollment preserves a concurrently restricted window", async () => {
+  const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "linked-enrollment-race-")) }));
+  try {
+    await built.app.upsertDirectory(
+      ["owner", "member"].map((principalId) => ({ principalId, displayName: principalId, type: "internal" as const })),
+    );
+    await built.app.upsertChannels(
+      [{ channelId: "C-RACE", name: "race", isPrivate: true }],
+      ["owner", "member"].map((principalId) => ({ channelId: "C-RACE", principalId })),
+    );
+    const project = await built.app.createProject("owner", "Race");
+    assert.ok(project);
+    assert.equal((await built.app.setProjectSlackChannel(project.id, "owner", "race")).status, "ok");
+    const session = await built.sessions.getOrCreateByThread(
+      "web:owner:race",
+      "channel",
+      "channel:C-RACE",
+      "race",
+      "web",
+    );
+    await built.sessions.addParticipant(session.id, "owner");
+    const { lease } = await built.sessions.acquireLease(session.id, "turn");
+    assert.ok(lease);
+    await built.sessions.append(lease, {
+      type: "assistant",
+      payload: { text: "Excluded history" },
+      scopeLabel: "channel:C-RACE",
+    });
+    await built.sessions.releaseLease(lease);
+    const windows = built.sessions.participantWindowsOf.bind(built.sessions);
+    let raced = false;
+    built.sessions.participantWindowsOf = async (id) => {
+      const snapshot = await windows(id);
+      if (id === session.id && !raced) {
+        raced = true;
+        await built.sessions.addParticipant(id, "member");
+      }
+      return snapshot;
+    };
+    await built.app.listSessions("member");
+    assert.ok(raced);
+    const member = (await windows(session.id)).find((window) => window.principalId === "member");
+    assert.equal(member?.validFromSeq, 1);
+    assert.equal((await built.app.getSessionForViewer(session.id, "member"))?.entries.length, 0);
+    await built.sessions.removeParticipant(session.id, "member");
+    const closed = await windows(session.id);
+    await built.sessions.addParticipant(session.id, "member", undefined, { includeHistory: true, onlyIfAbsent: true });
+    assert.deepEqual(await windows(session.id), closed);
+  } finally {
+    await built.runtime.stop();
+  }
+});

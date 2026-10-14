@@ -594,3 +594,40 @@ test("a goal lights the background chip with time worked, then the floor", () =>
   assert.equal(row?.label, "goal · 12m worked · 20m floor");
   assert.equal(backgroundLabel(0, 0, 0, 0, 0, { activeMs: 60_000 }, 9_999_999)?.label, "goal · 1m worked");
 });
+
+test("linked channel sessions group under their project without changing their scope", () => {
+  const channel = { scopeId: "channel:C1", kind: "channel" as const, name: "biz", sessionCount: 1, lastActivityAt: 2 };
+  const project = {
+    scopeId: "group:web-project-p",
+    kind: "group" as const,
+    name: "Business",
+    sessionCount: 2,
+    lastActivityAt: 3,
+    project: {
+      id: "p",
+      scopeId: "group:web-project-p",
+      members: [],
+      name: "Business",
+      orgId: "test",
+      ownerId: "owner",
+      createdAt: 1,
+      memberIds: ["owner"],
+      slackChannel: { channelId: "C1", channelName: "biz" },
+    },
+  };
+  const legacy = { ...saved("legacy", "web:owner:legacy"), scopeId: channel.scopeId };
+  const native = { ...saved("native", "web:owner:native"), scopeId: project.scopeId };
+  const seeds = recentProjectSeeds([channel, project]);
+  assert.equal(seeds.length, 1);
+  const grouped = groupProjectSessions([legacy, native], seeds);
+  assert.equal(grouped.length, 1);
+  const first = grouped[0]!;
+  assert.equal(first.kind, "project");
+  if (first.kind !== "project") throw Error("missing project");
+  assert.equal(first.scopeId, project.scopeId);
+  assert.deepEqual(
+    first.sessions.map((s) => s.id),
+    ["legacy", "native"],
+  );
+  assert.equal(first.sessions[0]?.scopeId, channel.scopeId);
+});

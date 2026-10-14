@@ -282,21 +282,114 @@ export function createAppHelpers(deps: AppDeps, app: App) {
     return (await deps.projects.membership(ref, principalId).catch(() => false)) === true;
   }
 
+  async function linkedChannelProject(scope: ScopeId): Promise<Project | undefined> {
+    const { kind, ref } = parseScopeId(scope);
+    if (kind !== "channel") return undefined;
+    return (await deps.projects?.listLinked())?.find((project) => project.slackChannel?.channelId === ref);
+  }
+
+  async function webChannelSessionMember(
+    session: Pick<Session, "surface" | "scopeId">,
+    principalId: string,
+  ): Promise<boolean | undefined> {
+    if (session.surface !== "web" || parseScopeId(session.scopeId).kind !== "channel") return undefined;
+    const current = await principalIsCurrentSharedScopeMember(principalId, session.scopeId);
+    if (
+      !current &&
+      ((await deps.directory.channelPrivacy(parseScopeId(session.scopeId).ref)) !== false ||
+        !deps.identity.isInternal(deps.identity.classify(principalId)))
+    )
+      return false;
+    const project = await linkedChannelProject(session.scopeId);
+    return project ? (await managedProjectMembership(projectScopeId(project.id), principalId)) === true : true;
+  }
+
+  async function rehydrateLinkedChannelSession(session: Session, principalId: string): Promise<boolean> {
+    if (session.surface !== "web" || session.parentSessionId || session.spawnMeta || session.forkedFrom) return false;
+    if (
+      !(await principalIsCurrentSharedScopeMember(principalId, session.scopeId)) ||
+      !(await linkedChannelProject(session.scopeId)) ||
+      (await webChannelSessionMember(session, principalId)) !== true
+    )
+      return false;
+    if (
+      (await deps.sessions.participantWindowsOf(session.id)).some((window) =>
+        samePerson(window.principalId, principalId),
+      )
+    )
+      return false;
+    await deps.sessions.addParticipant(session.id, principalId, undefined, {
+      includeHistory: true,
+      onlyIfAbsent: true,
+    });
+    return true;
+  }
+
+  async function hydrateLinkedChannelSessions(principalId: string): Promise<void> {
+    const projects = (await projectsForViewer(principalId)).filter((project) => project.slackChannel);
+    if (!projects.length) return;
+    const existing = await deps.sessions.listByParticipant(principalId);
+    const known = new Set(existing.map((session) => session.id));
+    for (const project of projects) {
+      if (!project.slackChannel) continue;
+      const channelScope = scopeId("channel", project.slackChannel.channelId);
+      if (!(await principalIsCurrentSharedScopeMember(principalId, channelScope))) continue;
+      for (const session of await deps.sessions.listByScope(channelScope)) {
+        if (
+          known.has(session.id) ||
+          session.surface !== "web" ||
+          session.parentSessionId ||
+          session.spawnMeta ||
+          session.forkedFrom
+        )
+          continue;
+        if (
+          (await deps.sessions.participantWindowsOf(session.id)).some((window) =>
+            samePerson(window.principalId, principalId),
+          )
+        )
+          continue;
+        await deps.sessions.addParticipant(session.id, principalId, undefined, {
+          includeHistory: true,
+          onlyIfAbsent: true,
+        });
+      }
+    }
+  }
+
   async function sessionsForViewer(principalId: string): Promise<Session[]> {
+    await hydrateLinkedChannelSessions(principalId);
     const sessions = await deps.sessions.listByParticipant(principalId);
-    const allowed = new Map(
-      await Promise.all(
-        [...new Set(sessions.map((session) => session.scopeId))].map(
-          async (scope) => [scope, await managedProjectMembership(scope, principalId)] as const,
-        ),
-      ),
+    const scopeChecks = new Map<ScopeId, Promise<boolean | undefined>>();
+    const webChannelChecks = new Map<ScopeId, Promise<boolean | undefined>>();
+    const visible = await Promise.all(
+      sessions.map(async (session) => {
+        let projectCheck = scopeChecks.get(session.scopeId);
+        if (!projectCheck) {
+          projectCheck = managedProjectMembership(session.scopeId, principalId);
+          scopeChecks.set(session.scopeId, projectCheck);
+        }
+        if ((await projectCheck) === false) return false;
+        if (session.surface !== "web" || parseScopeId(session.scopeId).kind !== "channel") return true;
+        let channelCheck = webChannelChecks.get(session.scopeId);
+        if (!channelCheck) {
+          channelCheck = webChannelSessionMember(session, principalId);
+          webChannelChecks.set(session.scopeId, channelCheck);
+        }
+        return (await channelCheck) !== false;
+      }),
     );
-    return sessions.filter((session) => allowed.get(session.scopeId) !== false);
+    return sessions.filter((_, index) => visible[index]);
   }
 
   async function sessionForViewer(sessionId: string, principalId: string): Promise<Session | null> {
-    const session = await deps.sessions.getForParticipant(sessionId, principalId);
-    if (!session) return null;
+    let session = await deps.sessions.getForParticipant(sessionId, principalId);
+    if (!session) {
+      const stored = await deps.sessions.get(sessionId);
+      if (!stored || !(await rehydrateLinkedChannelSession(stored, principalId))) return null;
+      session = await deps.sessions.getForParticipant(sessionId, principalId);
+    }
+    if (!session || (await webChannelSessionMember(session, principalId)) === false) return null;
     return (await managedProjectMembership(session.scopeId, principalId)) === false ? null : session;
   }
 
@@ -331,7 +424,11 @@ export function createAppHelpers(deps: AppDeps, app: App) {
     for (const s of await sessionsForViewer(principalId)) {
       const { kind } = parseScopeId(s.scopeId);
       if (s.scopeId !== personal && kind !== "channel" && kind !== "group") continue;
-      let ctx = byScope.get(s.scopeId);
+      const linked = [...byScope.values()].find(
+        (candidate) =>
+          candidate.project?.slackChannel && s.scopeId === scopeId("channel", candidate.project.slackChannel.channelId),
+      );
+      let ctx = linked ?? byScope.get(s.scopeId);
       if (!ctx && kind === "group" && (await deps.directory.groupMember(parseScopeId(s.scopeId).ref, principalId))) {
         ctx = { scopeId: s.scopeId, kind: "group", name: s.channelName ?? null, sessionCount: 0, lastActivityAt: null };
       }
@@ -341,7 +438,7 @@ export function createAppHelpers(deps: AppDeps, app: App) {
         ctx.sessionCount++;
         ctx.lastActivityAt = Math.max(ctx.lastActivityAt ?? 0, s.lastActivityAt ?? s.createdAt);
       }
-      byScope.set(s.scopeId, ctx);
+      byScope.set(ctx.scopeId, ctx);
     }
     return [...byScope.values()].sort((a, b) => {
       if (a.kind === "personal") return -1;
@@ -738,6 +835,8 @@ export function createAppHelpers(deps: AppDeps, app: App) {
     managedProjectMembership,
     sessionsForViewer,
     sessionForViewer,
+    webChannelSessionMember,
+    hydrateLinkedChannelSessions,
     contextsFor,
     filesForViewer,
     currentResourceScopesForViewer,

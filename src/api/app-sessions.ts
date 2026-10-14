@@ -110,6 +110,8 @@ export function createSessionMethods(
   const {
     sessionsForViewer,
     sessionForViewer,
+    webChannelSessionMember,
+    hydrateLinkedChannelSessions,
     managedProjectMembership,
     filesForViewer,
     canUseContext,
@@ -485,6 +487,7 @@ export function createSessionMethods(
 
     async searchSessions(principalId, query, limit = SEARCH_HIT_LIMIT): Promise<SessionSearchHit[]> {
       const capped = Math.max(1, Math.min(limit, 100));
+      await hydrateLinkedChannelSessions(principalId);
       const hits = await deps.sessions.searchEntries(principalId, query, capped);
       if (!hits.length) return [];
       const allowed = new Map(
@@ -494,9 +497,18 @@ export function createSessionMethods(
           ),
         ),
       );
+      const visibleIds = new Set(
+        (
+          await Promise.all(
+            hits.map(async (hit) =>
+              (await webChannelSessionMember(hit, principalId)) !== false ? hit.sessionId : null,
+            ),
+          )
+        ).filter((id): id is string => id !== null),
+      );
       const terms = searchTerms(query);
       return hits.flatMap((hit) => {
-        if (!allowed.get(hit.scopeId)) return [];
+        if (!allowed.get(hit.scopeId) || !visibleIds.has(hit.sessionId)) return [];
         const session = hit;
         return [
           {
