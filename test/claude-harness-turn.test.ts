@@ -853,3 +853,45 @@ test("Claude waits for an in-flight steer before closing a committed result", as
   );
   assert.equal(queryCloseCalls, 2);
 });
+
+for (const skipTranscript of [false, true]) {
+  for (const updateBeforeResult of [false, true]) {
+    test(`Claude drains native task notifications before settling (hidden=${skipTranscript}, updated=${updateBeforeResult})`, async () => {
+      queryCloseCalls = 0;
+      let receivedNotification = false;
+      currentScript = async function* (prompts) {
+        await prompts[Symbol.asyncIterator]().next();
+        yield {
+          type: "system",
+          subtype: "task_started",
+          task_id: "native-1",
+          tool_use_id: "agent-1",
+          description: "background task",
+          skip_transcript: skipTranscript,
+        };
+        if (updateBeforeResult) {
+          yield { type: "system", subtype: "task_updated", task_id: "native-1", patch: { status: "completed" } };
+        }
+        yield resultMessage("Parent result");
+        assert.equal(queryCloseCalls, 0);
+        yield {
+          type: "system",
+          subtype: "task_notification",
+          task_id: "native-1",
+          status: "completed",
+          summary: "Child done",
+          skip_transcript: skipTranscript,
+        };
+        receivedNotification = true;
+        yield resultMessage("All done");
+        throw new Error("read past the final result");
+      };
+      const { turn, entries } = harnessTurn({ readOnly: false });
+      const result = await createClaudeHarness({}).turns.runTurn(turn);
+      assert.equal(result.reply, "All done");
+      assert.equal(receivedNotification, true);
+      assert.equal(queryCloseCalls, 2);
+      assert.equal(entries.filter((entry) => entry.type === "tool_result").length, skipTranscript ? 0 : 1);
+    });
+  }
+}
