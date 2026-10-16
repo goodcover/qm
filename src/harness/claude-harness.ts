@@ -405,7 +405,10 @@ export function createClaudeHarness(opts: ClaudeHarnessOptions = {}): Harness {
       for (const value of thinking.splice(0))
         await turn.emit({ type: "thinking", payload: { thinking: value }, scopeLabel: turn.scopeLabel });
     };
-    const taskStates = new Map<string, { callId: string; status: TaskStatus; resultEmitted: boolean }>();
+    const taskStates = new Map<
+      string,
+      { callId: string; status: TaskStatus; resultEmitted: boolean; notificationReceived: boolean }
+    >();
     const callUsage = new Map<string, { input: number; output: number; cacheRead: number; cacheWrite: number }>();
     let stepCallIds = new Set<string>();
     let recordedSteps = 0;
@@ -687,7 +690,12 @@ export function createClaudeHarness(opts: ClaudeHarnessOptions = {}): Harness {
                   title: message.description || message.prompt || "subagent task",
                   status: "in_progress",
                 });
-              taskStates.set(message.task_id, { callId, status: "in_progress", resultEmitted: false });
+              taskStates.set(message.task_id, {
+                callId,
+                status: "in_progress",
+                resultEmitted: false,
+                notificationReceived: false,
+              });
               if (!message.skip_transcript) {
                 await turn.emit({
                   type: "tool_call",
@@ -716,6 +724,7 @@ export function createClaudeHarness(opts: ClaudeHarnessOptions = {}): Harness {
           if (message.type === "system" && message.subtype === "task_notification") {
             const tracked = taskStates.get(message.task_id);
             if (tracked) {
+              tracked.notificationReceived = true;
               const next: TaskStatus = message.status === "completed" ? "completed" : "failed";
               if (tracked.status !== next) {
                 await transitionTask(opts.tasks, message.task_id, tracked.status, next, turn.runId ?? turn.session.id);
@@ -765,7 +774,13 @@ export function createClaudeHarness(opts: ClaudeHarnessOptions = {}): Harness {
             await stopSignals?.();
             signalsStopped = true;
           }
-          if (pendingPrompts === 0) queue.close();
+          if (pendingPrompts === 0) {
+            queue.close();
+            if ([...taskStates.values()].every((task) => task.notificationReceived)) {
+              sdkQuery.close();
+              break;
+            }
+          }
         }
       })();
       try {

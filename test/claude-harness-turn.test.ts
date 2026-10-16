@@ -14,6 +14,7 @@ const toolShapes = new Map<string, z.ZodRawShape>();
 const toolHandlers = new Map<string, (args: unknown) => Promise<unknown>>();
 
 let capturedOptions: Record<string, unknown> = {};
+let queryCloseCalls = 0;
 
 let currentScript: Script = async function* () {};
 
@@ -36,6 +37,7 @@ mock.module("@anthropic-ai/claude-agent-sdk", {
           await generator.return?.(undefined as never);
         },
         close() {
+          queryCloseCalls++;
           void generator.return?.(undefined as never);
         },
         [Symbol.asyncIterator]() {
@@ -775,3 +777,121 @@ test("Claude retains a queued message which the SDK never consumes", async () =>
   assert.equal(entries.filter((entry) => entry.type === "user").length, 1);
   assert.equal((await signals.pending("no-echo"))[0]?.signal.ts, "pending");
 });
+
+test("a committed Claude result settles without waiting for SDK stream EOF", async () => {
+  const release = Promise.withResolvers<void>();
+  let askedForAnotherMessage = false;
+  let iteratorCleaned = false;
+  queryCloseCalls = 0;
+  currentScript = async function* (prompts) {
+    await prompts[Symbol.asyncIterator]().next();
+    try {
+      yield resultMessage("Already finished");
+      askedForAnotherMessage = true;
+      await release.promise;
+    } finally {
+      iteratorCleaned = true;
+    }
+  };
+  const harness = createClaudeHarness({});
+  const { turn, entries } = harnessTurn();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const result = await Promise.race([
+      harness.turns.runTurn(turn),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("waited for SDK EOF")), 1000);
+      }),
+    ]);
+    assert.equal(result.reply, "Already finished");
+    assert.equal(askedForAnotherMessage, false);
+    assert.equal(iteratorCleaned, true);
+    assert.equal(queryCloseCalls, 2);
+    assert.equal(entries.filter((entry) => entry.type === "assistant").length, 1);
+  } finally {
+    clearTimeout(timer);
+    release.resolve();
+    await harness.turns.close?.();
+  }
+});
+
+test("Claude waits for an in-flight steer before closing a committed result", async () => {
+  const signals = createMemoryRunSignalStore();
+  const preparing = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  queryCloseCalls = 0;
+  currentScript = async function* (prompts) {
+    const iterator = prompts[Symbol.asyncIterator]();
+    yield (await iterator.next()).value as unknown as FakeSdkMessage;
+    await signals.send("final-steer-race", { kind: "steer", text: "one more" });
+    await preparing.promise;
+    yield resultMessage("First result");
+    assert.equal(queryCloseCalls, 0);
+    yield (await iterator.next()).value as unknown as FakeSdkMessage;
+    yield resultMessage("Steered result");
+  };
+  const { turn, entries } = harnessTurn({
+    runId: "final-steer-race",
+    prepareSteer: async (text) => {
+      preparing.resolve();
+      await release.promise;
+      return { text };
+    },
+  });
+  delete (turn as Partial<HarnessTurnInput>).emit;
+  turn.emit = async (entry) => {
+    const saved = { ...entry, sessionId: "session-1", seq: entries.length + 1, createdAt: Date.now() } as SessionEntry;
+    entries.push(saved);
+    if (entry.type === "assistant" && (entry.payload as { text?: string }).text === "First result") release.resolve();
+    return saved;
+  };
+  const result = await createClaudeHarness({ signals }).turns.runTurn(turn);
+  assert.equal(result.reply, "Steered result");
+  assert.deepEqual(
+    entries.filter((entry) => entry.type === "assistant").map((entry) => (entry.payload as { text: string }).text),
+    ["First result", "Steered result"],
+  );
+  assert.equal(queryCloseCalls, 2);
+});
+
+for (const skipTranscript of [false, true]) {
+  for (const updateBeforeResult of [false, true]) {
+    test(`Claude drains native task notifications before settling (hidden=${skipTranscript}, updated=${updateBeforeResult})`, async () => {
+      queryCloseCalls = 0;
+      let receivedNotification = false;
+      currentScript = async function* (prompts) {
+        await prompts[Symbol.asyncIterator]().next();
+        yield {
+          type: "system",
+          subtype: "task_started",
+          task_id: "native-1",
+          tool_use_id: "agent-1",
+          description: "background task",
+          skip_transcript: skipTranscript,
+        };
+        if (updateBeforeResult) {
+          yield { type: "system", subtype: "task_updated", task_id: "native-1", patch: { status: "completed" } };
+        }
+        yield resultMessage("Parent result");
+        assert.equal(queryCloseCalls, 0);
+        yield {
+          type: "system",
+          subtype: "task_notification",
+          task_id: "native-1",
+          status: "completed",
+          summary: "Child done",
+          skip_transcript: skipTranscript,
+        };
+        receivedNotification = true;
+        yield resultMessage("All done");
+        throw new Error("read past the final result");
+      };
+      const { turn, entries } = harnessTurn({ readOnly: false });
+      const result = await createClaudeHarness({}).turns.runTurn(turn);
+      assert.equal(result.reply, "All done");
+      assert.equal(receivedNotification, true);
+      assert.equal(queryCloseCalls, 2);
+      assert.equal(entries.filter((entry) => entry.type === "tool_result").length, skipTranscript ? 0 : 1);
+    });
+  }
+}
