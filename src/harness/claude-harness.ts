@@ -765,7 +765,11 @@ export function createClaudeHarness(opts: ClaudeHarnessOptions = {}): Harness {
             await stopSignals?.();
             signalsStopped = true;
           }
-          if (pendingPrompts === 0) queue.close();
+          if (pendingPrompts === 0) {
+            queue.close();
+            sdkQuery.close();
+            break;
+          }
         }
       })();
       try {
