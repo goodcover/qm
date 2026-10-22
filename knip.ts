@@ -1,14 +1,17 @@
-{
-  "$schema": "https://unpkg.com/knip@6/schema.json",
-  "treatConfigHintsAsErrors": true,
-  "ignoreBinaries": ["tail", "cloudflared"],
-  "ignoreIssues": {
+import { existsSync } from "node:fs";
+
+export default {
+  $schema: "https://unpkg.com/knip@6/schema.json",
+  treatConfigHintsAsErrors: true,
+  ignoreUnresolved: existsSync("/usr/bin/mount") ? [] : ["/usr/bin/mount"],
+  ignoreBinaries: ["tail", "cloudflared"],
+  ignoreIssues: {
     "scripts/migrate-principals-to-email.d.mts": ["files"],
-    "src/slack/lib.ts": ["exports", "types"]
+    "src/slack/lib.ts": ["exports", "types"],
   },
-  "workspaces": {
+  workspaces: {
     ".": {
-      "entry": [
+      entry: [
         "src/migrate-main.ts",
         "src/sandbox/local-sandbox.ts",
         "scripts/aws-deploy-smoke.ts",
@@ -31,14 +34,14 @@
         "superserve/templates/verify-qm-agent.ts",
         "docs/qa/resource-search-demo.mjs",
         "src/deploy/vendor/devbar.js",
-        "deploy/layers/goodcover/sandbox/microvm-runtime.mjs"
+        "deploy/layers/goodcover/sandbox/microvm-runtime.mjs",
       ],
-      "paths": {
-        "./agent.mjs": ["aws/microvm-agent/agent.mjs"]
-      }
+      paths: {
+        "./agent.mjs": ["aws/microvm-agent/agent.mjs"],
+      },
     },
-    "desktop": {
-      "entry": [
+    desktop: {
+      entry: [
         "preload.cjs",
         "setup.js",
         "cursor.js",
@@ -46,15 +49,15 @@
         "runtime.js",
         "runtime-preload.cjs",
         "permissions-preload.cjs",
-        "test/**/*.electron.mjs"
-      ]
+        "test/**/*.electron.mjs",
+      ],
     },
-    "cli": {
-      "entry": ["bin/qm.ts"]
+    cli: {
+      entry: ["bin/qm.ts"],
     },
     "plugins/*": {},
     "plugins/web-ui": {
-      "entry": [
+      entry: [
         "src/shared-session.ts",
         "src/lazy-katex.ts",
         "src/lazy-hljs.ts",
@@ -63,9 +66,9 @@
         "src/app-devbar.ts",
         "src/inbox.ts",
         "src/context-model.ts",
-        "src/assistant-sidebar.ts"
+        "src/assistant-sidebar.ts",
       ],
-      "ignoreDependencies": [
+      ignoreDependencies: [
         "katex-real",
         "hljs-real",
         "hljs-real-javascript",
@@ -76,12 +79,11 @@
         "hljs-real-json",
         "hljs-real-bash",
         "hljs-real-sql",
-        "hljs-real-markdown"
-      ]
+        "hljs-real-markdown",
+      ],
     },
     "deploy/connector-sdk": {
-      "ignoreDependencies": ["@composio/core"]
-    }
+      ignoreDependencies: ["@composio/core"],
+    },
   },
-  "ignoreUnresolved": ["/usr/bin/mount"]
-}
+};
