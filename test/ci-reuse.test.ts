@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
+import { runInNewContext } from "node:vm";
 import test from "node:test";
 import { CI_JOBS, readReceipt, reusableCi } from "../scripts/reuse-ci.ts";
 
@@ -313,9 +314,24 @@ test("all quality jobs keep successful names and missing proof runs full checks"
 
 test("deployment notice fires only for a fully green main push and holds no repository access", () => {
   const job = jobs["notify-deployments"]!;
-  assert.ok(
-    job.includes("if: always() && !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main'"),
-  );
+  const condition = job.match(/^ {4}if: (.+)$/m)![1]!;
+  for (const [repository, event, ref, cancelled, expected] of [
+    ["yc-software/qm", "push", "refs/heads/main", false, true],
+    ["example/qm", "push", "refs/heads/main", false, false],
+    ["yc-software/qm", "pull_request", "refs/heads/main", false, false],
+    ["yc-software/qm", "push", "refs/heads/master", false, false],
+    ["yc-software/qm", "push", "refs/heads/main", true, false],
+  ] as const) {
+    assert.equal(
+      runInNewContext(condition, {
+        always: () => true,
+        cancelled: () => cancelled,
+        github: { repository, event_name: event, ref },
+      }),
+      expected,
+      JSON.stringify({ repository, event, ref, cancelled }),
+    );
+  }
   assert.ok(
     job.includes(
       "needs: [core, cli, lint, dependency-audit, core-postgres, admin-plugin, web-ui-plugin, auth-plugin, portal-plugin]",
