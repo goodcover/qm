@@ -4,6 +4,19 @@ The source target is upstream `7417aa2a3f917cf97406914897078ae3b273e173`.
 This source sync does not authorize production rollout. Land it with a merge
 commit or ancestry-preserving fast-forward; never squash or rebase it.
 
+## Release authorization and QA waiver
+
+On 2026-10-22, Dan explicitly authorized this upgrade's merge and production
+release after green static checks, security, authentication and independent
+review. Unavailable development-environment and live preproduction QA are
+waived, not performed or passed. Remaining UI, Slack and manual acceptance must
+be recorded honestly. Production writes require a fresh verified usable database
+backup, captured deployed configuration and images, and migration-compatible
+recovery. A destructive restore or data reset requires separate authorization.
+Private production subscription smoke must avoid customer messages and business
+cron execution. Preserve the existing subscription credential and fail closed on
+authentication failure; do not add a paid API fallback.
+
 ## Qualification and configuration
 
 GC4 uses the existing EKS manifests in the separate ops checkout, rather than a
