@@ -21,7 +21,7 @@ import { safeSkillFilePath, type SkillResolution } from "../../skills/skill-stor
 import { isSafeSkillName } from "../../skills/skill-name.ts";
 import type { SkillResult } from "../../tools/primitives.ts";
 import { TURN_FILES_DIR } from "../attachments.ts";
-import { errMessage, swallow, swallowAs } from "../../util/errors.ts";
+import { errMessage, swallow, swallowAs, withCleanup } from "../../util/errors.ts";
 import { createKeyedQueue, sleep } from "../../util/async.ts";
 import { loadActiveBundles } from "./turn-helpers.ts";
 import type { OrchestratorDeps, OrchestratorInput } from "./types.ts";
@@ -301,16 +301,18 @@ export function createTurnSandboxes(ctx: TurnSandboxContext) {
       if (fingerprint === ownerSkillFingerprint) return;
       ownerSkillFingerprint = null;
       await deps.sandbox.removeDir(handle, ownerSkillsRoot());
-      try {
-        for (const { resolution: r, bundles } of current)
-          await laySkillTree(deps.sandbox, handle, skillsRoot(r), r, bundles);
-        if (ownerSkillsFingerprint(await currentOwnerSkills()) !== fingerprint)
-          throw new Error("global skills changed while preparing the owner-auth sandbox; retry the command");
-        ownerSkillFingerprint = fingerprint;
-      } catch (err) {
-        await deps.sandbox.removeDir(handle, ownerSkillsRoot());
-        throw err;
-      }
+      await withCleanup(
+        async () => {
+          for (const { resolution: r, bundles } of current)
+            await laySkillTree(deps.sandbox, handle, skillsRoot(r), r, bundles);
+          if (ownerSkillsFingerprint(await currentOwnerSkills()) !== fingerprint)
+            throw new Error("global skills changed while preparing the owner-auth sandbox; retry the command");
+          ownerSkillFingerprint = fingerprint;
+        },
+        async () => {
+          if (ownerSkillFingerprint === null) await deps.sandbox.removeDir(handle, ownerSkillsRoot());
+        },
+      );
     });
   const laidTrees = new Set<string>();
   const materializeSkillTree = async (handle: SandboxHandle, r: SkillResolution): Promise<void> => {

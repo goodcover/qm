@@ -252,6 +252,7 @@ test("owner sandbox loads current global skill sources separately and removes re
     }) as unknown as SkillResolution;
   let current = [skill("commander", "org:default-org"), skill("room-helper", "channel:room")];
   let failWrites = false;
+  let failCleanup = false;
   let reads = 0;
   let revokeAtRead = 0;
   let writes = 0;
@@ -267,13 +268,17 @@ test("owner sandbox loads current global skill sources separately and removes re
         },
         listDir: async () => [],
         removeDir: async (h: { id: string }, path: string) => {
+          if (failCleanup) throw new Error("fixture cleanup failed");
           const files = disks.get(h.id)!;
           for (const key of files.keys()) if (key === path || key.startsWith(`${path}/`)) files.delete(key);
         },
         readFile: async (h: { id: string }, path: string) => disks.get(h.id)?.get(path) ?? null,
         writeFile: async (h: { id: string }, path: string, content: string) => {
           writes++;
-          if (failWrites && path.endsWith("scripts/run.py")) throw new Error("fixture write failed");
+          if (failWrites && path.endsWith("scripts/run.py")) {
+            failCleanup = true;
+            throw new Error("fixture write failed");
+          }
           disks.get(h.id)!.set(path, content);
         },
       },
@@ -321,8 +326,18 @@ test("owner sandbox loads current global skill sources separately and removes re
   assert.ok(!disks.get("owner")!.has(assetPath("commander")));
   current = [skill("commander", "org:default-org")];
   failWrites = true;
-  await assert.rejects(turn.provisionOwnerAuth!(), /fixture write failed/);
+  await assert.rejects(turn.provisionOwnerAuth!(), (error: unknown) => {
+    assert.ok(error instanceof AggregateError);
+    assert.equal(error.message, "fixture write failed");
+    assert.deepEqual(
+      error.errors.map((failure: Error) => failure.message),
+      ["fixture write failed", "fixture cleanup failed"],
+    );
+    assert.equal(error.cause, error.errors[0]);
+    return true;
+  });
   failWrites = false;
+  failCleanup = false;
   current = [skill("new-helper", "org:default-org")];
   reads = 0;
   revokeAtRead = 2;
