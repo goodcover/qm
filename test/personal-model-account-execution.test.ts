@@ -286,7 +286,7 @@ test("a company ChatGPT login feeds pi's subscription provider while personal Ch
   const built = buildApp(testConfig({ harness: "pi", codexAuthFile: authFile }));
   assert.deepEqual(await piOptions?.resolveProviderKeys?.(), { "openai-codex": companyToken });
   assert.equal(piOptions?.companyModelId?.("gpt-5.6-sol"), "codex/gpt-5.6-sol");
-  assert.equal(piOptions?.companyModelId?.("gpt-6-astra-ultrafast"), "gpt-6-astra-ultrafast");
+  assert.equal(piOptions?.companyModelId?.("gpt-6-astra-ultrafast"), "codex/gpt-6-astra-ultrafast");
   assert.equal(piOptions?.companyModelId?.("claude-opus-5"), "claude-opus-5");
   built.config.setApprovedHarnesses(["pi"]);
   await built.userModelCredentials.setOAuth("U1", "openai", {
