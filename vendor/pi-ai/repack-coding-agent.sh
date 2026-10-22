@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# Repackages the vendored pi-coding-agent (security.5 -> security.6) so its npm-shrinkwrap
-# pins pi-ai to the qm.1 tarball instead of stock npm. Only npm-shrinkwrap.json changes.
 set -euo pipefail
 base=https://github.com/yc-software/qm/releases/download
 work="$(mktemp -d)"

@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# Rebuilds the vendored pi-ai tarball: stock npm 0.82.0 + provider-error.patch.
-# Output: earendil-works-pi-ai-0.82.0-qm.1.tgz in the current directory.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 work="$(mktemp -d)"

@@ -288,7 +288,6 @@ async function authorize(ctx: ApiCtx, linkSlack = false): Promise<void> {
       ...(ticket ? { ticket } : {}),
     });
   } catch (error) {
-    // Keep the cause for operators (secret-redacted); the user only sees a generic message.
     const mask = createExactSecretValueMasker([access.key]);
     reportFailure("composio: authorize", new Error(mask(redactSecrets(errMessage(error)))), `toolkit=${toolkit}`);
     return sendJson(ctx.res, 502, {

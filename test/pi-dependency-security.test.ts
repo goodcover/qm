@@ -80,12 +80,10 @@ function versionAtLeast(version: unknown, floor: string): boolean {
   return true;
 }
 
-// The core image runs `npm audit --omit=dev --audit-level=moderate`, so a lockfile that
-// falls back below these advisory fixes fails the release build.
 const advisoryFixes = {
-  "@modelcontextprotocol/sdk": "1.31.0", // GHSA-6qxp-vccf-f47h
-  "proxy-addr": "2.0.8", // GHSA-jqcg-44mw-7w3h
-  "smol-toml": "1.9.0", // GHSA-r4xh-jqrq-34v2
+  "@modelcontextprotocol/sdk": "1.31.0",
+  "proxy-addr": "2.0.8",
+  "smol-toml": "1.9.0",
 };
 
 test("the root lockfile carries the releases that fix production dependency advisories", () => {

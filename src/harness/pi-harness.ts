@@ -395,7 +395,7 @@ async function directAnthropicJson(
     body: JSON.stringify({
       model: gateway?.target ?? requestModel.id,
       max_tokens: 64,
-      // Haiku 5.5 thinks by default; a 64-token budget would go entirely to thinking.
+
       thinking: { type: "disabled" },
       system: systemPrompt,
       messages: [{ role: "user", content: userPrompt }],
@@ -883,7 +883,6 @@ function textFromContent(content: unknown): string {
     .join("");
 }
 
-/** The agent's recent pi messages as governor work lines: what it said, called and got back. */
 function piGoalWork(messages: ReadonlyArray<unknown>): string {
   const lines: string[] = [];
   for (const m of messages as ReadonlyArray<{ role?: string; content?: unknown; toolName?: string }>) {
@@ -927,7 +926,6 @@ function piAssistantFailure(session: AssistantTextSession): ProviderTurnError | 
   return providerTurnError(failed, { contextWindow, lastInputTokens: lastInputTokens(session, failed) });
 }
 
-/** Codes that retry the turn on the configured fallback model. */
 const FALLBACK_CODES = new Set(["refusal", "model_unavailable"]);
 
 export function piLastAssistantTextOrThrow(session: AssistantTextSession): string | undefined {

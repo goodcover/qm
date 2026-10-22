@@ -118,7 +118,7 @@ export interface ToolContextRef {
 
   goalMeter?: import("./grind.ts").GrindMeter;
   governGoal?: GoalGovernor;
-  /** The agent's recent work for the governor, newest last. */
+
   goalRecentWork?: () => string;
   screenToolResult?: (input: ToolResultScreenInput) => Promise<ToolResultScreen>;
   toolApprovalGate?: (tool: string) => boolean;
@@ -4065,8 +4065,7 @@ export function createAgentTools(ref: ToolContextRef, opts?: AgentToolsOptions):
             true,
           );
         }
-        // Only a person's own message can lift a pause the person put there;
-        // crons, webhooks, ambient and delegated wakes cannot.
+
         if (ref.current?.humanTurn !== true) {
           return recordCoreAuthoredResult(
             callId,

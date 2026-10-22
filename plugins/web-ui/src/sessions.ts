@@ -1823,8 +1823,7 @@ export async function openSessionInto(
   const fetchEntries = (): Promise<TranscriptPage | null> =>
     fetchTranscript(s.id, { tailTurns: TAIL_TURNS }).catch(() => null);
   const continuable = s.canContinue === true;
-  // Approvals load alongside the transcript but never hold up the first draw:
-  // the chat mounts as soon as entries arrive, and cards attach when this settles.
+
   const approvals = continuable ? (approvalsPrefetch ?? fetchSessionApprovals(s.id)) : null;
   const entriesRes = await (entriesPrefetch ? entriesPrefetch.then((r) => r ?? fetchEntries()) : fetchEntries());
   if (!isLiveConversation(conv) || !isCurrent()) return;

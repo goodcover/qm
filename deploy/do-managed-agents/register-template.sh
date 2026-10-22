@@ -1,14 +1,4 @@
 #!/usr/bin/env bash
-# Build the QM sandbox image and register it as a Managed Agents template
-# on your own DigitalOcean team. Run once per team, and again after the
-# Dockerfile changes.
-#
-# Needs: docker (buildx), doctl authenticated with a token that has
-# registry and Managed Agents access, and an existing container registry.
-#
-# Usage: deploy/do-managed-agents/register-template.sh [tag]
-#   DO_REGISTRY      registry name (default: first registry on the account)
-#   TEMPLATE_NAME    template name (default: qm-sandbox)
 set -euo pipefail
 
 TAG="${1:-$(date +%Y%m%d%H%M%S)}"

@@ -196,7 +196,7 @@ export interface ToolContext extends SurfaceToolDeps {
   runtime?(request: RuntimeRequest, signal?: AbortSignal): Promise<RuntimeResult>;
   attach: AttachFiles;
   sessionSyscalls?: SessionSyscalls;
-  /** True when a person's own message started this turn (not a cron, webhook, ambient or delegated wake). */
+
   humanTurn?: boolean;
   commandCredentialHandles?: readonly string[];
   execute(
