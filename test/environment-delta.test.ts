@@ -70,7 +70,7 @@ test("local ISO clock follows daylight-saving transitions and non-hour offsets",
   assert.match(currentTimeBlock("Asia/Kathmandu", 0), /1970-01-01T05:30:00\+05:30/);
 });
 
-test("standing work includes all titles and readable timings, not IDs, owners or task bodies", () => {
+test("standing work bounds its inventory while retaining readable titles and timings", () => {
   const crons: Cron[] = Array.from({ length: 15 }, (_, i) => ({
     id: `cron-${i}`,
     ownerScopeId: "personal:U1",
@@ -83,10 +83,11 @@ test("standing work includes all titles and readable timings, not IDs, owners or
     schedule: { cron: "0 8 * * 1,3,5", timezone: "America/Los_Angeles" },
   }));
   const text = renderStandingObligations(crons, [], []);
-  assert.equal(text.split("\n").filter((line) => line.startsWith("- ")).length, 15);
+  assert.equal(text.split("\n").filter((line) => line.startsWith("- ")).length, 10);
   assert.match(text, /Task 14/);
   assert.match(text, /08:00 AM, only on Monday, Wednesday, and Friday/);
-  assert.doesNotMatch(text, /cron-1|private instructions|private-owner|and .* more/);
+  assert.doesNotMatch(text, /cron-1|private instructions|private-owner/);
+  assert.match(text, /5 more/);
   assert.match(
     renderStandingObligations(
       [{ ...crons[0]!, schedule: { cron: "0 8 * * FRI#L", timezone: "America/Los_Angeles" } }],

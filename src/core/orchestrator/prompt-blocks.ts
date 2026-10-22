@@ -65,6 +65,8 @@ function cronSchedulePromptLabel(c: Cron, timezone: string): string {
   return `once at ${localIsoTime(timezone, schedule.firstFireAt ?? c.createdAt)}`;
 }
 
+const OBLIGATIONS_CAP = 10;
+
 export function renderStandingObligations(
   crons: Cron[],
   webhooks: Webhook[],
@@ -75,15 +77,25 @@ export function renderStandingObligations(
   const lines = [
     ...crons
       .toSorted((a, b) => a.id.localeCompare(b.id))
+      .slice(0, OBLIGATIONS_CAP)
       .map((c) => `- ${c.title || "Untitled scheduled task"} — ${cronSchedulePromptLabel(c, timezone)}`),
-    ...webhooks.toSorted((a, b) => a.id.localeCompare(b.id)).map((w) => `- Webhook: ${summary(w.action)}`),
+    ...webhooks
+      .toSorted((a, b) => a.id.localeCompare(b.id))
+      .slice(0, OBLIGATIONS_CAP)
+      .map((w) => `- Webhook: ${summary(w.action)}`),
     ...monitors
       .toSorted((a, b) => a.id.localeCompare(b.id))
+      .slice(0, OBLIGATIONS_CAP)
       .map((m) => `- Job watch: ${summary(m.purpose ?? m.command)}`),
   ];
   return [
     "## Already scheduled here",
     ...(lines.length ? lines : ["No active scheduled work was found for this conversation."]),
+    ...(crons.length + webhooks.length + monitors.length > lines.length
+      ? [
+          `…and ${crons.length + webhooks.length + monitors.length - lines.length} more — use cron action=list, webhook action=list or background action=list to inspect the full inventory.`,
+        ]
+      : []),
   ].join("\n");
 }
 

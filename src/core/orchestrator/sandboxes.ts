@@ -267,13 +267,10 @@ export function createTurnSandboxes(ctx: TurnSandboxContext) {
   const ownerSkillsRoot = () => `${SKILLS_ROOT}/${turnSessionDir.split("/").at(-1)}`;
   let ownerSkillFingerprint: string | null = null;
   const currentOwnerSkills = async () => {
-    const current = (await visibleSkillsForTurn()).filter(
-      (r) =>
-        r.skill &&
-        resolution.layers.some(
-          (layer) => layer.mode === "ro" && layer.mountPath === "global" && layer.scopeId === r.skill!.scopeId,
-        ),
-    );
+    const sources = resolution.layers
+      .filter((layer) => layer.mode === "ro" && layer.mountPath === "global")
+      .map((layer) => layer.scopeId);
+    const current = (await visibleSkillsForTurn(sources)).filter((r) => r.skill && sources.includes(r.skill.scopeId));
     return Promise.all(
       current.map(async (r) => ({
         resolution: r,

@@ -256,6 +256,7 @@ test("owner sandbox loads current global skill sources separately and removes re
   let reads = 0;
   let revokeAtRead = 0;
   let writes = 0;
+  let unrelatedScreens = 0;
   const turn = createTurnSandboxes({
     deps: {
       skills: { recordUse: async () => {} },
@@ -299,9 +300,11 @@ test("owner sandbox loads current global skill sources separately and removes re
     transferId: "t",
     connectorEnv: {},
     ownerAuthAvailable: true,
-    visibleSkillsForTurn: async () => {
+    visibleSkillsForTurn: async (sources?: readonly string[]) => {
       if (++reads === revokeAtRead) current = [];
-      return current;
+      const selected = current.filter((entry) => !sources || sources.includes(entry.skill!.scopeId));
+      unrelatedScreens += selected.filter((entry) => entry.skill!.scopeId !== "org:default-org").length;
+      return selected;
     },
     emitGapWork: () => {},
   } as unknown as TurnSandboxContext);
@@ -309,12 +312,14 @@ test("owner sandbox loads current global skill sources separately and removes re
   const assetPath = (name: string) => `.agent-skills/s/${hashId([name, "1"], 16)}/${name}/scripts/run.py`;
   await turn.provisionOwnerAuth!();
   assert.deepEqual(provisions, ["owner"]);
+  assert.equal(unrelatedScreens, 0);
   assert.equal(disks.get("owner")!.get(assetPath("commander")), "commander");
   assert.ok(![...disks.get("owner")!.keys()].some((path) => path.includes("room-helper")));
   const writesBeforeUsageUpdate = writes;
   current = current.map((r) => ({ ...r, skill: { ...r.skill!, lastUsedAt: Date.now() } }));
   await turn.provisionOwnerAuth!();
   assert.equal(writes, writesBeforeUsageUpdate);
+  assert.equal(unrelatedScreens, 0);
   const loaded = await turn.useSkill("commander", "SKILL.md");
   assert.equal(loaded.dir, `/workspace/${assetPath("commander").replace("/scripts/run.py", "")}`);
   assert.equal(disks.get("shared")!.get(`${loaded.dir!.replace("/workspace/", "")}/scripts/run.py`), "commander");
