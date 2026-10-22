@@ -100,7 +100,12 @@ create a second connection with production bot credentials for local QA. The
 0.1.12 source update accepts the existing 0.1.11 installation without migration
 or token re-entry. Ops owns the release's immutable image pins and rollout record.
 
-## Enable Claude Code alongside Codex
+## Historical deployed baseline: Claude Code alongside Codex
+
+The instructions in this section describe the pre-0.1.15 deployed baseline.
+They are not configuration instructions for this source candidate. The 0.1.15
+candidate retires native Codex and OpenCode; use the [Pi subscription migration
+guide](UPGRADE-0.1.15.md) when preparing a separately authorized rollout.
 
 The deployed core already includes the Claude Code harness. Adding a token to
 Keychain does not automatically approve the harness or connect the credential
@@ -132,7 +137,11 @@ it when expired or revoked. The entry's ID is safe to keep in ops configuration.
 
 ## Upstream updates and CI
 
-The 0.1.13 source merge retains Goodcover's Codex 0.156.1 and Claude Agent SDK
+The current 0.1.15 source candidate adopts Pi while retaining ChatGPT subscription
+access. Use [the candidate upgrade guide](UPGRADE-0.1.15.md) for its configuration,
+migration, and rollback requirements. The version notes below are historical.
+
+The historical 0.1.13 source merge retained Goodcover's Codex 0.156.1 and Claude Agent SDK
 0.3.280, Plain OAuth and MCP catalog support, model reasoning capabilities,
 and deployed apps on the QM origin. Upstream's per-turn skill directories replace
 the old workspace skill projection. Owner credential sandboxes synchronize current
@@ -145,7 +154,7 @@ The source build uses upstream Pi security.4 and patched HTTP, URI, IP parsing,
 glob expansion, and Mermaid dependencies so production dependency audits pass.
 The core image retains its build-time security audit.
 
-The GPT-6.1 Sol addition upgrades Codex to 0.159.2 for its native model catalog.
+The historical GPT-6.1 Sol addition upgraded Codex to 0.159.2 for its native model catalog.
 The organization and personal defaults remain unchanged. Axios is pinned by the
 lockfile at 1.20.0 so Slack dependencies pass the production security audit.
 

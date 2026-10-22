@@ -88,6 +88,47 @@ test("mcp client sends bearer auth", async () => {
   await assert.rejects(() => bad.listTools(), /HTTP 401/);
 });
 
+test("mcp client posts to the configured endpoint path", async () => {
+  const cases: Array<[string, string]> = [
+    ["https://api.example.com/mcp/consumer", "https://api.example.com/mcp/consumer"],
+    ["https://api.example.com/mcp/consumer/", "https://api.example.com/mcp/consumer"],
+    ["https://mcp.example.com/mcp", "https://mcp.example.com/mcp"],
+    ["https://mcp.example.com/mcp/", "https://mcp.example.com/mcp"],
+    ["https://mcp.example.com", "https://mcp.example.com/mcp"],
+    ["http://memory.internal:8080/", "http://memory.internal:8080/mcp"],
+  ];
+  for (const [url, expected] of cases) {
+    const seen: string[] = [];
+    const fetchImpl: McpFetch = async (target) => {
+      seen.push(target);
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({ jsonrpc: "2.0", id: 1, result: { tools: [] } }),
+      };
+    };
+    await createMcpClient({ url, auth: { mode: "none" }, fetchImpl }).listTools();
+    assert.deepEqual(seen, [expected], url);
+  }
+});
+
+test("mcp client mints client-credentials tokens beside the endpoint", async () => {
+  const seen: string[] = [];
+  const fetchImpl: McpFetch = async (target) => {
+    seen.push(target);
+    const body = target.endsWith("/token")
+      ? { access_token: "minted", expires_in: 3600 }
+      : { jsonrpc: "2.0", id: 1, result: { tools: [] } };
+    return { ok: true, status: 200, text: async () => JSON.stringify(body) };
+  };
+  await createMcpClient({
+    url: "https://mcp.example.com/mcp",
+    auth: { mode: "client-credentials", clientId: "id", clientSecret: "secret" },
+    fetchImpl,
+  }).listTools();
+  assert.deepEqual(seen, ["https://mcp.example.com/token", "https://mcp.example.com/mcp"]);
+});
+
 test("server id validation", () => {
   assert.ok(isValidMcpServerId("salesforce"));
   assert.ok(isValidMcpServerId("crm-2"));
@@ -342,3 +383,81 @@ test("MCP discovery retains callable tools beyond the first 64 entries", async (
     service.close();
   }
 });
+
+test("background MCP refresh contains registry failures at startup, on change, and on its timer", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  const backing = createMemoryMap<McpServer>();
+  const store = createMcpServerStore(backing);
+  const { fetch } = fakeServerFetch();
+  const list = t.mock.method(store, "list", async () => {
+    throw new Error("registry unavailable");
+  });
+  const errors = t.mock.method(console, "error", () => {});
+  const service = createMcpToolService({ servers: store, fetchImpl: fetch, refreshIntervalMs: 100 });
+  t.after(() => service.close());
+  const settle = () => new Promise<void>((resolve) => setImmediate(resolve));
+  await settle();
+  assert.equal(list.mock.callCount(), 1);
+  await store.put(server());
+  await settle();
+  assert.equal(list.mock.callCount(), 2);
+  t.mock.timers.tick(100);
+  await settle();
+  assert.equal(list.mock.callCount(), 3);
+  assert.equal(errors.mock.callCount(), 3);
+  await assert.rejects(service.refresh(), /registry unavailable/);
+  list.mock.restore();
+  t.mock.timers.tick(100);
+  await settle();
+  assert.deepEqual(
+    service.toolDefs().map((tool) => tool.name),
+    ["crm_query", "crm_update"],
+  );
+  assert.equal(await service.call("crm_query", {}), "ran query");
+});
+
+for (const credentialHost of ["API.GITHUB.COM", "api.github.com.", "tools.example.com"]) {
+  test(`persisted OAuth host collisions fail closed before reading tokens: ${credentialHost}`, async (t) => {
+    const store = createMcpServerStore(createMemoryMap<McpServer>());
+    let tokenReads = 0;
+    let requests = 0;
+    const config = server({
+      auth: "oauth-user",
+      credentialScope: "shared",
+      credentialHost: "safe.example.com",
+      tools: TOOLS,
+      clientId: "client",
+      oauthAuthorizeUrl: "https://id.example.com/authorize",
+      oauthTokenUrl: "https://id.example.com/token",
+    });
+    await store.put(config);
+    await store.put(server({ id: "other", enabled: false, credentialHost: "tools.example.com" }));
+    const service = createMcpToolService({
+      servers: store,
+      userTokens: {
+        connectorAccessToken: async () => {
+          tokenReads++;
+          return "private-token";
+        },
+      },
+      fetchImpl: async (_url, init) => {
+        requests++;
+        const request = JSON.parse(init.body);
+        return jsonResponse({ id: request.id, result: { content: [{ type: "text", text: "ok" }] } });
+      },
+    });
+    t.after(() => service.close());
+    await service.refresh();
+    assert.equal(await service.call("crm_query", {}, "alice"), "ok");
+    assert.equal(tokenReads, 1);
+    await store.put({ ...config, credentialHost });
+    await assert.rejects(service.call("crm_query", {}, "alice"), /conflicting OAuth|unknown MCP tool/);
+    await service.refresh();
+    assert.deepEqual(
+      service.toolDefs().filter((tool) => tool.serverId === "crm"),
+      [],
+    );
+    assert.equal(tokenReads, 1);
+    assert.equal(requests, 1);
+  });
+}

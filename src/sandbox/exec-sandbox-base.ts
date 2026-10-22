@@ -20,12 +20,24 @@ const RO_LAYERS_TAR = ".ro-layers.tar";
 const RO_LAYERS_MANIFEST = ".ro-layers.manifest";
 const PREP_TIMEOUT_SEC = 60;
 
+const MAX_SANDBOX_NAME = 63;
+const HASH_LEN = 6;
+
 export const sandboxScopeName = (prefix: string, id: string): string => {
   const cleaned = id
     .toLowerCase()
     .replace(/[^a-z0-9-]+/g, "-")
     .replace(/^-+|-+$/g, "");
-  return `${prefix}-${cleaned.slice(0, 40).replace(/-+$/, "") || "scope"}-${shortHash(id)}`;
+  const name = `${prefix}-${cleaned.slice(0, 40).replace(/-+$/, "") || "scope"}-${shortHash(id)}`;
+
+  if (name.length <= MAX_SANDBOX_NAME) return name;
+
+  const hash = shortHash(name);
+  const slugBudget = MAX_SANDBOX_NAME - prefix.length - HASH_LEN - 2;
+  const slug = slugBudget > 0 ? cleaned.slice(0, slugBudget).replace(/-+$/, "") : "";
+  if (slug) return `${prefix}-${slug}-${hash}`;
+  const head = prefix.slice(0, MAX_SANDBOX_NAME - HASH_LEN - 1).replace(/-+$/, "");
+  return head ? `${head}-${hash}` : hash;
 };
 
 export interface ExecSandboxBaseDeps {
@@ -88,6 +100,7 @@ export function createExecSandboxBase(deps: ExecSandboxBaseDeps): ExecSandboxBas
           await cleanupFailedProvision(
             { teardown: () => deps.deleteInstance(name) },
             { id: name, rootDir: workspaceDir, scratch: true, backend: label },
+            error,
           );
           scratchKeyByName.delete(name);
           throw error;
@@ -206,7 +219,7 @@ export function createExecSandboxBase(deps: ExecSandboxBaseDeps): ExecSandboxBas
 
       return handle;
     } catch (err) {
-      await cleanupFailedProvision({ teardown }, handle);
+      await cleanupFailedProvision({ teardown }, handle, err);
       throw err;
     }
   }

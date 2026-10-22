@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
+import { runInNewContext } from "node:vm";
 import test from "node:test";
 import { CI_JOBS, readReceipt, reusableCi } from "../scripts/reuse-ci.ts";
 
@@ -295,11 +296,11 @@ test("all quality jobs keep successful names and missing proof runs full checks"
   assert.ok(jobs.core!.includes('test "$TYPECHECK" = success && test "$TESTS" = success'));
   const names: string[] = [];
   for (const [id, block] of Object.entries(jobs)) {
-    if (["reuse", "certify"].includes(id)) continue;
+    if (["reuse", "certify", "notify-deployments"].includes(id)) continue;
     const name = block.match(/^ {4}name: (.+)$/m)![1]!;
     if (id === "core-tests") names.push(...[1, 2, 3, 4, 5].map((n) => name.replace("${{ matrix.shard }}", String(n))));
     else names.push(name);
-    if (["core", "coauthor-trailers"].includes(id)) continue;
+    if (["core", "coauthor-trailers", "dependency-audit"].includes(id)) continue;
     assert.ok(block.includes("needs: reuse\n    if: always() && !cancelled()"));
     const steps = block.split(/(?=^ {6}- (?:name|uses):)/m).slice(1);
     assert.ok(steps[0]!.includes("if: needs.reuse.outputs.reusable == 'true'"));
@@ -309,6 +310,39 @@ test("all quality jobs keep successful names and missing proof runs full checks"
   assert.ok(jobs.reuse!.includes("continue-on-error: true"));
   assert.ok(jobs.reuse!.includes("steps.proof.outcome == 'success' && steps.proof.outputs.reusable == 'true'"));
   assert.ok(jobs.reuse!.includes("if: github.event_name == 'push' && github.ref == 'refs/heads/main'"));
+});
+
+test("deployment notice fires only for a fully green main push and holds no repository access", () => {
+  const job = jobs["notify-deployments"]!;
+  const condition = job.match(/^ {4}if: (.+)$/m)![1]!;
+  for (const [repository, event, ref, cancelled, expected] of [
+    ["yc-software/qm", "push", "refs/heads/main", false, true],
+    ["example/qm", "push", "refs/heads/main", false, false],
+    ["yc-software/qm", "pull_request", "refs/heads/main", false, false],
+    ["yc-software/qm", "push", "refs/heads/master", false, false],
+    ["yc-software/qm", "push", "refs/heads/main", true, false],
+  ] as const) {
+    assert.equal(
+      runInNewContext(condition, {
+        always: () => true,
+        cancelled: () => cancelled,
+        github: { repository, event_name: event, ref },
+      }),
+      expected,
+      JSON.stringify({ repository, event, ref, cancelled }),
+    );
+  }
+  assert.ok(
+    job.includes(
+      "needs: [core, cli, lint, dependency-audit, core-postgres, admin-plugin, web-ui-plugin, auth-plugin, portal-plugin]",
+    ),
+  );
+  assert.ok(job.includes("permissions: {}"));
+  assert.ok(job.includes("continue-on-error: true"));
+  assert.ok(!job.includes("exit 1"));
+  assert.ok(job.includes(`all(. == "success")`));
+  assert.equal([...job.matchAll(/^ {6}- /gm)].length, 1);
+  assert.ok(!job.includes("uses: actions/checkout"));
 });
 
 test("receipt is an isolated immutable checkout with no secrets, artifacts, caches or repository scripts", () => {

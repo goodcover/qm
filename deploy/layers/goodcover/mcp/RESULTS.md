@@ -14,14 +14,14 @@ All six connections passed tool discovery and a bounded read through MCPorter
 inside the existing computer. Returned business data and credential values were
 not included in the test summaries.
 
-| Connection | Tools discovered | Successful read |
-| --- | ---: | --- |
-| Goodcover guides and blog posts | 9 | `list_blog_taxonomy` |
-| Existing SigNoz MCP | 43 | `signoz_list_services`, limit 1, last hour |
-| Datalake | 1 | `mysql_query`: `SELECT 1 AS qm_mcp_check` |
-| ProdDB | 1 | `mysql_query`: `SELECT 1 AS qm_mcp_check` |
-| Sentry | 8 initial tools | `find_organizations`; Goodcover visible |
-| Google Search Console | 24 | `sites_list`; goodcover.com property visible |
+| Connection                      | Tools discovered | Successful read                              |
+| ------------------------------- | ---------------: | -------------------------------------------- |
+| Goodcover guides and blog posts |                9 | `list_blog_taxonomy`                         |
+| Existing SigNoz MCP             |               43 | `signoz_list_services`, limit 1, last hour   |
+| Datalake                        |                1 | `mysql_query`: `SELECT 1 AS qm_mcp_check`    |
+| ProdDB                          |                1 | `mysql_query`: `SELECT 1 AS qm_mcp_check`    |
+| Sentry                          |  8 initial tools | `find_organizations`; Goodcover visible      |
+| Google Search Console           |               24 | `sites_list`; goodcover.com property visible |
 
 Sentry ran with Seer disabled. No paid Seer calls or write queries were made.
 SigNoz already has a native QM connection and can keep using it; its catalog

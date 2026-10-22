@@ -15,6 +15,7 @@ export interface RunSignal {
   queuedRunId?: string;
   callId?: string;
   result?: ClientToolResult;
+  reason?: string;
 }
 
 export interface RunSignalStore {
@@ -157,7 +158,7 @@ const SIGNAL_POLL_MS = 5_000;
 
 export interface SignalPollHandlers {
   onSteer(text: string, ts?: string, request?: TurnRequest, acknowledge?: () => Promise<void>): Promise<void | boolean>;
-  onAbort(): Promise<void>;
+  onAbort(reason?: string): Promise<void>;
 }
 
 export function startSignalPoll(
@@ -165,7 +166,7 @@ export function startSignalPoll(
   runId: string,
   handlers: SignalPollHandlers,
   opts?: { intervalMs?: number; onError?: (e: unknown) => void; drainOnStop?: boolean },
-): () => Promise<void> {
+): (canStop?: () => boolean) => Promise<boolean> {
   const declined = new Set<string>();
   let draining = false;
   let redrain = false;
@@ -185,7 +186,7 @@ export function startSignalPoll(
         try {
           if (s.kind === "abort") {
             if (!abortDelivered) {
-              await handlers.onAbort();
+              await handlers.onAbort(s.reason);
               abortDelivered = true;
             }
           } else if (!declined.has(id)) {
@@ -217,15 +218,28 @@ export function startSignalPoll(
   const unsubscribe = signals.onSignal(runId, drain);
   const timer = setInterval(drain, opts?.intervalMs ?? SIGNAL_POLL_MS);
   timer.unref?.();
-  return async () => {
-    accepting = false;
-    clearInterval(timer);
-    unsubscribe();
-    if (opts?.drainOnStop) drain(true);
+  const waitForDrain = async () => {
     for (;;) {
       const current = inFlight;
       await current;
       if (!draining && inFlight === current) break;
     }
+  };
+  return async (canStop) => {
+    if (canStop) {
+      for (;;) {
+        const current = inFlight;
+        await current;
+        if (draining || inFlight !== current) continue;
+        if (!canStop()) return false;
+        break;
+      }
+    }
+    accepting = false;
+    clearInterval(timer);
+    unsubscribe();
+    if (opts?.drainOnStop) drain(true);
+    await waitForDrain();
+    return true;
   };
 }
