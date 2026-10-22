@@ -731,3 +731,80 @@ test("a queued steer remains durable until its native intake acknowledges it", a
   await stop();
   assert.deepEqual(await store.pending("intake"), []);
 });
+
+test("a conditional signal stop keeps subscription and steer deduplication when a drain creates more work", async () => {
+  const signals = createMemoryRunSignalStore();
+  const preparing = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const aborted = Promise.withResolvers<void>();
+  let steers = 0;
+  let pending = 0;
+  const stop = startSignalPoll(signals, "conditional-stop", {
+    onAbort: async () => aborted.resolve(),
+    onSteer: async () => {
+      steers++;
+      preparing.resolve();
+      await release.promise;
+      pending++;
+      return false;
+    },
+  });
+  try {
+    await signals.send("conditional-stop", { kind: "steer", text: "continue" });
+    await preparing.promise;
+    const stopping = stop(() => pending === 0);
+    release.resolve();
+    assert.equal(await stopping, false);
+    await signals.send("conditional-stop", { kind: "abort" });
+    await aborted.promise;
+    assert.equal(steers, 1);
+    pending = 0;
+    assert.equal(await stop(() => pending === 0), true);
+  } finally {
+    release.resolve();
+    await stop();
+  }
+});
+
+test("a successful conditional signal stop waits for a redrain already requested by another signal", async () => {
+  const signals = createMemoryRunSignalStore();
+  const first = Promise.withResolvers<void>();
+  const releaseFirst = Promise.withResolvers<void>();
+  const second = Promise.withResolvers<void>();
+  const releaseSecond = Promise.withResolvers<void>();
+  const deliveries: string[] = [];
+  const stop = startSignalPoll(signals, "conditional-redrain", {
+    onAbort: async () => {},
+    onSteer: async (text) => {
+      deliveries.push(text);
+      if (text === "first") {
+        first.resolve();
+        await releaseFirst.promise;
+      } else {
+        second.resolve();
+        await releaseSecond.promise;
+      }
+    },
+  });
+  try {
+    await signals.send("conditional-redrain", { kind: "steer", text: "first" });
+    await first.promise;
+    let stopped = false;
+    const stopping = stop(() => true).then((result) => {
+      stopped = result;
+    });
+    await signals.send("conditional-redrain", { kind: "steer", text: "second" });
+    releaseFirst.resolve();
+    await second.promise;
+    assert.equal(stopped, false);
+    releaseSecond.resolve();
+    await stopping;
+    assert.equal(stopped, true);
+    await signals.send("conditional-redrain", { kind: "steer", text: "after stop" });
+    assert.deepEqual(deliveries, ["first", "second"]);
+  } finally {
+    releaseFirst.resolve();
+    releaseSecond.resolve();
+    await stop();
+  }
+});

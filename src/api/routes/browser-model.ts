@@ -1,4 +1,4 @@
-import { modelRequestOverrides } from "../../model/pi-models.ts";
+import { modelRequestOverrides, resolveModel } from "../../model/pi-models.ts";
 import { orgId } from "../../config.ts";
 import { scopeId } from "../../types.ts";
 import { resolveBrowserModel } from "../../model/browser-model.ts";
@@ -55,9 +55,14 @@ async function browserModel(ctx: ApiCtx): Promise<void> {
       return sendJson(res, 409, {
         error: "AI access changed or is unavailable; start a new turn to refresh browser access",
       });
+    const subscriptionModel = resolveModel(capability.browserModel);
+    const chatgptSubscription =
+      selected.account === "company" &&
+      deps.providerKeys?.codexOAuth === true &&
+      (subscriptionModel?.provider === "openai" || subscriptionModel?.provider === "openai-codex");
     const nativeVariant = Boolean(modelRequestOverrides(capability.browserModel));
     if (nativeVariant && selected.account === "company") await gateway?.refresh?.();
-    if (selected.account !== "company" || !gateway || nativeVariant) {
+    if (selected.account !== "company" || !gateway || nativeVariant || chatgptSubscription) {
       if (selected.account !== "company" && !selected.routing)
         return sendJson(res, 409, { error: "Reconnect your selected AI account in Settings" });
       if (selected.routing?.kind === "oauth" && selected.routing.provider === "anthropic")
@@ -69,7 +74,9 @@ async function browserModel(ctx: ApiCtx): Promise<void> {
         (await deps.config?.getRuntimeSelectionDurable(scopeId("personal", capability.actorId)))?.harnessId ??
         (await deps.config?.getRuntimeSelectionDurable(scopeId("org", orgId())))?.harnessId ??
         deps.harnessId;
-      const useCompanySubscription = selected.account === "company" && companyHarness === deps.harnessId;
+      const useCompanySubscription =
+        selected.account === "company" && (chatgptSubscription || companyHarness === deps.harnessId);
+      const companySubscriptionProvider = chatgptSubscription ? "openai" : deps.harnessCarriedModelAuth;
       return sendJson(
         res,
         200,
@@ -79,7 +86,7 @@ async function browserModel(ctx: ApiCtx): Promise<void> {
           credentials: deps.userModelCredentials,
           companyProviderKeys:
             selected.account === "company" ? await deps.resolveBrowserCompanyKeys?.(useCompanySubscription) : undefined,
-          companySubscriptionProvider: useCompanySubscription ? deps.harnessCarriedModelAuth : undefined,
+          companySubscriptionProvider: useCompanySubscription ? companySubscriptionProvider : undefined,
           actorId: capability.actorId,
           body: input,
           signal: AbortSignal.any([controller.signal, AbortSignal.timeout(120_000)]),

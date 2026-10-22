@@ -35,11 +35,11 @@ process groups.
 
 Credentials remain in Dan's personal encrypted keychain:
 
-| Connection | Keychain service | Environment |
-| --- | --- | --- |
-| Marketing | `goodcover-marketing` | `GOODCOVER_MARKETING_AUTHORIZATION` |
-| ProdDB | `mcp_server_mysql_proddb` | `PRODDB_MYSQL_PASSWORD` |
-| Sentry | `goodcover-sentry` | `SENTRY_ACCESS_TOKEN` |
+| Connection     | Keychain service           | Environment                                 |
+| -------------- | -------------------------- | ------------------------------------------- |
+| Marketing      | `goodcover-marketing`      | `GOODCOVER_MARKETING_AUTHORIZATION`         |
+| ProdDB         | `mcp_server_mysql_proddb`  | `PRODDB_MYSQL_PASSWORD`                     |
+| Sentry         | `goodcover-sentry`         | `SENTRY_ACCESS_TOKEN`                       |
 | Search Console | `goodcover-search-console` | `GOOGLE_CLIENT_EMAIL`, `GOOGLE_PRIVATE_KEY` |
 
 SigNoz uses the existing internal service. Datalake uses the existing
