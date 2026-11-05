@@ -292,8 +292,9 @@ application:
      Plain workspace in Keychain. The admin API no longer creates `auth: "oauth"`
      servers, so stop the dev instance and seed the legacy record through the store
      from the checkout. Run it with the dev instance's environment, including its
-     `DATABASE_URL`, `ORG_ID` and `CONNECTOR_SECRET_KEY`, and with `PLAIN_OWNER` set to
-     the principal that connected Plain. Then start the instance again:
+     table-owner `DATABASE_URL`, `ORG_ID` and `CONNECTOR_SECRET_KEY`, and with
+     `PLAIN_OWNER` set to the principal that connected Plain. Then start the instance
+     again:
 
      ```sh
      node --input-type=module -e '
@@ -306,7 +307,7 @@ application:
      const db = new pg.Client({ connectionString: config.databaseUrl });
      await db.connect();
      const booted = await db.query("SELECT 1 FROM qm_schema_migrations WHERE id = $1", ["surfaces/0005-retired-origin-sweep"]).catch(() => ({ rowCount: 0 }));
-     const seeded = await db.query("SELECT 1 FROM mcp_servers WHERE id = $1", ["plain"]).catch(() => ({ rowCount: 0 }));
+     const seeded = await db.query("SELECT 1 FROM mcp_servers WHERE id = $1", ["plain"]).catch((e) => { if (e.code === "42P01") return { rowCount: 0 }; throw e; });
      await db.end();
      if (!booted.rowCount) throw new Error("refusing: this database has not run 0.1.16");
      if (seeded.rowCount) throw new Error("refusing: a plain MCP record already exists");
