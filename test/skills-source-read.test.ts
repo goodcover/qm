@@ -249,7 +249,7 @@ test("a scratch computer carries current org skill files at the scoped paths, ne
     }) as unknown as SkillResolution;
   const bodyOnly = skill("org-notes", "org:default-org");
   (bodyOnly.skill!.manifest as { files?: unknown }).files = [];
-  const current = [skill("commander", "org:default-org"), skill("room-helper", "channel:room"), bodyOnly];
+  const current = [skill("org-helper", "org:default-org"), skill("room-helper", "channel:room"), bodyOnly];
   const sandboxes = (failScratchWrites: boolean) => {
     const disks = new Map<string, Map<string, string>>();
     const errors: unknown[] = [];
@@ -292,10 +292,10 @@ test("a scratch computer carries current org skill files at the scoped paths, ne
 
   const { turn, disks } = sandboxes(false);
   const scratch = await turn.provisionScratch();
-  const loaded = await turn.useSkill("commander", "SKILL.md");
+  const loaded = await turn.useSkill("org-helper", "SKILL.md");
   const script = `${loaded.dir!.slice("/workspace/".length)}/scripts/run.py`;
-  assert.equal(disks.get("shared")!.get(script), "commander");
-  assert.equal(disks.get(scratch.id)!.get(script), "commander");
+  assert.equal(disks.get("shared")!.get(script), "org-helper");
+  assert.equal(disks.get(scratch.id)!.get(script), "org-helper");
   assert.ok(
     ![...disks.get(scratch.id)!.keys()].some((path) => path.includes("room-helper") || path.includes("org-notes")),
   );
@@ -304,5 +304,7 @@ test("a scratch computer carries current org skill files at the scoped paths, ne
   const usable = await failing.turn.provisionScratch();
   assert.equal(await failing.turn.provisionScratch(), usable);
   assert.equal(failing.errors.length, 1);
-  assert.match(String((failing.errors[0] as [{ code: string; message: string }])[0].code), /tree_materialize_failed/);
+  const [recorded] = failing.errors[0] as [{ code: string; message: string }];
+  assert.equal(recorded.code, "tree_materialize_failed");
+  assert.match(recorded.message, /^org-helper: /);
 });

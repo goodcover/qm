@@ -299,6 +299,16 @@ test("MCP admin accepts per-user OAuth servers, discovers endpoints only from pu
     assert.equal(duplicate.status, 400);
     assert.equal(((await duplicate.json()) as { message: string }).message, CREDENTIAL_HOST_TAKEN);
   }
+  const unmatchable = await put("unmatchable", {
+    clientId: "c",
+    url: "https://other.example.com/mcp",
+    oauthAuthorizeUrl: "https://id.example.com/authorize",
+    oauthTokenUrl: "https://id.example.com/token",
+    credentialHost: "*.",
+  });
+  assert.equal(unmatchable.status, 400);
+  assert.equal(((await unmatchable.json()) as { message: string }).message, CREDENTIAL_HOST_TAKEN);
+  assert.ok(!(await store.get("unmatchable")));
 });
 
 test("MCP admin save stores the server's own description from the probe", async (t) => {

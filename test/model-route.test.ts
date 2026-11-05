@@ -295,6 +295,33 @@ for (const [account, anthropic, fallbackModel, expectedHosts] of [
   });
 }
 
+test("a company ChatGPT summary that fails never reaches a metered fallback", async () => {
+  const agent = createAgent({
+    resolveProviderKeys: async () => ({
+      anthropic: "sk-ant-api03-metered",
+      openai: "sk-openai",
+      "openai-codex": CHATGPT_LOGIN,
+    }),
+    resolveFallbackRuntime: () => ({ modelId: "claude-sonnet-5" }),
+  });
+  for (const [status, type] of [
+    [401, "authentication_error"],
+    [429, "insufficient_quota"],
+  ] as const) {
+    await withFetch(
+      () => errorReply(status, type, "subscription unavailable"),
+      async (calls) => {
+        await compact(agent, { runtime: { modelId: "codex/gpt-6-astra" } }).then(
+          () => assert.fail("the summary should fail"),
+          (e: unknown) => e,
+        );
+        assert.ok(calls.length > 0);
+        assert.deepEqual([...new Set(calls.map((call) => call.host))], ["chatgpt.com"]);
+      },
+    );
+  }
+});
+
 test("helper calls run on the org's utility model, not the deployment default", async () => {
   const agent = createAgent({
     defaultModelId: "claude-opus-5-5",

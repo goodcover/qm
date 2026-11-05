@@ -239,7 +239,7 @@ export function createTurnSandboxes(ctx: TurnSandboxContext) {
         {
           category: "skills",
           code: "tree_materialize_failed",
-          message: errMessage(err),
+          message: `${r.skill?.manifest.name ?? "skill"}: ${errMessage(err)}`,
           scopeLabel: scopeId,
           sessionId: session.id,
         },

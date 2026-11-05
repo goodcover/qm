@@ -49,6 +49,7 @@ export function mcpOAuthHostConflict(server: Pick<McpServer, "id" | "credentialH
   const host = server.credentialHost;
   if (PROVIDERS[server.id]) return true;
   if (!host) return false;
+  if (!hostMatches(host, host)) return true;
   const overlaps = (other: string) => hostMatches(host, other) || hostMatches(other, host);
   return (
     Object.values(PROVIDERS).some((provider) => provider.hosts.some(overlaps)) ||
