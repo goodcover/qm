@@ -8,7 +8,8 @@ Never squash or rebase it.
 
 Production stays on `0.1.15-gc.1`, which is source `f43507f4` and MicroVM 4.0. The
 authoritative pins live in ops `gc4/packages/qm/images.json`. This change does not
-touch them.
+touch them. Delete this guide once production runs 0.1.16 and its pre-hop-1 backup
+is no longer needed for recovery.
 
 ## What changes for GC4
 
@@ -165,8 +166,9 @@ configuration and the table-owner `DATABASE_URL`:
    candidate privately.
 
 Before hop 3, run the row checks of `surfaces/0005-retired-origin-sweep` read-only.
-From this candidate's checkout, print the migration's check block and run it inside
-a read-only transaction:
+Run it from a machine with `node`, `psql` and a checkout of this candidate, pointed
+at the same `DATABASE_URL` as the hop jobs; the core image may not ship `psql`. Print
+the migration's check block and run it inside a read-only transaction:
 
 ```sh
 { echo 'BEGIN TRANSACTION READ ONLY;'
@@ -274,15 +276,47 @@ application:
 
 ## Rollout checklist (requires separate approval)
 
-1. **Prove credentials before touching production.** Before hop 1, boot this
-   candidate as a web-only dev instance on a fresh database, with developer-owned
-   ChatGPT and Claude subscription credentials (never production ones). Run the
-   step 6 checks there. Then break each subscription credential in turn, with an API
-   key and a fallback runtime configured, and confirm the turn fails without any
+1. **Prove credentials before touching production.** A credential problem found
+   only at step 6 comes after an irreversible migration, so first boot this candidate
+   as a web-only dev instance (`/dev-instance`) on a fresh database. Use only
+   developer-owned accounts, never production ones:
+   - **ChatGPT.** Save a developer ChatGPT account's `.codex/auth.json` (from
+     `codex login`) as a file credential in the dev admin's Keychain, and set
+     `CODEX_AUTH_CREDENTIAL` to that entry's ID.
+   - **Claude.** Save a developer Claude subscription setup token (from
+     `claude setup-token`) as an environment credential named
+     `CLAUDE_CODE_OAUTH_TOKEN`, and set `CLAUDE_AUTH_CREDENTIAL` to its ID.
+   - **Plain.** Register a developer Plain client with `client_secret_post`, set
+     `PLAIN_OAUTH_CLIENT_ID` and `PLAIN_OAUTH_CLIENT_SECRET`, and connect a developer
+     Plain workspace in Keychain. The admin API no longer creates `auth: "oauth"`
+     servers, so seed the legacy record through the store from the checkout, with
+     `PLAIN_OWNER` set to the principal that connected Plain, then restart:
+
+     ```sh
+     node --input-type=module -e '
+     const { loadConfig } = await import("./src/config.ts");
+     const { buildApp } = await import("./src/wiring.ts");
+     const owner = process.env.PLAIN_OWNER;
+     if (!owner) throw new Error("set PLAIN_OWNER");
+     const built = buildApp(loadConfig());
+     await built.mcpServers.put({
+       id: "plain", name: "Plain", url: "https://mcp.plain.com/mcp", auth: "oauth",
+       credentialScope: "per-user", credentialHost: "mcp.plain.com", oauthPrincipalId: owner,
+       readOnly: true, enabled: true, updatedAt: Date.now(), updatedBy: owner,
+     });
+     process.exit(0);'
+     ```
+
+     Match `credentialScope` to production's Plain record, as shown in `/settings`.
+
+   Run the step 6 checks there. For the rotation check, a second process must read
+   back the rotated login. Then break each subscription credential in turn, with an
+   API key and a fallback runtime configured, and confirm the turn fails without any
    request to `api.openai.com` or to a metered Anthropic key. The broken Claude
    subscription also logs `[pi] fallback … skipped`; a broken ChatGPT login fails
-   without attempting a fallback. A credential problem found only at step 6 comes
-   after an irreversible migration.
+   without attempting a fallback. Slack is covered only if a dev Slack app is
+   provided; otherwise it is first exercised at step 7.
+
 2. **Build.** Build core, web-ui and portal from this exact merged source with
    `GIT_SHA`. Publish only to Goodcover ECR. Keep the `0.1.15-gc.1` digests.
 3. **Back up.** Take a fresh backup, then decode it, verify its checksum, restore it
