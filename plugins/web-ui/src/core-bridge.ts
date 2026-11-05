@@ -323,7 +323,6 @@ export interface CoreProject {
   scopeId: string;
   members: Array<{ principalId: string; displayName: string; avatarUrl?: string; viaChannel?: boolean }>;
   slackChannel?: { channelId: string; channelName: string; linkedBy?: string; linkedAt?: number };
-  /** Sidebar icon; absent shows the folder. */
   icon?: ProjectIcon;
   createdAt?: number;
   updatedAt?: number;

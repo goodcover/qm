@@ -1267,7 +1267,6 @@ export async function shareArtifact(ctx: ApiCtx): Promise<void> {
   });
 }
 
-/** Workspace custom emoji (name → image URL, aliases resolved), from the catalog the Slack surface publishes. */
 async function getCustomEmoji(ctx: ApiCtx): Promise<void> {
   const catalog = await ctx.deps.config?.getSlackEmojiCatalogDurable(orgScope(ctx.deps));
   const raw = catalog?.emoji ?? {};

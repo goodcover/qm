@@ -1144,7 +1144,6 @@ onCustomEmojiLoaded(() => {
   if (appState.currentView === "contexts") drawContexts();
 });
 
-/** Saves a project's icon; resolves to an error message, or null on success. */
 export async function setProjectIcon(project: CoreProject, value: ProjectIcon | null): Promise<string | null> {
   try {
     const updated = projectFromResponse(
