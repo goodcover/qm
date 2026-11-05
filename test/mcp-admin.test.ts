@@ -307,7 +307,7 @@ test("MCP admin accepts per-user OAuth servers, discovers endpoints only from pu
     credentialHost: "*.",
   });
   assert.equal(unmatchable.status, 400);
-  assert.equal(((await unmatchable.json()) as { message: string }).message, CREDENTIAL_HOST_TAKEN);
+  assert.equal(((await unmatchable.json()) as { message: string }).message, "credentialHost must be a valid host name");
   assert.ok(!(await store.get("unmatchable")));
 });
 

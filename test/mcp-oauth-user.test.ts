@@ -46,10 +46,12 @@ test("oauth-user servers register a PKCE public client that exchanges and refres
         credentialHost: "disabled.example.com",
         url: "https://disabled.example.com/mcp",
       }),
+      oauthServer({ id: "unmatchable", credentialHost: "*." }),
     ]),
   );
   assert.ok(oauthProvider("orders")?.pkce);
   assert.equal(oauthProvider("off"), undefined);
+  assert.equal(oauthProvider("unmatchable"), undefined);
   const resolve = withPublicOAuthClients(async () => {
     throw new Error("secret resolver must not be used");
   });

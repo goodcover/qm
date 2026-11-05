@@ -12,6 +12,7 @@ import {
 } from "../../../mcp/mcp-server-store.ts";
 import { isAccountType, PROVIDERS } from "../../../connectors/oauth.ts";
 import { mcpOAuthHostConflict } from "../../../mcp/mcp-tool-service.ts";
+import { normalizeHost } from "../../../resolution/egress-policy.ts";
 import { discoverOAuth, httpsUrl, parseScopes, type DiscoveredOAuth } from "../../../mcp/oauth-discovery.ts";
 import { errMessage } from "../../../util/errors.ts";
 import { sendJson } from "../../http.ts";
@@ -135,6 +136,9 @@ export async function putMcpServer(ctx: ApiCtx): Promise<void> {
   }
   const credentialHost =
     b.credentialHost ?? existing?.credentialHost ?? (oauthUser || auth === "oauth" ? parsed.hostname : undefined);
+  if (oauthUser && typeof credentialHost === "string" && !normalizeHost(credentialHost)) {
+    return sendJson(ctx.res, 400, { error: "bad_request", message: "credentialHost must be a valid host name" });
+  }
   if (
     oauthUser &&
     typeof credentialHost === "string" &&
