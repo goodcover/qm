@@ -145,7 +145,7 @@ export function keychainCompanyChatGPTAuth(
         auth: found.auth,
         async write(next) {
           await deps.keychain.updateFiles(
-            bundle,
+            { ...bundle, writeback: true },
             bundle.files.map((file) =>
               file.path === found.path
                 ? { ...file, contentBase64: Buffer.from(JSON.stringify(next), "utf8").toString("base64") }
