@@ -233,11 +233,10 @@ test("pack assets run from the skills root and stay across turns", async (t) => 
   assert.match(await b.turn("!skill source-helper"), /no skill file/);
 });
 
-test("a scratch computer carries current org skill files at the scoped paths, never room skills", async () => {
+test("a scratch computer carries current org skill files at the scoped paths, never room skills, and survives a failed write", async () => {
   const { createTurnSandboxes } = await import("../src/core/orchestrator/sandboxes.ts");
   type TurnSandboxContext = import("../src/core/orchestrator/sandboxes.ts").TurnSandboxContext;
   type SkillResolution = import("../src/skills/skill-store.ts").SkillResolution;
-  const { hashId } = await import("../src/util/crypto.ts");
   const skill = (name: string, scopeId: string): SkillResolution =>
     ({
       skill: {
@@ -248,15 +247,17 @@ test("a scratch computer carries current org skill files at the scoped paths, ne
       },
       shadowed: [],
     }) as unknown as SkillResolution;
-  const current = [skill("commander", "org:default-org"), skill("room-helper", "channel:room")];
-  const assetPath = (name: string) => `.agent-skills/s/${hashId([name, "1"], 16)}/${name}/scripts/run.py`;
+  const bodyOnly = skill("org-notes", "org:default-org");
+  (bodyOnly.skill!.manifest as { files?: unknown }).files = [];
+  const current = [skill("commander", "org:default-org"), skill("room-helper", "channel:room"), bodyOnly];
   const sandboxes = (failScratchWrites: boolean) => {
     const disks = new Map<string, Map<string, string>>();
-    const requestedSources: (readonly string[] | undefined)[] = [];
+    const errors: unknown[] = [];
     let scratchCount = 0;
     const turn = createTurnSandboxes({
       deps: {
         skills: { recordUse: async () => {} },
+        errors: { record: (...args: unknown[]) => errors.push(args) },
         sandbox: {
           provision: async (_owner: unknown, options?: { scratch?: unknown }) => {
             const id = options?.scratch ? `scratch-${++scratchCount}` : "shared";
@@ -283,23 +284,25 @@ test("a scratch computer carries current org skill files at the scoped paths, ne
       transferId: "t",
       connectorEnv: {},
       visibleSkillsForTurn: async (sources?: readonly string[]) => {
-        requestedSources.push(sources);
         return current.filter((entry) => !sources || sources.includes(entry.skill!.scopeId));
       },
     } as unknown as TurnSandboxContext);
-    return { turn, disks, requestedSources };
+    return { turn, disks, errors };
   };
 
-  const { turn, disks, requestedSources } = sandboxes(false);
+  const { turn, disks } = sandboxes(false);
   const scratch = await turn.provisionScratch();
-  assert.deepEqual(requestedSources, [["org:default-org"]]);
-  assert.equal(disks.get(scratch.id)!.get(assetPath("commander")), "commander");
-  assert.ok(![...disks.get(scratch.id)!.keys()].some((path) => path.includes("room-helper")));
   const loaded = await turn.useSkill("commander", "SKILL.md");
-  assert.equal(loaded.dir, `/workspace/${assetPath("commander").replace("/scripts/run.py", "")}`);
-  assert.equal(disks.get("shared")!.get(assetPath("commander")), "commander");
+  const script = `${loaded.dir!.slice("/workspace/".length)}/scripts/run.py`;
+  assert.equal(disks.get("shared")!.get(script), "commander");
+  assert.equal(disks.get(scratch.id)!.get(script), "commander");
+  assert.ok(
+    ![...disks.get(scratch.id)!.keys()].some((path) => path.includes("room-helper") || path.includes("org-notes")),
+  );
 
   const failing = sandboxes(true);
-  await assert.rejects(failing.turn.provisionScratch(), /fixture write failed/);
-  await assert.rejects(failing.turn.provisionScratch(), /cleanup is still pending/);
+  const usable = await failing.turn.provisionScratch();
+  assert.equal(await failing.turn.provisionScratch(), usable);
+  assert.equal(failing.errors.length, 1);
+  assert.match(String((failing.errors[0] as [{ code: string; message: string }])[0].code), /tree_materialize_failed/);
 });

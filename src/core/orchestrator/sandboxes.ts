@@ -248,10 +248,12 @@ export function createTurnSandboxes(ctx: TurnSandboxContext) {
       throw err;
     }
   };
+  const shipsFiles = (r: SkillResolution): boolean =>
+    (r.skill?.manifest.files?.length ?? 0) > 0 || r.skill?.pack !== undefined;
   const layOrgSkills = async (handle: SandboxHandle): Promise<void> => {
     const org = resolution.orgScopeId;
-    for (const r of await visibleSkillsForTurn([org]))
-      if (r.skill?.scopeId === org) await materializeSkillTree(handle, r);
+    const shipped = (await visibleSkillsForTurn([org])).filter((r) => r.skill?.scopeId === org && shipsFiles(r));
+    await Promise.allSettled(shipped.map((r) => materializeSkillTree(handle, r)));
   };
   const useSkill = async (name: string, file: string, sandboxId?: string, source?: string): Promise<SkillResult> => {
     const missing = { content: null, sourceScopeId: null };
@@ -265,7 +267,6 @@ export function createTurnSandboxes(ctx: TurnSandboxContext) {
       (r) => r.skill?.manifest.name === name,
     );
     if (!resolution?.skill) return missing;
-    const shipsFiles = (resolution.skill.manifest.files?.length ?? 0) > 0 || resolution.skill.pack !== undefined;
     const asset = resolution.skill.manifest.files?.find((f) => {
       try {
         return safeSkillFilePath(f.path) === file;
@@ -280,7 +281,7 @@ export function createTurnSandboxes(ctx: TurnSandboxContext) {
       file === "SKILL.md"
         ? renderSkillBody(resolution, root)
         : rehomeSkillPaths(resolution, asset!, root ?? skillsRoot(resolution));
-    if (!shipsFiles) return { content: render(), sourceScopeId: resolution.skill.scopeId };
+    if (!shipsFiles(resolution)) return { content: render(), sourceScopeId: resolution.skill.scopeId };
     const access = sandboxId !== undefined ? await accessResource(sandboxId) : undefined;
     if (access?.crossScope) return { content: render(skillsRoot(resolution)), sourceScopeId: resolution.skill.scopeId };
     const handle = access ? await provisionResource(access) : await provision();
