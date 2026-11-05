@@ -91,7 +91,7 @@ function compact(agent: ReturnType<typeof createAgent>, route: Partial<CompactIn
 function turn(agent: ReturnType<typeof createAgent>, modelId: string): Promise<unknown> {
   let seq = 0;
   return agent.runTurn({
-    session: { id: `route-turn-${modelId}` } as AgentTurnInput["session"],
+    session: { id: `route-turn-${modelId.replaceAll("/", "-")}` } as AgentTurnInput["session"],
     input: "hello",
     systemPrompt: "BASE",
     history: [],
@@ -266,6 +266,35 @@ test("a fallback that fails keeps the original refusal and says what happened to
     },
   );
 });
+
+for (const [anthropic, fallbackModel, expectedHosts] of [
+  ["sk-ant-oat01-subscription", "gpt-6-astra", ["api.anthropic.com"]],
+  ["sk-ant-oat01-subscription", "codex/gpt-6-astra", ["api.anthropic.com", "chatgpt.com"]],
+  ["sk-ant-api03-metered", "gpt-6-astra", ["api.anthropic.com", "api.openai.com"]],
+] as const) {
+  const subscription = anthropic.includes("oat");
+  test(`a ${subscription ? "subscription" : "metered"} Claude turn ${expectedHosts.length > 1 ? "falls back" : "never falls back"} to ${fallbackModel}`, async () => {
+    const agent = createAgent({
+      resolveProviderKeys: async () => ({ anthropic, openai: "sk-openai", "openai-codex": CHATGPT_LOGIN }),
+      resolveFallbackRuntime: () => ({ modelId: fallbackModel }),
+    });
+    await withFetch(
+      (url) =>
+        new URL(url).host === "api.anthropic.com"
+          ? errorReply(401, "authentication_error", "login revoked")
+          : errorReply(400, "invalid_request_error", "fallback unavailable"),
+      async (calls) => {
+        const error = await turn(agent, "claude-sonnet-5").then(
+          () => assert.fail("both routes fail"),
+          (e: unknown) => e,
+        );
+        assert.ok(error instanceof ProviderTurnError);
+        assert.equal(error.code, "auth");
+        assert.deepEqual([...new Set(calls.map((call) => call.host))], expectedHosts);
+      },
+    );
+  });
+}
 
 test("helper calls run on the org's utility model, not the deployment default", async () => {
   const agent = createAgent({

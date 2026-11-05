@@ -60,6 +60,7 @@ import { providerTurnError } from "../model/provider-error.ts";
 import { asError, swallow, swallowAs } from "../util/errors.ts";
 import { startPhase } from "../../plugins/chassis/src/error-reporting.ts";
 import {
+  CODEX_SUBSCRIPTION_PROVIDER,
   DEFAULT_AGENT_MODEL_ID,
   auxiliaryModelFor,
   defaultModel,
@@ -78,6 +79,7 @@ import {
   type ModelRequestPurpose,
 } from "../model/provider-endpoints.ts";
 import { modelBilling, routeLabel, type ModelRoute } from "../model/model-route.ts";
+import { isClaudeSubscriptionToken } from "../model/claude-subscription.ts";
 import {
   type Agent,
   type CompactInput,
@@ -886,7 +888,12 @@ export function createAgent(opts?: AgentOptions): Agent {
     routeFor(session.runtime?.modelId ?? baseModelId(), session.providerKeys);
   const utilityRoute = async (modelId?: string) =>
     servable(await routeFor(modelId ?? auxiliaryModelFor(baseModelId())));
+  const subscriptionServed = (route: ModelRoute): boolean =>
+    route.billing !== "model_gateway" &&
+    (route.model.provider === CODEX_SUBSCRIPTION_PROVIDER ||
+      (route.model.provider === "anthropic" && isClaudeSubscriptionToken(route.keys.anthropic)));
   const fallbackRoute = async (
+    from: ModelRoute,
     fromModelIds: ReadonlySet<string>,
     providerKeys?: ProviderKeys,
   ): Promise<(ModelRoute & { runtime: RuntimeChoice }) | undefined> => {
@@ -896,6 +903,12 @@ export function createAgent(opts?: AgentOptions): Agent {
     if (fromModelIds.has(runtime.modelId) || fromModelIds.has(served) || !resolveModel(served, !providerKeys))
       return undefined;
     const route = servable(await routeFor(runtime.modelId, providerKeys));
+    if (route && subscriptionServed(from) && !subscriptionServed(route)) {
+      console.error(
+        `[pi] fallback ${routeLabel(route)} skipped: ${routeLabel(from)} is subscription-served and may only fall back to another subscription`,
+      );
+      return undefined;
+    }
     return route && { ...route, runtime };
   };
   const captureRequests = opts?.captureRequests ?? true;
@@ -1339,7 +1352,7 @@ export function createAgent(opts?: AgentOptions): Agent {
           const fromId = (entry.agentSession.model as { id?: string } | undefined)?.id;
           if (!fromId) return false;
           refusedModelIds.add(fromId);
-          const fallback = await fallbackRoute(refusedModelIds, turn.providerKeys);
+          const fallback = await fallbackRoute(route, refusedModelIds, turn.providerKeys);
           if (!fallback || !roomToReprompt()) return false;
           console.error(
             `[pi] provider ${failure.code} — retrying on fallback model ${fromId} -> ${fallback.modelId} session=${turn.session.id}: ${failure.message}`,
@@ -1688,7 +1701,7 @@ export function createAgent(opts?: AgentOptions): Agent {
         if (!(error instanceof ProviderTurnError)) throw error;
         const failure = routeFailed(error, primary);
         const fallback = FALLBACK_CODES.has(error.code)
-          ? await fallbackRoute(new Set([primary.modelId, primary.model.id]), input.providerKeys)
+          ? await fallbackRoute(primary, new Set([primary.modelId, primary.model.id]), input.providerKeys)
           : undefined;
         if (!fallback) throw failure;
         console.error(
