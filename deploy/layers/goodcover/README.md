@@ -60,7 +60,7 @@ hooks bind a guest-local resolver file over `/etc/resolv.conf`, directing DNS to
 the dedicated gateway at `172.16.31.250`. The image requires `ALL` additional guest
 OS capabilities. Gateway infrastructure and enrollment credentials stay in ops.
 
-Build an archive locally, using **this checkout's** `aws/microvm-agent/Dockerfile`
+Build an archive locally, using **this checkout's** `cli/templates/aws/microvm-agent/Dockerfile`
 and `agent.mjs`, plus the Goodcover wrapper:
 
 ```sh

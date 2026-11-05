@@ -18,23 +18,16 @@ import {
   type FileArtifact,
   type FileArtifactStore,
 } from "./file-artifact-store.ts";
-import type { FileUpload, FileUploadStore } from "./file-upload-store.ts";
+import { FileUploadError, type FileUpload, type FileUploadStore } from "./file-upload-store.ts";
 import { safeAttachmentName, mimeFromName } from "../core/attachments.ts";
 import { createSweeper } from "../util/sweeper.ts";
+import { inTenantOf } from "../tenants/claim.ts";
 
 export const FILE_UPLOAD_PART_SIZE = 64 * 1024 * 1024;
 const MAX_DIRECT_FILE_BYTES = 100 * 1024 ** 3;
 const UPLOAD_TTL_MS = 24 * 60 * 60 * 1000;
 const URL_TTL_SECONDS = 15 * 60;
 const SHA256_BASE64 = /^[A-Za-z0-9+/]{43}=$/;
-
-export class FileUploadError extends Error {
-  status: number;
-  constructor(message: string, status = 400) {
-    super(message);
-    this.status = status;
-  }
-}
 
 export function multipartChecksum(checksums: string[]): string {
   return `${createHash("sha256")
@@ -49,6 +42,7 @@ export interface DirectFileUploads {
     },
   ): Promise<FileUpload>;
   get(id: string): Promise<FileUpload | null>;
+  list(actorId: string): Promise<FileUpload[]>;
   sign(id: string, partNumber: number): Promise<{ url: string; headers: Record<string, string>; expiresAt: number }>;
   complete(id: string): Promise<FileArtifact>;
   abort(id: string): Promise<void>;
@@ -165,6 +159,7 @@ export function createDirectFileUploads(options: {
         uploadId: "",
         state: "pending",
         createdAt: now(),
+        lastActivityAt: now(),
         expiresAt: now() + UPLOAD_TTL_MS,
       };
       const matches = (existing: FileUpload) =>
@@ -202,6 +197,7 @@ export function createDirectFileUploads(options: {
       return row;
     },
     get: (id) => store.get(id),
+    list: (actorId) => store.active(actorId, now()),
     async sign(id, partNumber) {
       const row = await requireRow(id);
       if (row.state !== "pending" || row.expiresAt <= now())
@@ -211,6 +207,7 @@ export function createDirectFileUploads(options: {
       const length = Math.min(row.partSize, row.sizeBytes - (partNumber - 1) * row.partSize);
       const expiresIn = Math.min(URL_TTL_SECONDS, Math.floor((row.expiresAt - now()) / 1000));
       if (expiresIn < 1) throw new FileUploadError("upload expired", 409);
+      if (!(await store.touch(id, now()))) throw new FileUploadError("upload is not pending or has expired", 409);
       const checksum = row.checksums[partNumber - 1]!;
       const url = await presign(
         new UploadPartCommand({
@@ -332,8 +329,10 @@ export function createDirectFileUploads(options: {
     async sweep() {
       for (const row of await store.expired(now())) {
         try {
-          if (row.state === "completing") await service.complete(row.id);
-          else await service.abort(row.id);
+          await inTenantOf(row.tenantId, async () => {
+            if (row.state === "completing") await service.complete(row.id);
+            else await service.abort(row.id);
+          });
         } catch (error) {
           if (error instanceof FileUploadError && error.status === 410) continue;
           console.warn("[file uploads] cleanup failed", row.id, error instanceof Error ? error.name : "unknown");
@@ -366,8 +365,7 @@ export function createDirectFileUploads(options: {
             continue;
           const id = upload.Key.slice(`${options.prefix ?? ""}files/uploads/`.length);
           if (!/^[0-9a-f]{32}$/.test(id)) continue;
-          const row = await store.get(id);
-          if (row?.state === "completing" && row.uploadId === upload.UploadId) continue;
+          if ((await store.completingUploadId(id)) === upload.UploadId) continue;
           await client.send(
             new AbortMultipartUploadCommand({ Bucket: options.bucket, Key: upload.Key, UploadId: upload.UploadId }),
           );

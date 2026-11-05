@@ -4,21 +4,11 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CONFIG_FILENAME, loadConfigAt } from "../src/config.ts";
-import {
-  adminGrantEmails,
-  mintSigningJwk,
-  pendingSecrets,
-  playbookFor,
-  updateEnvContent,
-  runSetup,
-} from "../src/commands/setup.ts";
+import { adminGrantEmails, pendingSecrets, playbookFor, updateEnvContent, runSetup } from "../src/commands/setup.ts";
 import { CliError } from "../src/log.ts";
+import { MINT_JWK, mintLocalSecret } from "../src/secrets.ts";
 
-function configFor(
-  services: string[],
-  extra = "",
-  env = `{ "core": { "HARNESS": "pi" } }`,
-): ReturnType<typeof loadConfigAt>["config"] {
+function configFor(services: string[], extra = "", env = `{}`): ReturnType<typeof loadConfigAt>["config"] {
   const dir = mkdtempSync(join(tmpdir(), "qm-setup-"));
   try {
     writeFileSync(
@@ -130,15 +120,15 @@ test("the sign-in allowlist derives from the administrator seed", () => {
 });
 
 test("the broker signing key is a fresh P-256 private JWK", () => {
-  const first = JSON.parse(mintSigningJwk()) as Record<string, unknown>;
+  const first = JSON.parse(mintLocalSecret({ generate: MINT_JWK })!) as Record<string, unknown>;
   assert.equal(first.kty, "EC");
   assert.equal(first.crv, "P-256");
   for (const field of ["d", "x", "y"]) assert.equal(typeof first[field], "string", field);
-  assert.notEqual(mintSigningJwk(), JSON.stringify(first), "every deployment gets its own key");
+  assert.notEqual(mintLocalSecret({ generate: MINT_JWK }), JSON.stringify(first), "every deployment gets its own key");
 });
 
 test("the broker's operator secrets replace the external-IdP ones", () => {
-  const external = configFor(["core", "web-ui", "admin", "portal"]);
+  const external = configFor(["core", "web-ui", "portal"]);
   const externalNames = pendingSecrets(external, new Map()).todo.map((secret) => secret.name);
   assert.ok(externalNames.includes("OIDC_CLIENT_SECRET"));
   for (const name of ["AUTH_EMAIL_FROM", "RESEND_API_KEY"]) {
@@ -146,9 +136,9 @@ test("the broker's operator secrets replace the external-IdP ones", () => {
   }
 
   const broker = configFor(
-    ["core", "web-ui", "admin", "portal", "auth"],
+    ["core", "web-ui", "portal", "auth"],
     "",
-    `{ "core": { "HARNESS": "pi" }, "auth": { "AUTH_EMAIL_TRANSPORT": "resend" } }`,
+    `{ "auth": { "AUTH_EMAIL_TRANSPORT": "resend" } }`,
   );
   const brokerNames = pendingSecrets(broker, new Map()).todo.map((secret) => secret.name);
   assert.ok(!brokerNames.includes("OIDC_CLIENT_SECRET"), "the broker mints the portal's client secret");
@@ -178,7 +168,7 @@ test("runSetup refuses to run without a TTY", async () => {
 
 test("email setup uses declared secret names and does not reprompt for direct config values", () => {
   const aliased = configFor(
-    ["core", "web-ui", "admin", "portal", "auth"],
+    ["core", "web-ui", "portal", "auth"],
     `, "secretEnv": { "auth": { "AUTH_EMAIL_FROM": "AUTH_SENDER", "RESEND_API_KEY": "MAIL_KEY" } }`,
     `{ "auth": { "AUTH_EMAIL_TRANSPORT": "resend" } }`,
   );

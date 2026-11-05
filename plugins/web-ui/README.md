@@ -46,7 +46,7 @@ and `CORE_SIGNING_SECRET` (same value as the core when source-auth is enabled).
 
 ## Suggested activities
 
-Suggested activity generation is **on by default** when the configured harness supports
+Suggested activity generation is **on by default** when the configured model supports
 it. Set `SUGGESTED_ACTIVITIES_ENABLED=false` on core to disable generation. Optionally
 set `WEB_UI_SUGGESTED_ACTIVITIES` on web to a JSON array for fixed fallback starters;
 unset it as well to hide suggestions entirely. No deployment-specific activity content
@@ -93,8 +93,8 @@ subsequent runs happen around 2am in the browser's timezone, with the minute
 staggered by user. The cron runner uses the normal owner-scoped session, runtime
 selection, memory, history, tools, and authorized data access. It has no delivery
 destination. The standing task in `src/suggestions/activities.ts` asks it to research
-relevant context, avoid mutations or notifications, and return three validated
-activity objects. Draft prompts use a natural, collaborative voice, such as "Let's...",
+relevant context, avoid mutations or notifications, and return five validated
+activity objects: three are shown and two wait in reserve. Draft prompts use a natural, collaborative voice, such as "Let's...",
 with relevant facts and uncertainties as neutral context, without attributing knowledge,
 feelings, or beliefs to the user. They preserve explicit user
 preferences and scope while leaving the approach to the responding agent. It does not
@@ -106,6 +106,18 @@ previous result while a refresh runs and briefly polls for the first/new result;
 opening another chat does not normally invoke a model. Failed initial generations
 can retry after five minutes. Existing cron queueing, run persistence, authorization,
 fire history, and failure handling apply.
+
+When generation is enabled, each suggestion has a low-contrast dismiss button that
+strengthens on row hover or keyboard focus. Dismissing collapses that row while the next
+reserve suggestion expands into the list with the same height-and-fade motion the list
+uses when it collapses and reappears around a draft. The core stores dismissals on the
+user's suggestion profile (the 30 most recent IDs and titles), filters them out of every
+later response on every device, and adds their titles to the managed cron task so the
+next run avoids them; user-edited cron tasks are left alone. Three seconds after the last
+dismissal in a burst, the browser asks for a refresh; opening a new chat does the same if that
+request never arrived. The core starts one immediate run
+of the user's suggestions cron only when a dismissal is newer than the latest run and no
+run is in flight. Until it lands, fewer rows show; new rows then expand in.
 
 Cadence is reevaluated hourly. Ten or more user messages in sampled recent private
 conversations within 24 hours increases refreshes to every four hours; otherwise it
@@ -130,7 +142,7 @@ Below 860px the same build behaves like an app rather than a shrunken desktop:
   button's column so nothing renders under it.
 - **Bottom sheets.** Popover menus — composer settings, a session's ⋯, the user menu, the
   per-session tools — render as sheets with a backdrop; tap outside or swipe down to dismiss.
-- **Compact composer.** Attach · input · settings · send on one row; model, harness, effort, and
+- **Compact composer.** Attach · input · settings · send on one row; model, effort, and
   Fast live in the settings sheet. Inputs are 16px so iOS never zooms on focus, and the layout
   tracks the visual viewport so the composer stays above the on-screen keyboard.
 - **Touch targets.** Message actions, file chips, selects, drawer rows, approvals, and back
@@ -147,7 +159,7 @@ the CSS media queries, the composer, and the split canvas.
 
 - **Custom chat UI** — a first-party conversation surface with a left history rail, centered
   transcript, bottom composer, inline **model selector** (the models core reports as
-  serviceable for the approved harnesses),
+  serviceable),
   explicit **effort selector** (`low|medium|high|xhigh|max|ultracode|auto`), **Fast mode**
   toggle, attachments, streaming partials, and a theme picker. Settings → Theme takes
   light, dark, or system, or an imported palette: drop in an iTerm2 `.itermcolors` preset or
@@ -165,8 +177,8 @@ the CSS media queries, the composer, and the split canvas.
   (→ core `GET /v1/skills?principalId=`, resolved by `app.listVisibleSkills`). The skill _body_
   never reaches the browser; only name/description/scope do.
 - **Functional selectors** — the chosen model + effort + Fast mode ride along on each turn
-  (`POST /v1/turns` `model`/`thinkingLevel`/`fastMode`); the Pi harness applies them
-  server-side, bypassing Pi's stale thinking-level clamp for newer effort values and falling
+  (`POST /v1/turns` `model`/`thinkingLevel`/`fastMode`); the agent applies them
+  server-side, bypassing pi-ai's stale thinking-level clamp for newer effort values and falling
   back to its default on any unknown value. Attachments are forwarded as `IncomingAttachment`s
   and materialized into the agent's sandbox inbox (same path as Slack file shares).
 - **Unified history** — every session you participated in (DMs, channels, web), via

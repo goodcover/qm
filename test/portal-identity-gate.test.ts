@@ -5,15 +5,17 @@ import type { Server } from "node:http";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildApp, type BuiltApp } from "../src/wiring.ts";
+import { type BuiltApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import { createServer, createInsecureTestServer } from "../src/api/server.ts";
 import { mintSignedPayload } from "../src/auth/signed-token.ts";
 import { verifyCapabilityToken } from "../src/auth/capability-token.ts";
 import { testConfig } from "./support/test-config.ts";
 import { scopeId } from "../src/types.ts";
-import { isUnclassifiedWrite } from "../src/api/user-scoped-routes.ts";
 import { signedHeaders } from "../plugins/chassis/src/core-client.ts";
 import { authBrokerRoutes } from "../src/api/routes/auth-broker.ts";
+import { createPostgresReplayDedupe } from "../src/auth/replay-dedupe.ts";
+import { testDatabaseUrl } from "./support/test-database.ts";
 
 const SOURCE = "shared-source-auth-secret-for-tests-0001";
 const CAP = "core-only-capability-secret-for-tests-01";
@@ -77,6 +79,7 @@ describe("user-scoped routes require a portal-verified actor when enforcement is
     assert.ok(claimed?.leaseToken);
     await built.runs.complete(run.id, claimed.leaseToken, { status: "ok", reply: "owner-only result" });
     const strictServer = createServer(built.app, {
+      replayDedupe: createPostgresReplayDedupe(testDatabaseUrl()),
       signingSecret: SOURCE,
       capabilitySecret: CAP,
       portalIdentitySecret: PID,
@@ -132,6 +135,7 @@ describe("user-scoped routes require a portal-verified actor when enforcement is
     const alice = await token("U1");
     for (const path of [
       "/v1/memory?principalId=",
+      "/v1/spend?principalId=",
       "/v1/contexts/policy?scope=channel:C1&principalId=",
       "/v1/sessions/s1/background?viewer=",
       "/v1/shared-sessions/token?viewer=",
@@ -314,7 +318,7 @@ describe("user-scoped routes require a portal-verified actor when enforcement is
       endpoint: null,
       versions: [{ version: 1, createdAt: Date.now(), entrypoint: "node app.js", snapshotDir: "" }],
     };
-    built.app.listDeployments = async () => [deployment];
+    built.app.getDeployment = async (id) => (id === deployment.id ? deployment : null);
     built.app.listDeploymentsForViewer = async () => [];
     built.app.canManageDeployment = async (_id, principalId) => principalId === "U2";
     assert.equal((await fetch(`${base}/v1/deployments?principalId=U2`, { headers: aliceHeaders })).status, 403);
@@ -333,7 +337,7 @@ describe("user-scoped routes require a portal-verified actor when enforcement is
       assert.equal(response.status, 403, `deployment ${suffix}`);
     }
 
-    built.config.setCommandPolicy(scopeId("org", "default-org"), {
+    await built.config.setCommandPolicy(scopeId("org", "default-org"), {
       mode: "denylist",
       rules: [{ pattern: "printf", decision: "require_approval" }],
     });
@@ -361,6 +365,19 @@ describe("user-scoped routes require a portal-verified actor when enforcement is
       { "x-portal-identity": await token("U1") },
     );
     assert.equal(r.status, 403);
+  });
+
+  it("a web turn is gated whichever way its path is spelled", async () => {
+    const turn = {
+      surface: "web",
+      text: "hi",
+      actor: { externalId: "U2" },
+      conversation: { kind: "dm", threadRef: "t" },
+    };
+    const identity = { "x-portal-identity": await token("U1") };
+    assert.equal((await post("/v1/turns", turn, identity)).status, 403);
+    assert.equal((await post("/v1/%74urns", turn, identity)).status, 404);
+    assert.equal((await post("/v1/%74urns", turn)).status, 404);
   });
 
   it("a slack turn carries no portal identity and is not gated (different trust authority)", async () => {
@@ -394,16 +411,14 @@ describe("user-scoped routes require a portal-verified actor when enforcement is
 });
 
 describe("service-to-service writes are classified", () => {
-  it("every auth:source write route is classified, so production gating cannot demand a portal identity from a plugin", () => {
-    const unclassified = authBrokerRoutes
-      .filter((route) => "path" in route && route.auth === "source")
-      .map((route) => route as { method: string; path: string })
-      .filter((route) => isUnclassifiedWrite(route.method, route.path))
-      .map((route) => `${route.method} ${route.path}`);
+  it("every auth-broker source write declares its actor, so production gating cannot demand a portal identity from a plugin", () => {
+    const undeclared = authBrokerRoutes
+      .filter((route) => "path" in route && route.auth === "source" && route.method !== "GET" && !route.actor)
+      .map((route) => `${(route as { method: string }).method} ${(route as { path: string }).path}`);
     assert.deepEqual(
-      unclassified,
+      undeclared,
       [],
-      "an unclassified write requires a portal identity under REQUIRE_SIGNED_PORTAL_IDENTITY; add it to SYSTEM in user-scoped-routes.ts",
+      'a write defaults to requiring a portal identity under REQUIRE_SIGNED_PORTAL_IDENTITY; declare actor: "system" or "person" on the route',
     );
   });
 });

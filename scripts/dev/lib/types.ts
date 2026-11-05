@@ -12,13 +12,12 @@ export const EXIT = {
   doctorCritical: 10,
 } as const;
 
-export type ChildName = "core" | "web" | "admin" | "portal";
+export type ChildName = "core" | "web" | "portal";
 export const CHILD_ORDER: ChildName[] = ["core", "web", "portal"];
 
 export interface SlotPorts {
   core: number;
   web: number;
-  admin: number;
   portal: number;
   prodProxy: number;
   slackHealth: number;
@@ -94,18 +93,16 @@ export interface StatusReport {
   envSha: string;
   gitSha: string;
   sandbox: { backend: string; detail: string };
-  durability: { sessionStore: string; runStore: string; databaseUrl: boolean };
-  harness: string;
+  durability: { databaseUrl: boolean };
   webEnabled?: boolean;
   slackEnabled: boolean;
   watch: boolean;
-  turnsLive: boolean;
   publicApiUrl: string | null;
   children: Record<string, ChildStatus & { slack?: SlackHealth }>;
 }
 
 export type DevSandboxBackend =
-  "local" | "sprites" | "smolmachines" | "e2b" | "porter" | "agent37" | "superserve" | "do-managed-agents";
+  "local" | "sprites" | "smolmachines" | "e2b" | "porter" | "agent37" | "superserve" | "do-managed-agents" | "render";
 export type DevSandboxChoice = DevSandboxBackend | "auto";
 
 export interface BootSpec {
@@ -127,4 +124,11 @@ export interface LeaseInfo {
   meta: Record<string, string>;
   heartbeat: { pid: number; at: number; phase: string } | null;
   state: Record<string, unknown> | null;
+}
+
+export interface CanaryReply {
+  ok: boolean;
+  code?: "unconfigured";
+  rttMs?: number;
+  reason?: string;
 }

@@ -3,10 +3,12 @@ import { createServer, type Server } from "node:http";
 import { createHash, generateKeyPairSync, randomBytes } from "node:crypto";
 import { emailConfigured, readConfig, type AuthConfig } from "../src/config.ts";
 import type { ClaimStore } from "../../chassis/src/claims.ts";
-import type { Mailer, OutgoingEmail } from "../src/email.ts";
+import type { Mailer, OutgoingEmail } from "../../chassis/src/resend.ts";
 import { loadSigningKey } from "../src/keys.ts";
 import { TokenSigner } from "../src/tokens.ts";
-import { createAuthHandler } from "../src/server.ts";
+import { brokerHostTenants, createAuthHandler } from "../src/server.ts";
+import { inHostTenant, type HostTenantLookup } from "../../chassis/src/host-tenant.ts";
+import type { TenantSignInLookup } from "../../chassis/src/tenant-sign-in.ts";
 
 export const CLIENT_ID = "qm-portal";
 export const CLIENT_SECRET = "0123456789abcdef0123456789abcdef";
@@ -74,9 +76,6 @@ export function captureMailer(): Mailer & { sent: OutgoingEmail[]; failNext: boo
       state.sent.push(message);
       return "test-message-id";
     },
-    async verify(): Promise<string> {
-      return "ok";
-    },
   };
   return state;
 }
@@ -101,6 +100,8 @@ export async function startHarness(
     trustedSignInLabel?: string;
     emailAllowed?: (email: string) => Promise<boolean>;
     sessions?: RememberedSessions;
+    signIn?: TenantSignInLookup;
+    hostTenants?: HostTenantLookup;
   } = {},
 ): Promise<Harness> {
   const cfg = readConfig(testEnv(options.env));
@@ -139,11 +140,12 @@ export async function startHarness(
     mailer: emailConfigured(cfg) ? mailer : null,
     ...(options.brandName ? { brandName: options.brandName } : {}),
     emailAllowed: options.emailAllowed ?? (async () => false),
+    ...(options.signIn ? { signIn: options.signIn } : {}),
     now: () => now.ms,
     onBackgroundTask: (task) => pending.push(task),
   });
   const server: Server = createServer((req, res) => {
-    void handle(req, res).catch(() => {
+    void inHostTenant(brokerHostTenants(options.hostTenants, req), req, res, () => handle(req, res)).catch(() => {
       if (!res.headersSent) res.writeHead(500);
       res.end();
     });

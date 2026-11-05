@@ -1,6 +1,7 @@
 import { orgId as configOrgId } from "../config.ts";
 import { createPgPool } from "../persistence/pg-pool.ts";
 import type { ScopeId } from "../types.ts";
+import { TENANCY, tenantTables } from "../tenants/migrations.ts";
 
 export interface Environment {
   id: string;
@@ -59,69 +60,53 @@ function rowToAttachment(r: Record<string, unknown>): EnvironmentAttachment {
   };
 }
 
-export function createMemoryEnvironmentStore(opts: { now?: () => number } = {}): EnvironmentStore {
-  const now = opts.now ?? (() => Date.now());
-  const environments = new Map<string, Environment>();
-  const attachments = new Map<ScopeId, EnvironmentAttachment>();
-  return {
-    async create(input): Promise<Environment> {
-      const existing = environments.get(input.id);
-      if (existing) return existing;
-      const env: Environment = {
-        id: input.id,
-        orgId: configOrgId(),
-        name: input.name ?? null,
-        ownerActorId: input.ownerActorId ?? null,
-        createdAt: now(),
-        updatedAt: now(),
-      };
-      environments.set(env.id, env);
-      return env;
-    },
-    async get(id): Promise<Environment | null> {
-      return environments.get(id) ?? null;
-    },
-    async list(): Promise<Environment[]> {
-      return [...environments.values()]
-        .filter((e) => e.orgId === configOrgId())
-        .sort((a, b) => b.updatedAt - a.updatedAt);
-    },
-    async attach(scopeId, environmentId, attachedBy): Promise<void> {
-      attachments.set(scopeId, { scopeId, environmentId, attachedBy, attachedAt: now() });
-    },
-    async getAttachment(scopeId): Promise<EnvironmentAttachment | null> {
-      return attachments.get(scopeId) ?? null;
-    },
-    async attachmentsFor(environmentId): Promise<EnvironmentAttachment[]> {
-      return [...attachments.values()].filter((a) => a.environmentId === environmentId);
-    },
-  };
-}
-
 export function createPostgresEnvironmentStore(
   connectionString: string,
   opts: { now?: () => number } = {},
 ): EnvironmentStore {
   const now = opts.now ?? (() => Date.now());
-  const { q } = createPgPool(connectionString, "environments/store/0001", [
-    `CREATE TABLE IF NOT EXISTS environments(
+  const { q } = createPgPool(connectionString, [
+    ...TENANCY,
+    {
+      id: "environments/store/0001",
+      statements: [
+        `CREATE TABLE IF NOT EXISTS environments(
         id TEXT PRIMARY KEY, org_id TEXT NOT NULL, name TEXT, owner_actor_id TEXT,
         created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL
       )`,
-    `CREATE TABLE IF NOT EXISTS environment_attachments(
+        `CREATE TABLE IF NOT EXISTS environment_attachments(
         scope_id TEXT PRIMARY KEY,
         environment_id TEXT NOT NULL REFERENCES environments(id),
         attached_by TEXT NOT NULL, attached_at BIGINT NOT NULL
       )`,
-    `CREATE INDEX IF NOT EXISTS environment_attachments_by_env
+        `CREATE INDEX IF NOT EXISTS environment_attachments_by_env
         ON environment_attachments(environment_id)`,
+      ],
+    },
+    ...tenantTables(
+      "environments/store/0002-tenants",
+      [
+        { table: "environments", primaryKey: "id" },
+        { table: "environment_attachments", primaryKey: "scope_id" },
+      ],
+      {
+        foreignKeys: [
+          {
+            table: "environment_attachments",
+            name: "environment_attachments_environment_id_fkey",
+            columns: "environment_id",
+            references: "environments(tenant_id, id)",
+          },
+        ],
+      },
+    ),
   ]);
   return {
     async create(input): Promise<Environment> {
       const ts = now();
       await q(
         `INSERT INTO environments(id, org_id, name, owner_actor_id, created_at, updated_at)
-         VALUES ($1,$2,$3,$4,$5,$5) ON CONFLICT (id) DO NOTHING`,
+         VALUES ($1,$2,$3,$4,$5,$5) ON CONFLICT (tenant_id, id) DO NOTHING`,
         [input.id, configOrgId(), input.name ?? null, input.ownerActorId ?? null, ts],
       );
       const rows = await q("SELECT * FROM environments WHERE id = $1", [input.id]);
@@ -139,7 +124,7 @@ export function createPostgresEnvironmentStore(
       await q(
         `INSERT INTO environment_attachments(scope_id, environment_id, attached_by, attached_at)
          VALUES ($1,$2,$3,$4)
-         ON CONFLICT (scope_id) DO UPDATE SET environment_id = EXCLUDED.environment_id,
+         ON CONFLICT (tenant_id, scope_id) DO UPDATE SET environment_id = EXCLUDED.environment_id,
            attached_by = EXCLUDED.attached_by, attached_at = EXCLUDED.attached_at`,
         [scopeId, environmentId, attachedBy, now()],
       );

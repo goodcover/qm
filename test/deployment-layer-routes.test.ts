@@ -8,22 +8,29 @@ import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import { createServer } from "../src/api/server.ts";
 import { signRequest } from "../src/auth/source-auth.ts";
-import { buildApp } from "../src/wiring.ts";
-import { agentApiMatches } from "../src/api/agent-api-catalog.ts";
+import { buildApp } from "./support/build-app.ts";
 import { mintCapabilityToken, CAPABILITY_TTL_MS } from "../src/auth/capability-token.ts";
 import { scopeId } from "../src/types.ts";
 import { testConfig } from "./support/test-config.ts";
 import { DeploymentLayerPersistedError } from "../src/deployment/deployment-layer-store.ts";
+import { createPostgresReplayDedupe } from "../src/auth/replay-dedupe.ts";
+import { testDatabaseUrl } from "./support/test-database.ts";
 
 const SECRET = "layer-routes-secret".repeat(3);
 const PATH = "/v1/deployment-layer";
 
-function start(overrides: { deploymentLayerDir?: string } = {}, serverDeps: Record<string, unknown> = {}) {
+function start(
+  overrides: { deploymentLayerDir?: string } = {},
+  serverDeps: Record<string, unknown> = {},
+  mappedHosts = false,
+) {
   const built = buildApp(testConfig({ signingSecret: SECRET, ...overrides }));
   const server = createServer(built.app, {
+    replayDedupe: createPostgresReplayDedupe(testDatabaseUrl()),
     signingSecret: SECRET,
     deploymentLayer: built.deploymentLayerStore,
     auditLog: built.auditLog,
+    ...(mappedHosts ? { tenancy: { ...built.tenancy, hostTenant: async () => ({ multi: true }) } } : {}),
     ...serverDeps,
   });
   server.listen(0);
@@ -122,7 +129,7 @@ test("a correctly signed PUT replaces the layer and a signed GET reads it back",
     };
     assert.equal(putBody.ok, true);
     assert.equal(putBody.version, 1);
-    assert.equal(putBody.durable, false, "a memory-backed core reports the PUT as non-durable");
+    assert.equal(putBody.durable, true, "a Postgres-backed core reports the PUT as durable");
     assert.deepEqual(putBody.resolved.advertisedTools, ["acme CLI"]);
 
     const get = await fetch(`${srv.base}${PATH}`, { headers: signed("GET", "") });
@@ -202,6 +209,21 @@ test("GET distinguishes a poisoned stored revision from the prior durable revisi
       ["acme v1"],
       "GET reports the prior revision this instance still serves",
     );
+  } finally {
+    await srv.close();
+  }
+});
+
+test("the operator's layer sync still reads and writes once company hosts are mapped to tenants", async () => {
+  const srv = start({}, {}, true);
+  try {
+    const put = await fetch(`${srv.base}${PATH}`, { method: "PUT", headers: signed("PUT", bundle), body: bundle });
+    assert.equal(put.status, 200);
+    const get = await fetch(`${srv.base}${PATH}`, { headers: signed("GET", "") });
+    assert.equal(get.status, 200);
+    assert.equal(((await get.json()) as { source: string }).source, "durable");
+    const unsigned = await fetch(`${srv.base}${PATH}`);
+    assert.equal(unsigned.status, 401);
   } finally {
     await srv.close();
   }
@@ -348,9 +370,6 @@ test("a skill collision racing after validation is accepted degraded and audited
 });
 
 test("a VALID capability token is rejected on the deployment-layer routes (source-auth only)", async () => {
-  assert.equal(agentApiMatches("GET", PATH), false);
-  assert.equal(agentApiMatches("PUT", PATH), false);
-
   const srv = start();
   try {
     const cap = await mintCapabilityToken(

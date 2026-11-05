@@ -8,6 +8,7 @@ import {
   UploadPartCommand,
 } from "@aws-sdk/client-s3";
 import { shq } from "../util/shell.ts";
+import { tenantScopedId } from "../tenants/context.ts";
 import { swallowAs } from "../util/errors.ts";
 import { sleep, withTimeout } from "../util/async.ts";
 import { bodyToReadable, isNoSuchKey, s3Client, type S3Send } from "../persistence/s3.ts";
@@ -109,7 +110,8 @@ export interface S3SnapshotStoreOptions {
 
 export function createS3SnapshotStore(opts: S3SnapshotStoreOptions): HomeSnapshotStore {
   const s3 = opts.s3 ?? s3Client(opts.region);
-  const keyFor = opts.keyFor ?? ((scope: string): string => `${opts.prefix}/${encodeURIComponent(scope)}.tar`);
+  const keyFor =
+    opts.keyFor ?? ((scope: string): string => `${opts.prefix}/${encodeURIComponent(tenantScopedId(scope))}.tar`);
   const Bucket = opts.bucket;
   return {
     async open(scope): Promise<StoredSnapshot | null> {
@@ -179,6 +181,9 @@ export interface HomeSnapshotOpsOptions<S> {
   maxBytes?: number;
   timeoutMs?: number;
 }
+
+export const JOB_COMPUTER_SCOPE_PREFIX = "job-";
+export const isJobComputerScope = (scope: string): boolean => scope.startsWith(JOB_COMPUTER_SCOPE_PREFIX);
 
 export interface HomeSnapshotOps<S> {
   snapshotHome(scope: string, session: S): Promise<void>;
@@ -286,6 +291,7 @@ export function createHomeSnapshotOps<S>(opts: HomeSnapshotOpsOptions<S>): HomeS
 
   return {
     async snapshotHome(scope, session): Promise<void> {
+      if (isJobComputerScope(scope)) return;
       const left = startClock();
       const prune = prunePaths.length
         ? `\\( ${prunePaths.map((p) => `-path ${shq(p)}`).join(" -o ")} \\) -prune -o `
@@ -313,6 +319,7 @@ export function createHomeSnapshotOps<S>(opts: HomeSnapshotOpsOptions<S>): HomeS
     },
 
     async hydrateHome(scope, session): Promise<boolean> {
+      if (isJobComputerScope(scope)) return false;
       const left = startClock();
       const stored = await withTimeout(() => store.open(scope), left(), `${label} hydrate open`);
       if (!stored) return false;

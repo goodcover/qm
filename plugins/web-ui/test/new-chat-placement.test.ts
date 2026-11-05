@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { JSDOM } from "jsdom";
-import { createServer } from "vite";
+import { testViteServer } from "./vite-server.ts";
 import type { Conversation } from "../src/conv-types.ts";
 import { MAX_PANES, MAX_TILES } from "../src/split-layout.ts";
 
@@ -51,12 +51,11 @@ async function withCanvas(
     fetch: async () =>
       Response.json({
         scopeId: "personal:tester",
-        approvedHarnesses: ["pi"],
-        modelsByHarness: { pi: [] },
+        models: [],
         modelCatalog: {},
         fastModeModelIds: [],
         interactiveFastMode: false,
-        effective: { harnessId: "pi", modelId: "" },
+        effective: { modelId: "" },
         sessions: [],
         items: [],
       }),
@@ -69,7 +68,7 @@ async function withCanvas(
   Object.defineProperty(dom.window, "matchMedia", {
     value: () => ({ matches: false, addEventListener() {}, removeEventListener() {} }),
   });
-  const vite = await createServer({ server: { middlewareMode: true, hmr: false }, appType: "custom" });
+  const vite = await testViteServer();
   try {
     const { appState } = await vite.ssrLoadModule("/src/shell.ts");
     const split = await vite.ssrLoadModule("/src/split.ts");
@@ -141,11 +140,13 @@ async function withCanvas(
           .dispatchEvent(new dom.window.MouseEvent("pointerdown", { bubbles: true }));
       },
       splitTile: (index) => {
-        document
-          .querySelectorAll(".dv-groupview")
-          .item(index)!
-          .querySelector<HTMLButtonElement>('[aria-label="Split this pane with a new session"]')!
-          .click();
+        const group = document.querySelectorAll(".dv-groupview").item(index)!;
+        group.querySelector<HTMLButtonElement>('[aria-label="Pane layout and tools"]')!.click();
+        const action = Array.from(group.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')).find(
+          (button) => button.textContent?.trim() === "New pane to the right",
+        );
+        assert.ok(action, "the pane layout menu offers an explicit split");
+        action.click();
       },
       tiles: () => document.querySelectorAll(".dv-groupview").length,
       newChat: () => sessions.startNewChat() !== null,

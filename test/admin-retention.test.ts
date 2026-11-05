@@ -8,7 +8,7 @@ import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import { computeRetention } from "../src/admin/retention.ts";
 import { createInsecureTestServer } from "../src/api/server.ts";
-import { buildApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import type { TurnRequest } from "../src/types.ts";
 import { testConfig } from "./support/test-config.ts";
 
@@ -21,12 +21,12 @@ test("computeRetention: DAU/WAU/MAU, cohorts, new-vs-returning, and channel appr
     nowMs,
     sessionCount: 4,
     participants: [
-      { sessionId: "dm1", principalId: "U1", validFrom: at(950), validTo: null, validFromSeq: null, validToSeq: null },
-      { sessionId: "dm2", principalId: "U2", validFrom: at(998), validTo: null, validFromSeq: null, validToSeq: null },
-      { sessionId: "ch1", principalId: "U3", validFrom: at(995), validTo: null, validFromSeq: null, validToSeq: null },
-      { sessionId: "ch1", principalId: "U4", validFrom: at(995), validTo: null, validFromSeq: null, validToSeq: null },
-      { sessionId: "ch1", principalId: "U5", validFrom: at(1001), validTo: null, validFromSeq: null, validToSeq: null },
-      { sessionId: "dm3", principalId: "U6", validFrom: at(890), validTo: null, validFromSeq: null, validToSeq: null },
+      { sessionId: "dm1", principalId: "U1" },
+      { sessionId: "dm2", principalId: "U2" },
+      { sessionId: "ch1", principalId: "U3" },
+      { sessionId: "ch1", principalId: "U4" },
+      { sessionId: "ch1", principalId: "U5" },
+      { sessionId: "dm3", principalId: "U6" },
     ],
     turns: [
       { principalId: "U1", sessionId: "dm1", day: 1000, turns: 1, firstAt: at(1000), lastAt: at(1000) },

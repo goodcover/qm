@@ -1,9 +1,7 @@
 import { cleanupFailedProvision } from "./sandbox.ts";
 import { randomUUID } from "node:crypto";
 import { NotFoundError } from "porter-sandbox";
-import type { WorkspaceLayer } from "../types.ts";
-import type { WorkspaceStore } from "../workspace/workspace-store.ts";
-import { createNoopAdvisoryLock, type AdvisoryLock } from "../persistence/advisory-lock.ts";
+import type { AdvisoryLock } from "../persistence/advisory-lock.ts";
 import { createKeyedQueue } from "../util/async.ts";
 import { swallowAs, errMessage } from "../util/errors.ts";
 import {
@@ -21,7 +19,6 @@ import {
 import { shq } from "../util/shell.ts";
 import { nonInteractiveShellPrefix, DROPPED_PROXY_ENV, forceThroughProxyEnv } from "./sandbox-env.ts";
 import { createExecProcessSessions, type ExecProcessIo } from "./exec-process-session.ts";
-import { materializeRoLayers } from "./ro-layers.ts";
 import { createExecExport, createBackendBlobStaging, createExecFileOps, posixJoin } from "./exec-file-ops.ts";
 import {
   ephemeralCredLinkScript,
@@ -43,8 +40,6 @@ import type {
 } from "./sandbox.ts";
 
 const WORKSPACE_BASENAME = "workspace";
-const RO_LAYERS_TAR = ".ro-layers.tar";
-const RO_LAYERS_MANIFEST = ".ro-layers.manifest";
 const GUEST_PROBE_TIMEOUT_SEC = 10;
 const EGRESS_TAG = "qm-egress";
 const SCOPE_TAG = "qm-scope";
@@ -71,7 +66,7 @@ export interface PorterSandboxOptions {
   apiBaseUrl?: string;
   extraTools?: string[];
   credentialPaths?: CredentialPathSpec[];
-  advisoryLock?: AdvisoryLock;
+  advisoryLock: AdvisoryLock;
   client?: PorterClientLike;
   onError?: (e: { category: string; code: string; message: string; scopeLabel?: string }) => void;
 }
@@ -80,7 +75,7 @@ export const porterScopeSlug = porterSlug;
 
 const bodyName = (slug: string): string => `${slug}-${randomUUID().slice(0, 5)}`;
 
-export function createPorterSandbox(workspace: WorkspaceStore, opts: PorterSandboxOptions = {}): Sandbox {
+export function createPorterSandbox(opts: PorterSandboxOptions): Sandbox {
   const image = opts.image ?? DEFAULT_PORTER_SANDBOX_IMAGE;
   const prefix = opts.namePrefix ?? "qm";
   const homeDir = opts.homeDir ?? "/root";
@@ -88,7 +83,7 @@ export function createPorterSandbox(workspace: WorkspaceStore, opts: PorterSandb
   const defaultTimeoutSec = opts.defaultTimeoutSec ?? 600;
   const workspaceDir = `${homeDir}/${WORKSPACE_BASENAME}`;
   const provisionQueue = createKeyedQueue<string>();
-  const advisoryLock = opts.advisoryLock ?? createNoopAdvisoryLock();
+  const advisoryLock = opts.advisoryLock;
   const egressProxyHost = opts.egressProxyUrl ? new URL(opts.egressProxyUrl).hostname : undefined;
 
   const client: PorterClientLike =
@@ -144,7 +139,7 @@ export function createPorterSandbox(workspace: WorkspaceStore, opts: PorterSandb
       .catch((e) => {
         if (errMessage(e).includes("egress restriction is not available")) {
           throw new Error(
-            `porter sandbox ${name}: PORTER_SANDBOX_EGRESS_PROXY_URL is set but this cluster has egress restriction turned off, so Porter refuses to create the body at all — enable it on the cluster's sandbox-api system application or unset the proxy URL (docs/porter.md) (${errMessage(e)})`,
+            `porter sandbox ${name}: EGRESS_PROXY_URL is set but this cluster has egress restriction turned off, so Porter refuses to create the body at all — enable it on the cluster's sandbox-api system application or add porter to EGRESS_PROXY_EXEMPT_BACKENDS (docs/porter.md) (${errMessage(e)})`,
             { cause: e },
           );
         }
@@ -187,11 +182,7 @@ export function createPorterSandbox(workspace: WorkspaceStore, opts: PorterSandb
           bodies.delete(slug);
           await retirePorterBody(existing.sb, true);
         }
-        try {
-          onStatus?.("Starting your computer…");
-        } catch (error) {
-          void error;
-        }
+        onStatus?.("Starting your computer…");
         const ref = await createBody(slug, egressMode, { mountPath: homeDir, id: volume.id });
         scopeByBody.set(ref.name, scope);
         return { name: ref.name, coldStart: volume.created };
@@ -285,10 +276,8 @@ export function createPorterSandbox(workspace: WorkspaceStore, opts: PorterSandb
     ...execFileOps,
     ...blobStaging,
 
-    async provision(layers: WorkspaceLayer[], provOpts?: ProvisionOptions): Promise<SandboxHandle> {
+    async provision(scope: string, provOpts?: ProvisionOptions): Promise<SandboxHandle> {
       const scratch = provOpts?.scratch;
-      const writable = layers.find((l) => l.mode === "rw") ?? layers[0];
-      const scope = writable?.scopeId ?? "default";
       const forceEgress = !!egressProxyHost && !!provOpts?.egressToken;
       let name: string;
       let coldStart: boolean;
@@ -301,10 +290,7 @@ export function createPorterSandbox(workspace: WorkspaceStore, opts: PorterSandb
       const turnEnv = Object.fromEntries(
         Object.entries(provOpts?.env ?? {}).filter(([k]) => !DROPPED_PROXY_ENV.has(k)),
       );
-      const env = {
-        ...turnEnv,
-        ...(forceEgress ? forceThroughProxyEnv(opts.egressProxyUrl!, provOpts!.egressToken!) : {}),
-      };
+      const env = forceEgress ? forceThroughProxyEnv(opts.egressProxyUrl!, provOpts!.egressToken!, turnEnv) : turnEnv;
       const handle: SandboxHandle = {
         id: name,
         rootDir: workspaceDir,
@@ -319,18 +305,6 @@ export function createPorterSandbox(workspace: WorkspaceStore, opts: PorterSandb
         const prep = await execRaw(name, `mkdir -p ${shq(workspaceDir)}${credLinks}`, 60);
         if (prep.code !== 0)
           throw new Error(`porter provision prep failed: ${(prep.stderr || prep.stdout).slice(0, 200)}`);
-
-        await materializeRoLayers(
-          workspace,
-          layers,
-          handle,
-          {
-            readFile: (h, rel) => sandbox.readFile(h, rel),
-            writeFileBytes: (h, rel, data) => sandbox.writeFileBytes(h, rel, data),
-            exec: (script, t) => execRaw(name, script, t),
-          },
-          { manifest: RO_LAYERS_MANIFEST, tar: RO_LAYERS_TAR, label: "porter" },
-        );
 
         return handle;
       } catch (err) {

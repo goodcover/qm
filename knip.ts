@@ -4,7 +4,7 @@ export default {
   $schema: "https://unpkg.com/knip@6/schema.json",
   treatConfigHintsAsErrors: true,
   ignoreUnresolved: existsSync("/usr/bin/mount") ? [] : ["/usr/bin/mount"],
-  ignoreBinaries: ["tail", "cloudflared"],
+  ignoreBinaries: ["tail", "cloudflared", "litestream"],
   ignoreIssues: {
     "scripts/migrate-principals-to-email.d.mts": ["files"],
     "src/slack/lib.ts": ["exports", "types"],
@@ -12,12 +12,13 @@ export default {
   workspaces: {
     ".": {
       entry: [
+        "deploy/render-runner/start.mjs",
         "src/migrate-main.ts",
+        "scripts/ops/tenant-prebuild.ts",
+        "src/render/start.ts",
         "src/sandbox/local-sandbox.ts",
         "scripts/aws-deploy-smoke.ts",
         "scripts/aws-litestream-smoke.ts",
-        "scripts/backfill-search-index.ts",
-        "scripts/backfill-session-origin.ts",
         "scripts/e2b-live-smoke.mjs",
         "scripts/modal-live-smoke.mjs",
         "scripts/dev/cli.ts",
@@ -37,7 +38,7 @@ export default {
         "deploy/layers/goodcover/sandbox/microvm-runtime.mjs",
       ],
       paths: {
-        "./agent.mjs": ["aws/microvm-agent/agent.mjs"],
+        "./agent.mjs": ["cli/templates/aws/microvm-agent/agent.mjs"],
       },
     },
     desktop: {
@@ -53,9 +54,12 @@ export default {
       ],
     },
     cli: {
-      entry: ["bin/qm.ts"],
+      entry: ["bin/qm.ts", "src/contract.ts"],
     },
     "plugins/*": {},
+    "plugins/portal": {
+      ignoreDependencies: ["nodemailer"],
+    },
     "plugins/web-ui": {
       entry: [
         "src/shared-session.ts",

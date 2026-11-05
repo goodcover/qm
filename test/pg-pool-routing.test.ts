@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import { createPostgresAdvisoryLock } from "../src/persistence/advisory-lock.ts";
 import { createPostgresMap } from "../src/persistence/durable-map.ts";
 import { createPgPool, configurePgPooling } from "../src/persistence/pg-pool.ts";
+import { withTenant } from "../src/tenants/context.ts";
+import { seedInstallTenant } from "./support/tenant-seed.ts";
 
 const direct = process.env.DATABASE_URL;
 const pooled = process.env.DATABASE_POOL_URL;
@@ -10,8 +12,8 @@ const pooling = {
   ...(direct ? { databaseUrl: direct } : {}),
   ...(pooled ? { poolUrl: pooled } : {}),
   ...(process.env.DATABASE_POOL_CA_CERT ? { caCert: process.env.DATABASE_POOL_CA_CERT } : {}),
-  queryMax: Number(process.env.DATABASE_POOL_MAX ?? 4),
-  sessionMax: Number(process.env.DATABASE_DIRECT_POOL_MAX ?? 1),
+  queryMax: 4,
+  sessionMax: 1,
 };
 configurePgPooling(pooling);
 const skip = !direct || !pooled ? "requires direct Postgres and transaction PgBouncer URLs" : false;
@@ -46,7 +48,6 @@ test("session operations remain direct while ordinary queries use another backen
   const a = createPgPool(direct!);
   const client = await (await a.sessionPool()).connect();
   try {
-    assert.equal(new URL((await a.pool()).options.connectionString!).port, new URL(pooled!).port);
     const directPid = (await client.query("SELECT pg_backend_pid() AS pid")).rows[0]!.pid;
     await client.query("LISTEN qm_pool_routing_test");
     await client.query("SELECT pg_advisory_lock(827360194)");
@@ -77,11 +78,14 @@ test("one session slot can hold a lock while a transaction uses the query pool",
   const a = createPgPool(direct!);
   const lock = createPostgresAdvisoryLock(a);
   const map = createPostgresMap<{ n: number }>(a, "pgbouncer_lock_write_test");
+  await seedInstallTenant(direct!);
   try {
-    await lock.withLock("pgbouncer-write", async () => {
-      await map.put("one", { n: 42 });
-      assert.deepEqual(await map.get("one"), { n: 42 });
-    });
+    await lock.withLock("pgbouncer-write", () =>
+      withTenant("00000000-0000-4000-8000-000000000001", async () => {
+        await map.put("one", { n: 42 });
+        assert.deepEqual(await map.get("one"), { n: 42 });
+      }),
+    );
   } finally {
     await a.close();
   }
@@ -114,8 +118,11 @@ test("closing during initialization rejects pending queries and leaves other sto
 });
 
 test("dynamic migration waits for its prerequisite schema on a fresh database", { skip }, async () => {
-  const a = createPgPool(direct!, "pool-routing/prerequisite/0001", [
-    "CREATE TABLE IF NOT EXISTS pool_routing_prerequisite(id INTEGER PRIMARY KEY)",
+  const a = createPgPool(direct!, [
+    {
+      id: "pool-routing/prerequisite/0001",
+      statements: ["CREATE TABLE IF NOT EXISTS pool_routing_prerequisite(id INTEGER PRIMARY KEY)"],
+    },
   ]);
   try {
     await a.migrate({

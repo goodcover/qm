@@ -3,6 +3,7 @@ import type { ScopeId } from "../types.ts";
 import { createPgPool, withPgTransaction } from "../persistence/pg-pool.ts";
 import { createNotebookMemory, type FactStoreTx, type MemoryService } from "./memory-service.ts";
 import { isMemorySensitivity, type MemoryFact } from "./facts.ts";
+import { TENANCY, tenantTables } from "../tenants/migrations.ts";
 
 const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS memory_facts(
@@ -81,14 +82,34 @@ function fact(row: Row): MemoryFact {
 const LIVE = `SELECT id, text, sensitivity, sources, source_unknown, author, created_at, updated_at
   FROM memory_facts WHERE scope_id = $1 AND deleted_at IS NULL ORDER BY id`;
 
+export const MEMORY_FACTS_MIGRATIONS = [
+  ...TENANCY,
+  {
+    id: "memory/facts/0000-records-column",
+    statements: ["ALTER TABLE IF EXISTS memory_revisions ADD COLUMN IF NOT EXISTS records JSONB"],
+  },
+  { id: "memory/facts/0001", statements: SCHEMA },
+  {
+    id: "memory/facts/0002-text-hash",
+    statements: [
+      "ALTER TABLE memory_facts ADD COLUMN IF NOT EXISTS text_hash TEXT",
+      `CREATE OR REPLACE FUNCTION memory_facts_text_hash() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+        NEW.text_hash := encode(sha256(convert_to(NEW.text, 'UTF8')), 'hex');
+        RETURN NEW;
+      END $$`,
+      "DROP TRIGGER IF EXISTS memory_facts_text_hash ON memory_facts",
+      `CREATE TRIGGER memory_facts_text_hash BEFORE INSERT OR UPDATE OF text ON memory_facts
+        FOR EACH ROW EXECUTE FUNCTION memory_facts_text_hash()`,
+      "UPDATE memory_facts SET text_hash = encode(sha256(convert_to(text, 'UTF8')), 'hex') WHERE text_hash IS NULL",
+      "ALTER TABLE memory_facts ALTER COLUMN text_hash SET NOT NULL",
+    ],
+  },
+  ...tenantTables("memory/facts/0003-tenants", [{ table: "memory_facts", primaryKey: "id" }]),
+];
+
 export function createPostgresMemoryService(connectionString: string): MemoryService {
-  const { q, pool } = createPgPool(connectionString, [
-    {
-      id: "memory/facts/0000-records-column",
-      statements: ["ALTER TABLE IF EXISTS memory_revisions ADD COLUMN IF NOT EXISTS records JSONB"],
-    },
-    { id: "memory/facts/0001", statements: SCHEMA },
-  ]);
+  const { q, pool } = createPgPool(connectionString, MEMORY_FACTS_MIGRATIONS);
 
   function tx(client: PoolClient, scopeId: ScopeId): FactStoreTx {
     return {

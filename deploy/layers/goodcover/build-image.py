@@ -21,7 +21,7 @@ def main():
     parser = argparse.ArgumentParser(description='Build a GC4 sandbox archive from this source checkout.')
     parser.add_argument('--publish', action='store_true', help='Upload and create a new AWS image version.')
     args = parser.parse_args()
-    assets = ROOT / 'aws/microvm-agent'
+    assets = ROOT / 'cli/templates/aws/microvm-agent'
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as archive:
         for name in ('Dockerfile', 'agent.mjs'):

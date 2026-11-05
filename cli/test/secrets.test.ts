@@ -1,12 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { type QmConfig } from "../src/config.ts";
-import { FLY_TEMPLATE_ENV_DEFAULTS } from "../src/target-env-defaults.ts";
 import {
   computedSecrets,
+  missingRequiredSecrets,
   serviceSecretValue,
   renderEnvExample,
   runtimeSecretNames,
@@ -37,6 +34,32 @@ function secretByName(config: QmConfig, name: string): ComputedSecret {
   return secret;
 }
 
+test("required secret validation uses the selected values without ambient credentials", () => {
+  const config = makeConfig({ target: "aws" });
+  const database = secretByName(config, "DATABASE_URL");
+  const prior = process.env.DATABASE_URL;
+  process.env.DATABASE_URL = "postgres://local/db";
+  try {
+    for (const value of [undefined, "", "replace-me"]) {
+      assert.deepEqual(
+        missingRequiredSecrets([database], () => value),
+        ["DATABASE_URL"],
+      );
+    }
+    assert.deepEqual(
+      missingRequiredSecrets([database], () => "postgres://deployed/db"),
+      [],
+    );
+    assert.deepEqual(
+      missingRequiredSecrets([{ ...database, required: false }], () => undefined),
+      [],
+    );
+  } finally {
+    if (prior === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = prior;
+  }
+});
+
 test("a dual-role secret (sandbox.secretEnv + virtual service) needs BOTH names on core", () => {
   const config = makeConfig({
     services: ["core", "slack"],
@@ -55,7 +78,7 @@ test("a sandbox-only secret lands on core ONLY as FLY_RESIDENT_ENV_<NAME>", () =
 
 test("a core + sandbox secret needs both the plain and renamed forms on core", () => {
   const config = makeConfig({
-    env: { core: { HARNESS: "pi" } },
+    env: {},
     sandbox: { app: "acme-sb", secretEnv: ["ANTHROPIC_API_KEY"] },
   });
   const names = runtimeSecretNames("core", secretByName(config, "ANTHROPIC_API_KEY"));
@@ -154,8 +177,6 @@ test('"sandbox" is a reserved name — a plugin may not shadow the sandbox pseud
 test("model credentials are optional at deploy time because Admin onboarding can configure them", () => {
   const fly = makeConfig({ target: "fly" });
   assert.equal(secretByName(fly, "ANTHROPIC_API_KEY").required, false);
-  const flyMock = makeConfig({ target: "fly", env: { core: { HARNESS: "mock" } } });
-  assert.equal(secretByName(flyMock, "ANTHROPIC_API_KEY").required, false);
   const docker = makeConfig();
   assert.equal(secretByName(docker, "ANTHROPIC_API_KEY").required, false);
 });
@@ -184,10 +205,9 @@ test("the sprites token is a catalog secret when the sandbox backend is sprites"
   );
 });
 
-test("the Agent37 key is required for either sandbox route", () => {
+test("the Agent37 key is required for either way of selecting the agent37 sandbox", () => {
   for (const config of [
     makeConfig({ env: { core: { SANDBOX_BACKEND: "agent37" } } }),
-    makeConfig({ env: { core: { SANDBOX_SECONDARY_BACKEND: "agent37" } } }),
     makeConfig({ sandbox: { backend: "agent37" } }),
   ]) {
     assert.equal(secretByName(config, "AGENT37_API_KEY").required, true);
@@ -223,10 +243,6 @@ test("omitting modelProvider preserves the pre-existing deferred-to-Admin behavi
 });
 
 test("conditional secret values use the runtime's trimmed enum semantics", () => {
-  const pi = makeConfig({ env: { core: { HARNESS: "  pi  " } } });
-  assert.equal(secretByName(pi, "ANTHROPIC_API_KEY").required, false);
-  assert.ok(secretByName(pi, "PUBLIC_API_URL").required);
-
   const slack = makeConfig({ services: ["core", "slack"], env: { slack: { SLACK_EVENTS_MODE: "  http  " } } });
   assert.ok(secretByName(slack, "SLACK_SIGNING_SECRET").required);
 });
@@ -242,30 +258,12 @@ test("AWS public app domains require and route their gate secret to core", () =>
   assert.ok(renderEnvExample(enabled).includes("AWS_DEPLOY_GATE_SECRET="));
 });
 
-test("real harnesses require and route the sandbox-reachable PUBLIC_API_URL to core", () => {
-  const real = makeConfig({ env: { core: { HARNESS: "pi" } } });
+test("core requires and routes the sandbox-reachable PUBLIC_API_URL", () => {
+  const real = makeConfig();
   const publicApi = secretByName(real, "PUBLIC_API_URL");
   assert.equal(publicApi.required, true);
   assert.deepEqual(runtimeSecretNames("core", publicApi), ["PUBLIC_API_URL"]);
   assert.ok(renderEnvExample(real).includes("PUBLIC_API_URL="));
-  assert.ok(
-    !computedSecrets(makeConfig({ env: { core: { HARNESS: "mock" } } })).some((s) => s.name === "PUBLIC_API_URL"),
-  );
-});
-
-test("FLY_TEMPLATE_ENV_DEFAULTS stays in sync with deploy/core/fly.toml", () => {
-  const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
-  const toml = readFileSync(join(root, "deploy", "core", "fly.toml"), "utf8");
-  const packaged = readFileSync(join(root, "cli", "templates", "fly", "core.toml"), "utf8");
-  for (const [name, value] of Object.entries(FLY_TEMPLATE_ENV_DEFAULTS.core ?? {})) {
-    assert.match(
-      toml,
-      new RegExp(`^\\s*${name}\\s*=\\s*"${value}"`, "m"),
-      `deploy/core/fly.toml sets ${name}="${value}"`,
-    );
-  }
-  assert.doesNotMatch(toml, /^\s*DEPLOY_PROVIDER\s*=/m);
-  assert.doesNotMatch(packaged, /^\s*DEPLOY_PROVIDER\s*=/m);
 });
 
 test("config secretEnv extras enter the computed set as required operator secrets, virtual services folding onto core", () => {
@@ -318,7 +316,7 @@ test("secretEnv for a service the config does not enable is ignored", () => {
 });
 
 test("PORTAL_IDENTITY_SECRET reaches every service that signs or verifies a portal identity", () => {
-  const config = makeConfig({ services: ["core", "web-ui", "admin", "portal"] });
+  const config = makeConfig({ services: ["core", "web-ui", "portal"] });
   const secret = secretByName(config, "PORTAL_IDENTITY_SECRET");
   assert.deepEqual(
     [...secretDestinations(secret).keys()].sort(),
@@ -327,15 +325,14 @@ test("PORTAL_IDENTITY_SECRET reaches every service that signs or verifies a port
   );
 });
 
-test("INBOX_USERS is one optional secret shared by web-ui and admin", () => {
-  const config = makeConfig({ services: ["core", "web-ui", "admin"] });
+test("INBOX_USERS is an optional web-ui secret", () => {
+  const config = makeConfig({ services: ["core", "web-ui"] });
   const allowlist = secretByName(config, "INBOX_USERS");
   assert.equal(allowlist.required, false);
-  assert.deepEqual(allowlist.services, ["admin", "web-ui"]);
+  assert.deepEqual(allowlist.services, ["web-ui"]);
   assert.deepEqual([...secretDestinations(allowlist).keys()], ["web-ui"]);
   assert.deepEqual(runtimeSecretNames("web-ui", allowlist), ["INBOX_USERS"]);
-  assert.deepEqual(runtimeSecretNames("admin", allowlist), ["INBOX_USERS"]);
-  assert.match(renderEnvExample(config), /Inbox, Calendar, and Design System\. \(admin, web-ui\)/);
+  assert.match(renderEnvExample(config), /Inbox, Calendar, and Design System\. \(web-ui\)/);
   assert.match(renderEnvExample(config), /^# INBOX_USERS=\s{2}# optional$/m);
 });
 
@@ -344,7 +341,7 @@ test("the invitation-email pair reaches core as optional secrets on every topolo
     const alone = secretByName(makeConfig(), name);
     assert.equal(alone.required, false);
     assert.deepEqual([...secretDestinations(alone).keys()], ["core"]);
-    assert.match(alone.description, /admin Users tab or by chatting with QM/);
+    assert.match(alone.description, /Users settings page or by chatting with QM/);
     assert.match(renderEnvExample(makeConfig()), new RegExp(`^# ${name}=  # optional$`, "m"));
 
     const broker = makeConfig({
@@ -372,7 +369,7 @@ test("the .env.example catalog names every secret exactly once", () => {
 test("runtime model provider override controls the required billing key", () => {
   const config = makeConfig({
     modelProvider: "anthropic",
-    env: { core: { HARNESS: "pi", MODEL_PROVIDER: " openrouter " } },
+    env: { core: { MODEL_PROVIDER: " openrouter " } },
   });
   assert.equal(secretByName(config, "OPENROUTER_API_KEY").required, true);
   assert.equal(secretByName(config, "ANTHROPIC_API_KEY").required, false);

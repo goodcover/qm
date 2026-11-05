@@ -1,7 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createPostgresEventSink, scopedEventMigrationId, type EventColumn } from "../src/admin/scoped-event-sink.ts";
-import { createPostgresMetricsSink } from "../src/admin/postgres-metrics-sink.ts";
 import { createPostgresErrorLog } from "../src/admin/postgres-error-log.ts";
 import { createPostgresEgressAuditSink } from "../src/admin/postgres-egress-audit-sink.ts";
 import { createPostgresCredentialUsageSink } from "../src/admin/postgres-credential-usage-sink.ts";
@@ -18,23 +17,10 @@ const BASE: readonly EventColumn<keyof Ev & string>[] = [
 ];
 const common = { defaultLimit: 10, equalityFilters: {}, persistErrorMessage: "x" };
 
-test("turn_metrics/0001 keeps the checksum already recorded in deployed databases; later columns ride a follow-up", () => {
-  const url = fakeUrl();
-  createPostgresMetricsSink(url);
-  const migrations = registeredPgMigrations(url);
-  const first = migrations.find((m) => m.id === "admin/scoped-events/turn_metrics/0001");
-  assert.ok(first, "0001 registered");
-  assert.equal(first.checksum, "d3bbf44523fb16643f38c18151c990ccbdaa2c411e01ce686b9576fcf98a6141");
-  assert.ok(!first.statements.some((s) => /lease_wait_ms/.test(s)), "0001 must not learn new columns");
-  const second = migrations.find((m) => m.id === "admin/scoped-events/turn_metrics/0002");
-  assert.ok(second, "0002 registered");
-  assert.match(second.statements.join("\n"), /ADD COLUMN IF NOT EXISTS lease_wait_ms INT/);
-});
-
 test("0001 is rendered from the frozen initial columns, not the live column list", () => {
   const frozenUrl = fakeUrl();
   createPostgresEventSink<Ev>({ ...common, connectionString: frozenUrl, table: "ev", columns: BASE });
-  const frozen = registeredPgMigrations(frozenUrl)[0]!;
+  const frozen = registeredPgMigrations(frozenUrl).find(({ id }) => id === "admin/scoped-events/ev/0001")!;
 
   const grownUrl = fakeUrl();
   createPostgresEventSink<Ev>({
@@ -50,7 +36,7 @@ test("0001 is rendered from the frozen initial columns, not the live column list
       ],
     },
   });
-  const grown = registeredPgMigrations(grownUrl);
+  const grown = registeredPgMigrations(grownUrl).filter(({ id }) => id.startsWith("admin/scoped-events/ev/"));
   assert.equal(grown[0]!.id, "admin/scoped-events/ev/0001");
   assert.equal(grown[0]!.checksum, frozen.checksum, "adding a follow-up column leaves 0001 untouched");
   assert.equal(grown[1]!.id, "admin/scoped-events/ev/0002");
@@ -90,13 +76,27 @@ test("every released scoped-event sink pins its 0001 checksum", () => {
   createPostgresEgressAuditSink(url);
   createPostgresCredentialUsageSink(url);
   assert.deepEqual(
-    registeredPgMigrations(url).map((m) => m.id),
+    registeredPgMigrations(url)
+      .map((m) => m.id)
+      .filter((id) => id.startsWith("admin/scoped-events/")),
     [
       "admin/scoped-events/credential_usage/0001",
       "admin/scoped-events/credential_usage/0002",
       "admin/scoped-events/credential_usage/0003",
+      "admin/scoped-events/credential_usage/0004-daily-calls-tenants",
+      "admin/scoped-events/credential_usage/0004-daily-calls-tenants-lookups",
+      "admin/scoped-events/credential_usage/0004-daily-calls-tenants-swap",
+      "admin/scoped-events/credential_usage/0100",
+      "admin/scoped-events/credential_usage/0100-lookups",
+      "admin/scoped-events/credential_usage/0100-swap",
       "admin/scoped-events/egress_events/0001",
+      "admin/scoped-events/egress_events/0100",
+      "admin/scoped-events/egress_events/0100-lookups",
+      "admin/scoped-events/egress_events/0100-swap",
       "admin/scoped-events/error_events/0001",
+      "admin/scoped-events/error_events/0100",
+      "admin/scoped-events/error_events/0100-lookups",
+      "admin/scoped-events/error_events/0100-swap",
     ],
   );
 });

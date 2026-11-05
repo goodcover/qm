@@ -1,11 +1,12 @@
 import { createPgPool, type PoolClient } from "./pg-pool.ts";
 import { swallow } from "../util/errors.ts";
+import { withoutTenant } from "../tenants/context.ts";
 
 type Subscription = { channel: string; receive: (payload: string) => void; resync: () => void };
 const listeners = new Map<string, ReturnType<typeof createListener>>();
 
 function createListener(connectionString: string) {
-  const pg = createPgPool(connectionString, []);
+  const pg = createPgPool(connectionString);
   const subscriptions = new Set<Subscription>();
   const ready = new Set<Subscription>();
   const channels = new Set<string>();
@@ -92,11 +93,13 @@ function createListener(connectionString: string) {
   }
 
   function sync() {
-    pending = pending.then(reconcile).catch((error) => {
-      swallow("postgres listener connection", error);
-      drop();
-      scheduleRetry();
-    });
+    pending = pending
+      .then(() => withoutTenant(reconcile))
+      .catch((error) => {
+        swallow("postgres listener connection", error);
+        drop();
+        scheduleRetry();
+      });
     return pending;
   }
 

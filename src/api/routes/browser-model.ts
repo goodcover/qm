@@ -1,8 +1,8 @@
 import { modelRequestOverrides, resolveModel } from "../../model/pi-models.ts";
-import { orgId } from "../../config.ts";
-import { scopeId } from "../../types.ts";
+import { gatewayRoot } from "../../model/provider-endpoints.ts";
 import { resolveBrowserModel } from "../../model/browser-model.ts";
 import { BrowserCompletionError, nativeBrowserCompletion } from "../../model/browser-completion.ts";
+import { modelGatewayHeaders } from "../../model/provider-endpoints.ts";
 import { BROWSER_MODEL_AUD } from "../../auth/capability-token.ts";
 import { sendJson } from "../http.ts";
 import type { ApiCtx, Route } from "./route.ts";
@@ -27,7 +27,7 @@ const REQUEST_FIELDS = new Set([
 
 async function browserModel(ctx: ApiCtx): Promise<void> {
   const { capability, deps, body, res } = ctx;
-  const gateway = deps.browserModelGateway;
+  const gateway = deps.modelGatewayTransport;
   if (!capability?.browserModel) return sendJson(res, 403, { error: "browser model grant required" });
   if (deps.config && (await deps.config.getSecurityPostureDurable(capability.scopeId)) === "strict")
     return sendJson(res, 403, { error: "browser model requests are disabled in strict posture" });
@@ -70,13 +70,8 @@ async function browserModel(ctx: ApiCtx): Promise<void> {
           error:
             "Claude subscription access does not support the browser agent. Choose company access, ChatGPT, or a Claude API key in Settings.",
         });
-      const companyHarness =
-        (await deps.config?.getRuntimeSelectionDurable(scopeId("personal", capability.actorId)))?.harnessId ??
-        (await deps.config?.getRuntimeSelectionDurable(scopeId("org", orgId())))?.harnessId ??
-        deps.harnessId;
-      const useCompanySubscription =
-        selected.account === "company" && (chatgptSubscription || companyHarness === deps.harnessId);
-      const companySubscriptionProvider = chatgptSubscription ? "openai" : deps.harnessCarriedModelAuth;
+      const useCompanySubscription = selected.account === "company";
+      const companySubscriptionProvider = chatgptSubscription ? "openai" : deps.companySubscriptionAuth;
       return sendJson(
         res,
         200,
@@ -96,9 +91,9 @@ async function browserModel(ctx: ApiCtx): Promise<void> {
     await gateway.refresh?.();
     const target = gateway.models[capability.browserModel];
     if (!target) return sendJson(res, 503, { error: "browser model unavailable" });
-    const response = await fetch(`${gateway.url.replace(/\/+$/, "").replace(/\/v1$/, "")}/v1/chat/completions`, {
+    const response = await fetch(`${gatewayRoot(gateway.url)}/v1/chat/completions`, {
       method: "POST",
-      headers: { "content-type": "application/json", [gateway.apiKeyHeader]: gateway.apiKey },
+      headers: { "content-type": "application/json", ...modelGatewayHeaders(gateway, "browser") },
       body: JSON.stringify({ ...input, model: target, stream: false }),
       signal: AbortSignal.any([controller.signal, AbortSignal.timeout(120_000)]),
       redirect: "error",

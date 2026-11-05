@@ -11,7 +11,6 @@ import {
   loadConfigAt,
   loadConfigInDir,
   localSandboxActive,
-  mockHarnessWarning,
   sandboxCoreEnv,
   securityScreenEnv,
   updateConfigImageOverrides,
@@ -32,7 +31,8 @@ function writeConfig(extra: Record<string, unknown>): { dir: string; path: strin
           },
         }
       : extra.env;
-  writeFileSync(path, JSON.stringify({ ...BASE, ...extra, ...(env === undefined ? {} : { env }) }));
+  const publicUrl = extra.target === "aws" ? { publicUrl: "https://agent.acme.example" } : {};
+  writeFileSync(path, JSON.stringify({ ...BASE, ...publicUrl, ...extra, ...(env === undefined ? {} : { env }) }));
   return { dir, path };
 }
 
@@ -60,9 +60,9 @@ test("required fields: orgId, target, services (must include core), valid servic
   );
   withConfig({ services: ["web-ui"] }, ({ path }) => assert.throws(() => loadConfigAt(path), /must include "core"/));
   withConfig({ services: ["core", "nope"] }, ({ path }) => assert.throws(() => loadConfigAt(path), /unknown service/));
-  withConfig({ services: ["core", "web-ui", "admin", "portal"] }, ({ path }) => {
+  withConfig({ services: ["core", "web-ui", "portal"] }, ({ path }) => {
     const { config } = loadConfigAt(path);
-    assert.deepEqual(config.services, ["core", "web-ui", "admin", "portal"]);
+    assert.deepEqual(config.services, ["core", "web-ui", "portal"]);
   });
   withConfig({ unknownField: "bad" }, ({ path }) =>
     assert.throws(() => loadConfigAt(path), /unknown top-level field "unknownField"/),
@@ -194,21 +194,6 @@ test("listen ports are managed consistently across deployment targets", () => {
   });
   withConfig({ plugins: [{ name: "linear", env: { PORT: "9000" } }] }, ({ path }) => {
     assert.throws(() => loadConfigAt(path), /plugins\[0\]\.env\.PORT.*managed/);
-  });
-});
-
-test("portal-mounted admin uses the portal's fixed /admin route", () => {
-  withConfig({ services: ["core", "admin", "portal"], env: { admin: { ADMIN_BASE_PATH: "/ops" } } }, ({ path }) => {
-    assert.throws(() => loadConfigAt(path), /env\.admin\.ADMIN_BASE_PATH.*must be "\/admin"/);
-  });
-  withConfig(
-    { services: ["core", "admin", "portal"], secretEnv: { admin: { ADMIN_BASE_PATH: "ADMIN_PATH_SECRET" } } },
-    ({ path }) => {
-      assert.throws(() => loadConfigAt(path), /secretEnv\.admin\.ADMIN_BASE_PATH.*managed/);
-    },
-  );
-  withConfig({ services: ["core", "admin", "portal"], env: { admin: { ADMIN_BASE_PATH: "/admin" } } }, ({ path }) => {
-    assert.equal(loadConfigAt(path).config.env.admin?.ADMIN_BASE_PATH, "/admin");
   });
 });
 
@@ -405,22 +390,12 @@ test("AWS config rejects public surfaces without the HTTPS portal and real harne
       error: /web-ui requires the authenticated portal/,
     },
     {
-      label: "admin without portal",
-      config: {
-        target: "aws",
-        publicUrl: "https://agent.acme.example",
-        services: ["core", "admin"],
-        aws: aws(["core", "admin"]),
-      },
-      error: /admin requires the authenticated portal/,
-    },
-    {
       label: "portal over HTTP",
       config: {
         target: "aws",
         publicUrl: "http://agent.acme.example",
         services: ["core", "web-ui", "portal"],
-        env: { core: { HARNESS: "mock" } },
+        env: { core: {} },
         aws: aws(["core", "web-ui", "portal"]),
       },
       error: /portal requires an HTTPS publicUrl/,
@@ -431,7 +406,7 @@ test("AWS config rejects public surfaces without the HTTPS portal and real harne
         target: "aws",
         publicUrl: "https://agent.acme.example",
         services: ["core", "web-ui", "portal"],
-        env: { core: { HARNESS: "mock" }, portal: { OIDC_CLIENT_ID: "client", PORTAL_EXPECTED_TEAM_ID: " " } },
+        env: { core: {}, portal: { OIDC_CLIENT_ID: "client", PORTAL_EXPECTED_TEAM_ID: " " } },
         aws: aws(["core", "web-ui", "portal"]),
       },
       error: /PORTAL_EXPECTED_TEAM_ID/,
@@ -443,7 +418,7 @@ test("AWS config rejects public surfaces without the HTTPS portal and real harne
         publicUrl: "https://agent.acme.example",
         services: ["core", "web-ui", "portal"],
         env: {
-          core: { HARNESS: "mock" },
+          core: {},
           portal: {
             OIDC_CLIENT_ID: "client",
             OIDC_ISSUER: "https://auth.example.com",
@@ -461,7 +436,7 @@ test("AWS config rejects public surfaces without the HTTPS portal and real harne
         publicUrl: "https://agent.acme.example",
         services: ["core", "web-ui", "portal"],
         env: {
-          core: { HARNESS: "mock" },
+          core: {},
           portal: {
             OIDC_CLIENT_ID: "client",
             OIDC_ISSUER: "https://auth.example.com",
@@ -479,10 +454,10 @@ test("AWS config rejects public surfaces without the HTTPS portal and real harne
         target: "aws",
         publicUrl: "http://agent.acme.example",
         services: ["core"],
-        env: { core: { HARNESS: "pi" } },
+        env: {},
         aws: aws(["core"]),
       },
-      error: /HARNESS=pi requires an HTTPS publicUrl/,
+      error: /AWS requires an HTTPS publicUrl/,
     },
     {
       label: "apiUrl protocol differing from publicUrl",
@@ -491,7 +466,7 @@ test("AWS config rejects public surfaces without the HTTPS portal and real harne
         publicUrl: "https://agent.acme.example",
         apiUrl: "http://api.agent.acme.example",
         services: ["core"],
-        env: { core: { HARNESS: "mock" } },
+        env: { core: {} },
         aws: aws(["core"]),
       },
       error: /apiUrl must use the same protocol as publicUrl/,
@@ -502,9 +477,9 @@ test("AWS config rejects public surfaces without the HTTPS portal and real harne
       label: `deployBranch ${JSON.stringify(deployBranch)}`,
       config: {
         target: "aws",
-        publicUrl: "http://agent.acme.example",
+        publicUrl: "https://agent.acme.example",
         services: ["core"],
-        env: { core: { HARNESS: "mock" } },
+        env: { core: {} },
         aws: { ...aws(["core"]), deployBranch },
       },
       error: /"aws\.deployBranch" must be a valid git branch name/,
@@ -513,9 +488,9 @@ test("AWS config rejects public surfaces without the HTTPS portal and real harne
   withConfig(
     {
       target: "aws",
-      publicUrl: "http://agent.acme.example",
+      publicUrl: "https://agent.acme.example",
       services: ["core"],
-      env: { core: { HARNESS: "mock" } },
+      env: { core: {} },
       aws: { ...aws(["core"]), deployBranch: "release/prod-2", deployEnvironment: "production" },
     },
     ({ path }) => {
@@ -527,9 +502,9 @@ test("AWS config rejects public surfaces without the HTTPS portal and real harne
     withConfig(
       {
         target: "aws",
-        publicUrl: "http://agent.acme.example",
+        publicUrl: "https://agent.acme.example",
         services: ["core"],
-        env: { core: { HARNESS: "mock" } },
+        env: { core: {} },
         aws: { ...aws(["core"]), deployEnvironment },
       },
       ({ path }) =>
@@ -548,11 +523,11 @@ test("AWS config rejects public surfaces without the HTTPS portal and real harne
       target: "aws",
       publicUrl: "http://agent.acme.example",
       services: ["core"],
-      env: { core: { HARNESS: "mock" } },
+      env: { core: {} },
       aws: aws(["core"]),
     },
     ({ path }) => {
-      assert.equal(loadConfigAt(path).config.env.core?.HARNESS, "mock");
+      assert.throws(() => loadConfigAt(path), /AWS requires an HTTPS publicUrl/);
     },
   );
   withConfig(
@@ -561,7 +536,6 @@ test("AWS config rejects public surfaces without the HTTPS portal and real harne
       publicUrl: "https://agent.acme.example",
       services: ["core", "web-ui", "portal"],
       env: {
-        core: { HARNESS: "pi" },
         portal: { OIDC_CLIENT_ID: "client", OIDC_ALLOWED_EMAIL_DOMAIN: "example.com", PORTAL_EXPECTED_TEAM_ID: "T123" },
       },
       aws: aws(["core", "web-ui", "portal"]),
@@ -575,7 +549,7 @@ test("AWS config rejects public surfaces without the HTTPS portal and real harne
       target: "aws",
       publicUrl: "https://agent.acme.example",
       services: ["core", "web-ui", "portal"],
-      env: { core: { HARNESS: "pi" }, portal: { OIDC_CLIENT_ID: "client", OIDC_ALLOWED_EMAILS: "admin@example.com" } },
+      env: { portal: { OIDC_CLIENT_ID: "client", OIDC_ALLOWED_EMAILS: "admin@example.com" } },
       aws: aws(["core", "web-ui", "portal"]),
     },
     ({ path }) => {
@@ -587,7 +561,7 @@ test("AWS config rejects public surfaces without the HTTPS portal and real harne
       target: "aws",
       publicUrl: "https://agent.acme.example",
       services: ["core", "web-ui", "portal"],
-      env: { core: { HARNESS: "pi" }, portal: { OIDC_PRINCIPAL_CLAIM: "email" } },
+      env: { portal: { OIDC_PRINCIPAL_CLAIM: "email" } },
       aws: aws(["core", "web-ui", "portal"]),
     },
     ({ path }) => {
@@ -895,11 +869,11 @@ test("sandbox shape errors: object, app non-empty string, env string-map, secret
     { sandbox: { secretEnv: ["1BAD"] }, rx: /not a valid env var name/ },
     {
       sandbox: { backend: "k8s", app: "acme-sandboxes" },
-      rx: /"sandbox.backend" must be "local".*"sprites".*"aws".*"agent37".*"superserve".*or "e2b"/,
+      rx: /"sandbox.backend" must be "local".*"sprites".*"aws".*"agent37".*"superserve".*"e2b".*or "render"/,
     },
     {
       sandbox: { backend: "fly", app: "acme-sandboxes" },
-      rx: /"sandbox.backend" must be "local".*"sprites".*"aws".*"agent37".*"superserve".*or "e2b"/,
+      rx: /"sandbox.backend" must be "local".*"sprites".*"aws".*"agent37".*"superserve".*"e2b".*or "render"/,
     },
     {
       sandbox: { backend: "aws", app: "acme-sandboxes" },
@@ -1348,66 +1322,12 @@ test("aws.services logGroup and stopTimeout adopt live task-def values and valid
   }
 });
 
-test("modelProvider must name a vendor the configured harness can bill", () => {
-  withConfig({ modelProvider: "openrouter", env: { core: { HARNESS: "pi" } } }, ({ path }) => {
-    assert.equal(loadConfigAt(path).config.modelProvider, "openrouter");
-  });
-  withConfig({ modelProvider: "openrouter", env: { core: { HARNESS: "claude" } } }, ({ path }) => {
-    assert.throws(
-      () => loadConfigAt(path),
-      /model provider "openrouter" cannot serve a base model on env.core.HARNESS "claude"/,
-    );
-  });
-  withConfig({ modelProvider: "openai", env: { core: { HARNESS: "claude" } } }, ({ path }) => {
-    assert.throws(() => loadConfigAt(path), /cannot serve a base model/);
-  });
-  withConfig({ modelProvider: "openai", env: { core: { HARNESS: "pi" } } }, ({ path }) => {
-    assert.equal(loadConfigAt(path).config.modelProvider, "openai");
-  });
-  for (const harness of ["codex", "opencode"]) {
-    withConfig({ env: { core: { HARNESS: harness } } }, ({ path }) => {
-      assert.throws(() => loadConfigAt(path), new RegExp(`env.core.HARNESS "${harness}" is not recognized`));
-    });
-  }
-  withConfig({ modelProvider: "openrouter" }, ({ path }) => {
-    assert.equal(
-      loadConfigAt(path).config.modelProvider,
-      "openrouter",
-      "an unset harness is mock, which bills anything",
-    );
-  });
-});
-
 test("env.core.MODEL_PROVIDER is validated as the provider core will actually use", () => {
-  withConfig(
-    { modelProvider: "anthropic", env: { core: { HARNESS: "claude", MODEL_PROVIDER: "openai" } } },
-    ({ path }) => {
-      assert.throws(() => loadConfigAt(path), /model provider "openai" cannot serve a base model/);
-    },
-  );
-  withConfig(
-    { modelProvider: "openai", env: { core: { HARNESS: "claude", MODEL_PROVIDER: "anthropic" } } },
-    ({ path }) => {
-      assert.equal(loadConfigAt(path).config.modelProvider, "openai", "the override decides, the declaration stays");
-    },
-  );
-  withConfig({ env: { core: { HARNESS: "pi", MODEL_PROVIDER: "bedrock" } } }, ({ path }) => {
+  withConfig({ modelProvider: "openai", env: { core: { MODEL_PROVIDER: "anthropic" } } }, ({ path }) => {
+    assert.equal(loadConfigAt(path).config.modelProvider, "openai", "the override decides, the declaration stays");
+  });
+  withConfig({ env: { core: { MODEL_PROVIDER: "bedrock" } } }, ({ path }) => {
     assert.throws(() => loadConfigAt(path), /env.core.MODEL_PROVIDER must be one of/);
-  });
-});
-
-test("a mock deployment is named as one, and a real harness draws no warning", () => {
-  withConfig({ env: { core: {} } }, ({ path }) => {
-    assert.match(mockHarnessWarning(loadConfigAt(path).config)!, /unset, which means "mock".*calls no model provider/s);
-  });
-  withConfig({ env: { core: { HARNESS: "mock" } } }, ({ path }) => {
-    assert.match(mockHarnessWarning(loadConfigAt(path).config)!, /set to "mock"/);
-  });
-  withConfig({ env: { core: { HARNESS: "pi" } } }, ({ path }) => {
-    assert.equal(mockHarnessWarning(loadConfigAt(path).config), undefined);
-  });
-  withConfig({ target: "fly", appPrefix: "acme", env: { core: {} } }, ({ path }) => {
-    assert.equal(mockHarnessWarning(loadConfigAt(path).config), undefined, "the fly template renders HARNESS=pi");
   });
 });
 
@@ -1427,7 +1347,7 @@ test("blank model provider overrides preserve the declared provider in runtime a
         services: { core: { ecrRepository: "core", ecsService: "acme-core", cpu: 512, memory: 1024 } },
       },
       modelProvider: "openrouter",
-      env: { core: { HARNESS: "pi", MODEL_PROVIDER: "  " } },
+      env: { core: { MODEL_PROVIDER: "  " } },
     },
     ({ path }) => {
       const { config } = loadConfigAt(path);
@@ -1513,7 +1433,7 @@ test("proxy deployment rendering names the mode and classifier", () => {
 });
 
 test("AWS built-in architecture defaults match published images and retain explicit choices", () => {
-  const workloads = ["core", "web-ui", "admin", "portal", "auth", "linear"];
+  const workloads = ["core", "web-ui", "portal", "auth", "linear"];
   const config = {
     plugins: [{ name: "linear" }],
     imageOverrides: {},

@@ -1,19 +1,21 @@
 import type { AdmittedWork } from "../util/admitted-work.ts";
-import type { Monitor, TurnRequest, TurnResult } from "../types.ts";
+import type { TurnRequest, TurnResult } from "../types.ts";
+import type { Monitor } from "../triggers/types.ts";
 import type { MonitorStore } from "./monitor-store.ts";
 import type { ProcessRegistry } from "../processes/process-registry.ts";
 import type { DeliveryStore } from "../delivery/delivery-store.ts";
 import type { IdempotencyStore } from "../idempotency/idempotency-store.ts";
 import type { IdentityService } from "../identity/identity-service.ts";
 import { supportsProcessSessions, type ProcessSandbox, type Sandbox, type SandboxHandle } from "../sandbox/sandbox.ts";
-import { processIsGone } from "../sandbox/process-poll.ts";
+import { ProcessSessionGoneError } from "../sandbox/exec-process-session.ts";
 import { runTrigger, type TriggerDeps, type TriggerOutcome } from "../triggers/run-trigger.ts";
-import { createNoopLeaderLease, type LeaderLease } from "../persistence/leader-lease.ts";
+import type { LeaderLease } from "../persistence/leader-lease.ts";
 import { createSweeper } from "../util/sweeper.ts";
+import { inTenantOf, type Claimed } from "../tenants/claim.ts";
 import { errMessage, reportFailureAs } from "../util/errors.ts";
 import type { CurrentScopeMembers } from "../resolution/scope-membership.ts";
 import { compileMonitorPattern } from "./monitor-broker.ts";
-import { buildEventWakeEnvelope, capForEscaping } from "../core/wake-envelope.ts";
+import { buildEventWakeEnvelope, capForEscaping } from "../wake/wake-envelope.ts";
 
 const TICK_LEASE_KEY = "monitor:poller:tick";
 const MAX_EVENT_CHARS = 16_000;
@@ -40,9 +42,10 @@ export interface MonitorPollerDeps {
   directory?: TriggerDeps["directory"];
   currentScopeMembers?: CurrentScopeMembers;
   sessions?: TriggerDeps["sessions"];
+  resolveRecipient?: TriggerDeps["resolveRecipient"];
   now?: () => number;
   maxFiresPerTick?: number;
-  leaderLease?: LeaderLease;
+  leaderLease: LeaderLease;
   onProcessExit?: (handle: SandboxHandle, processId: string) => Promise<void>;
   heartbeatMs?: number;
   minFireIntervalMs?: number;
@@ -130,7 +133,7 @@ export function createMonitorPoller(deps: MonitorPollerDeps): MonitorPoller {
   const maxFiresPerTick = deps.maxFiresPerTick ?? 20;
   const heartbeatMs = deps.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
   const minFireIntervalMs = deps.minFireIntervalMs ?? DEFAULT_MIN_FIRE_INTERVAL_MS;
-  const leaderLease = deps.leaderLease ?? createNoopLeaderLease();
+  const leaderLease = deps.leaderLease;
 
   const triggerDeps: TriggerDeps = {
     deliveries: deps.deliveries,
@@ -140,6 +143,7 @@ export function createMonitorPoller(deps: MonitorPollerDeps): MonitorPoller {
     ...(deps.directory ? { directory: deps.directory } : {}),
     ...(deps.currentScopeMembers ? { currentScopeMembers: deps.currentScopeMembers } : {}),
     ...(deps.sessions ? { sessions: deps.sessions } : {}),
+    ...(deps.resolveRecipient ? { resolveRecipient: deps.resolveRecipient } : {}),
   };
 
   async function fire(
@@ -187,7 +191,7 @@ export function createMonitorPoller(deps: MonitorPollerDeps): MonitorPoller {
         waitMs: 0,
       });
     } catch (e) {
-      if (processIsGone(e)) {
+      if (e instanceof ProcessSessionGoneError) {
         await reportLost(m);
         return true;
       }
@@ -265,10 +269,37 @@ export function createMonitorPoller(deps: MonitorPollerDeps): MonitorPoller {
   async function pollAll(t: number, observed: number): Promise<void> {
     if (!supportsProcessSessions(deps.sandbox)) return;
     const sandbox = deps.sandbox;
-    const enabled = (await deps.monitors.enabled()).sort((a, b) => a.createdAt - b.createdAt);
+    const enabled = (await deps.monitors.enabledAcrossTenants()).sort((a, b) => a.createdAt - b.createdAt);
     if (enabled.length === 0) return;
 
-    const handles = new Map<string, SandboxHandle>();
+    const handles = new Map<string, { tenantId?: string; handle: SandboxHandle }>();
+    const pollOne = async (m: Claimed<Monitor>): Promise<boolean> => {
+      const rec = await deps.processes.get(m.processId);
+      if (!rec?.sandboxId) {
+        await reportLost(m);
+        return true;
+      }
+      const handleKey = `${m.tenantId ?? ""}:${rec.sandboxId}`;
+      let handle = handles.get(handleKey)?.handle;
+      if (!handle) {
+        try {
+          handle = await sandbox.provision(rec.scopeId, {
+            sandboxId: rec.sandboxId,
+          });
+        } catch (e) {
+          await deps.monitors.recordError(m.id, errMessage(e));
+          return false;
+        }
+        handles.set(handleKey, { ...(m.tenantId === undefined ? {} : { tenantId: m.tenantId }), handle });
+      }
+      try {
+        return await poll(sandbox, handle, m, t);
+      } catch (e) {
+        await deps.monitors.recordError(m.id, errMessage(e));
+        console.error("%s", `[monitor] poll failed for ${m.id}:`, errMessage(e));
+        return false;
+      }
+    };
     let fires = 0;
     try {
       for (const m of enabled) {
@@ -277,35 +308,11 @@ export function createMonitorPoller(deps: MonitorPollerDeps): MonitorPoller {
           console.warn(`[monitor] fan-out capped: fired ${fires}/${enabled.length} watched jobs this tick`);
           break;
         }
-        const rec = await deps.processes.get(m.processId);
-        if (!rec?.sandboxId) {
-          await reportLost(m);
-          fires++;
-          continue;
-        }
-        const targetKey = rec.sandboxId;
-        let handle = handles.get(targetKey);
-        if (!handle) {
-          try {
-            handle = await sandbox.provision([{ scopeId: rec.scopeId, mode: "rw", mountPath: "" }], {
-              sandboxId: rec.sandboxId,
-            });
-          } catch (e) {
-            await deps.monitors.recordError(m.id, errMessage(e));
-            continue;
-          }
-          handles.set(targetKey, handle);
-        }
-        try {
-          if (await poll(sandbox, handle, m, t)) fires++;
-        } catch (e) {
-          await deps.monitors.recordError(m.id, errMessage(e));
-          console.error("%s", `[monitor] poll failed for ${m.id}:`, errMessage(e));
-        }
+        if (await inTenantOf(m.tenantId, () => pollOne(m))) fires++;
       }
     } finally {
-      for (const handle of handles.values()) {
-        await sandbox.teardown(handle, { keepWarm: true }).catch((e: unknown) => {
+      for (const { tenantId, handle } of handles.values()) {
+        await inTenantOf(tenantId, () => sandbox.teardown(handle, { keepWarm: true })).catch((e: unknown) => {
           console.error("[monitor] teardown failed:", errMessage(e));
         });
       }

@@ -7,7 +7,7 @@ image="qm-$service:runtime-smoke"
 container="qm-$service-runtime-smoke-${GITHUB_RUN_ID:-$$}"
 
 case "$service" in
-  admin | web-ui | portal | auth) container_port=8080 ;;
+  web-ui | portal | auth) container_port=8080 ;;
   *) echo "unsupported service: $service" >&2; exit 2 ;;
 esac
 
@@ -25,6 +25,7 @@ docker build -f "deploy/$service/Dockerfile" -t "$image" .
 if [[ "$service" == "portal" ]]; then
   signing_jwk="$(node -e "const {generateKeyPairSync}=require('node:crypto');process.stdout.write(JSON.stringify(generateKeyPairSync('ec',{namedCurve:'P-256'}).privateKey.export({format:'jwk'})))")"
   docker run -d --name "$container" -p 127.0.0.1::"$container_port" \
+    -e CORE_API_URL=http://127.0.0.1:9 \
     -e PORTAL_SESSION_SECRET=runtime-smoke-portal-session-secret \
     -e CORE_SIGNING_SECRET=runtime-smoke-core-signing-secret \
     -e AUTH_EMBEDDED=1 \
@@ -49,6 +50,7 @@ if [[ "$service" == "portal" ]]; then
 elif [[ "$service" == "auth" ]]; then
   signing_jwk="$(node -e "const {generateKeyPairSync}=require('node:crypto');process.stdout.write(JSON.stringify(generateKeyPairSync('ec',{namedCurve:'P-256'}).privateKey.export({format:'jwk'})))")"
   docker run -d --name "$container" -p 127.0.0.1::"$container_port" \
+    -e CORE_API_URL=http://127.0.0.1:9 \
     -e CORE_SIGNING_SECRET=runtime-smoke-core-signing-secret-0123456789 \
     -e AUTH_ISSUER=https://portal.example.com/idp \
     -e AUTH_REDIRECT_URI=https://portal.example.com/auth/callback \
@@ -62,20 +64,28 @@ elif [[ "$service" == "auth" ]]; then
     -e RESEND_API_KEY=re_runtime_smoke \
     "$image" >/dev/null
 else
-  docker run -d --name "$container" -p 127.0.0.1::"$container_port" "$image" >/dev/null
+  docker run -d --name "$container" -p 127.0.0.1::"$container_port" \
+    -e CORE_API_URL=http://127.0.0.1:9 "$image" >/dev/null
 fi
 port="$(docker port "$container" "$container_port/tcp" | sed 's/.*://')"
 
 for _ in {1..30}; do
   if curl -fs "http://127.0.0.1:$port/healthz" >/dev/null; then
-    if [[ "$service" == "web-ui" ]]; then
-      curl -fs "http://127.0.0.1:$port/admin/" >/dev/null
-    elif [[ "$service" == "portal" ]]; then
+    if [[ "$service" == "portal" ]]; then
       docker exec "$container" node -e "fetch('http://127.0.0.1:8099/.well-known/jwks.json').then(async r=>{const j=await r.json();process.exit(r.ok&&j.keys?.length===1?0:1)}).catch(()=>process.exit(1))"
       status="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/idp/.well-known/jwks.json")"
       [[ "$status" != 200 ]]
     fi
-    echo "ok: $service production image serves its combined routes"
+    started="$(date +%s)"
+    docker stop -t 30 "$container" >/dev/null
+    stopped="$(($(date +%s) - started))"
+    exit_code="$(docker inspect -f '{{.State.ExitCode}}' "$container")"
+    if [[ "$exit_code" != 0 || "$stopped" -ge 10 ]]; then
+      docker logs "$container" >&2 || true
+      echo "$service production image took ${stopped}s to stop and exited $exit_code" >&2
+      exit 1
+    fi
+    echo "ok: $service production image serves its combined routes and stops cleanly in ${stopped}s"
     exit 0
   fi
   [[ "$(docker inspect -f '{{.State.Running}}' "$container")" == true ]] || break

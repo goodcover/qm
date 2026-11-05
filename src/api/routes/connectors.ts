@@ -1,5 +1,7 @@
-import { GmailReadError, getSentEmail, listSentEmails } from "../../connectors/gmail-sent.ts";
-import { orgId as configOrgId } from "../../config.ts";
+import { bindTenant, withRowTenant } from "../tenant-ingress.ts";
+import { getSentEmail, listSentEmails } from "../../connectors/gmail-sent.ts";
+import { GmailApiError } from "../../connectors/gmail-api.ts";
+import { orgId } from "../../config.ts";
 import {
   authorizeUrl,
   exchangeCode,
@@ -14,15 +16,18 @@ import {
   type OAuthClientResolver,
   type AccountType,
   type OAuthState,
+  ACCOUNT_TYPES,
+  isAccountType,
 } from "../../connectors/oauth.ts";
-import { CONNECTOR_STATUS_ACCOUNT_TYPES, providerTokenStatuses } from "../../credentials/connector-status.ts";
+import { providerTokenStatuses } from "../../credentials/connector-status.ts";
 import type { ConnectorTokenStore, DerivedOAuthAuth, OAuthTokenStatus } from "../../credentials/keychain.ts";
 import { createEnvSecretSource } from "../../credentials/secret-source.ts";
 import type { ServerDeps } from "../deps.ts";
 import { personKey, samePerson } from "../../directory/person.ts";
-import { errMessage } from "../../util/errors.ts";
+import { errMessage, swallowAs } from "../../util/errors.ts";
 import { normalizeInboundExpiresAt } from "../expiry.ts";
 import { sendJson, sendRedirect } from "../http.ts";
+import { tenantClaim } from "../../tenants/context.ts";
 import { audit } from "./shared.ts";
 import type { ApiCtx, BaseCtx, Route } from "./route.ts";
 
@@ -54,7 +59,7 @@ export function resolverFor(deps: ServerDeps): OAuthClientResolver {
 }
 
 function parseAccountType(v: string | null | undefined): AccountType {
-  return v === "personal" || v === "company" ? v : "default";
+  return isAccountType(v) ? v : "default";
 }
 
 async function providerConfigured(deps: ServerDeps, provider: string): Promise<boolean> {
@@ -127,9 +132,16 @@ async function connectorProviderStatus(
   return Object.fromEntries(entries);
 }
 
-async function oauthCallback(ctx: BaseCtx): Promise<void> {
-  const { res, deps, secret, url, pathname } = ctx;
-  const oauthRoute = parseOAuthRoute(pathname)!;
+function oauthCallback(ctx: BaseCtx): Promise<void> {
+  const state = ctx.url.searchParams.get("state");
+  if (!ctx.deps.oauthFlows || !state) return finishOAuthCallback(ctx);
+  return withRowTenant(ctx.req, ctx.res, ctx.deps.tenancy, { table: "oauth_flows", id: state }, () =>
+    finishOAuthCallback(ctx),
+  );
+}
+
+async function finishOAuthCallback(ctx: BaseCtx): Promise<void> {
+  const { res, deps, secret, url } = ctx;
   if (!deps.connectorTokens)
     return sendJson(res, 501, { error: "not_configured", message: "connector token store not wired" });
   const code = url.searchParams.get("code") ?? "";
@@ -137,11 +149,28 @@ async function oauthCallback(ctx: BaseCtx): Promise<void> {
   const providerError = url.searchParams.get("error");
   if (providerError) return sendJson(res, 400, { error: "oauth_denied", message: providerError });
   if (!code || !stateParam) return sendJson(res, 400, { error: "bad_request", message: "code and state required" });
-  let state;
+  const connectorTokens = deps.connectorTokens;
+  let state: OAuthState;
   try {
     state = await resumeOAuthFlow(deps, secret, stateParam);
+  } catch (e) {
+    return sendJson(res, 400, { error: "oauth_callback_failed", message: errMessage(e) });
+  }
+  const complete = () => completeOAuthCallback(ctx, connectorTokens, code, state);
+  return state.tenant ? bindTenant(state.tenant, complete) : complete();
+}
+
+async function completeOAuthCallback(
+  ctx: BaseCtx,
+  connectorTokens: ConnectorTokenStore,
+  code: string,
+  state: OAuthState,
+): Promise<void> {
+  const { res, deps, pathname } = ctx;
+  const oauthRoute = parseOAuthRoute(pathname)!;
+  try {
     if (state.provider !== oauthRoute.provider) throw new Error("OAuth provider mismatch");
-    if (state.orgId !== undefined && state.orgId !== configOrgId()) {
+    if (state.orgId !== undefined && state.orgId !== orgId()) {
       throw new Error("OAuth state is for a different org");
     }
     if (
@@ -159,9 +188,8 @@ async function oauthCallback(ctx: BaseCtx): Promise<void> {
       ...(state.codeVerifier ? { codeVerifier: state.codeVerifier } : {}),
     });
     if (!token.accessToken) throw new Error("oauth exchange returned an empty access token");
-    const stamped = { ...token, clientRef: client.clientRef, accountType, orgId: configOrgId() };
-    for (const host of hosts)
-      await deps.connectorTokens.setConnectorToken(host, state.principalId, stamped, accountType);
+    const stamped = { ...token, clientRef: client.clientRef, accountType, orgId: orgId() };
+    for (const host of hosts) await connectorTokens.setConnectorToken(host, state.principalId, stamped, accountType);
     audit(deps, {
       principalId: state.principalId,
       action: "connector.oauth.connected",
@@ -169,7 +197,7 @@ async function oauthCallback(ctx: BaseCtx): Promise<void> {
       scopeLabel: state.principalId,
     });
     if (state.consentLinkId && deps.consentLinks) {
-      await deps.consentLinks.redeem(state.consentLinkId).catch(() => null);
+      await deps.consentLinks.redeem(state.consentLinkId).catch(swallowAs("connectors: redeem consent link", null));
     }
     if (state.returnTo) {
       const dest = new URL(state.returnTo, "http://localhost");
@@ -187,10 +215,10 @@ async function principalHasProvider(deps: ServerDeps, provider: string, principa
   const p = oauthProvider(provider);
   if (!p || !deps.connectorTokens) return false;
   for (const host of p.hosts) {
-    for (const at of CONNECTOR_STATUS_ACCOUNT_TYPES) {
+    for (const at of ACCOUNT_TYPES) {
       const st = await deps.connectorTokens
         .connectorTokenStatus(host, principalId, at)
-        .catch(() => ({ connected: false }) as OAuthTokenStatus);
+        .catch(swallowAs("connectors: token status", { connected: false } as OAuthTokenStatus));
       if (st.connected && !st.needsReconnect) return true;
     }
   }
@@ -208,7 +236,7 @@ async function consentRedeem(ctx: ApiCtx): Promise<void> {
     return sendJson(res, 200, { status: peeked.reason === "expired" ? "expired" : "invalid" });
   }
   const rec = peeked.rec;
-  if (rec.orgId !== undefined && rec.orgId !== configOrgId()) return sendJson(res, 200, { status: "invalid" });
+  if (rec.orgId !== undefined && rec.orgId !== orgId()) return sendJson(res, 200, { status: "invalid" });
   if (!oauthProvider(rec.provider)) return sendJson(res, 200, { status: "invalid" });
   if (!samePerson(clicker, rec.principalId)) {
     const clickerConnected = await principalHasProvider(deps, rec.provider, clicker);
@@ -239,7 +267,8 @@ async function consentRedeem(ctx: ApiCtx): Promise<void> {
       provider: rec.provider,
       principalId: rec.principalId,
       redirectUri: rec.redirectUri,
-      orgId: configOrgId(),
+      orgId: orgId(),
+      ...tenantClaim(),
       ...(rec.accountType !== "default" ? { accountType: rec.accountType } : {}),
       clientRef: client.clientRef,
       ...(returnTo ? { returnTo } : {}),
@@ -323,7 +352,7 @@ async function consentMint(ctx: ApiCtx): Promise<void> {
     safeReturnTo(typeof b.returnTo === "string" ? b.returnTo : null) ?? (deps.portalUrl ? "/connectors" : undefined);
   const { linkId } = await deps.consentLinks.mint({
     principalId: capability.actorId,
-    orgId: configOrgId(),
+    orgId: orgId(),
     provider,
     accountType,
     redirectUri,
@@ -370,7 +399,8 @@ async function oauthStart(ctx: ApiCtx): Promise<void> {
       provider: oauthRoute.provider,
       principalId,
       redirectUri,
-      orgId: configOrgId(),
+      orgId: orgId(),
+      ...tenantClaim(),
       ...(accountType !== "default" ? { accountType } : {}),
       clientRef: client.clientRef,
       ...(safeReturnTo(url.searchParams.get("returnTo"))
@@ -444,13 +474,11 @@ export async function oauthRevoke(ctx: ApiCtx): Promise<void> {
     if (!provider)
       return sendJson(res, 404, { error: "not_found", message: `unknown OAuth provider: ${providerName}` });
     for (const h of provider.hosts)
-      for (const at of CONNECTOR_STATUS_ACCOUNT_TYPES)
-        await deps.connectorTokens.deleteConnectorToken(h, principalId, at);
+      for (const at of ACCOUNT_TYPES) await deps.connectorTokens.deleteConnectorToken(h, principalId, at);
     audit(deps, { principalId, action: "connector.oauth.revoked", resource: providerName, scopeLabel: principalId });
     return sendJson(res, 200, { ok: true, principalId, provider: providerName, hosts: provider.hosts });
   }
-  for (const at of CONNECTOR_STATUS_ACCOUNT_TYPES)
-    await deps.connectorTokens.deleteConnectorToken(host, principalId, at);
+  for (const at of ACCOUNT_TYPES) await deps.connectorTokens.deleteConnectorToken(host, principalId, at);
   audit(deps, { principalId, action: "connector.oauth.revoked", resource: host, scopeLabel: principalId });
   return sendJson(res, 200, { ok: true, principalId, host });
 }
@@ -494,7 +522,12 @@ async function catalog(ctx: ApiCtx): Promise<void> {
 }
 
 export const connectorRawRoutes: ReadonlyArray<Route<BaseCtx>> = [
-  { match: (m, p) => m === "GET" && parseOAuthRoute(p)?.action === "callback", auth: "public", handle: oauthCallback },
+  {
+    match: (m, p) => m === "GET" && parseOAuthRoute(p)?.action === "callback",
+    auth: "public",
+    tenant: "row",
+    handle: oauthCallback,
+  },
 ];
 
 export async function gmailSent(ctx: ApiCtx): Promise<void> {
@@ -502,7 +535,7 @@ export async function gmailSent(ctx: ApiCtx): Promise<void> {
   ctx.res.setHeader("Cache-Control", "no-store");
   if (!principal) return sendJson(ctx.res, 403, { error: "forbidden", message: "Sign in to read sent mail." });
   const requestedAccountType = ctx.url.searchParams.get("accountType");
-  if (requestedAccountType !== null && !["default", "personal", "company"].includes(requestedAccountType))
+  if (requestedAccountType !== null && !isAccountType(requestedAccountType))
     return sendJson(ctx.res, 400, { error: "bad_request" });
   const pageToken = ctx.url.searchParams.get("pageToken") ?? undefined;
   if (pageToken && pageToken.length > 2048) return sendJson(ctx.res, 400, { error: "bad_request" });
@@ -510,9 +543,7 @@ export async function gmailSent(ctx: ApiCtx): Promise<void> {
     let accountType: AccountType | undefined;
     let auth: DerivedOAuthAuth | null | undefined;
     let authError: unknown;
-    for (const candidate of requestedAccountType
-      ? [requestedAccountType as AccountType]
-      : (["default", "personal", "company"] satisfies AccountType[])) {
+    for (const candidate of requestedAccountType ? [requestedAccountType] : ACCOUNT_TYPES) {
       try {
         auth = await ctx.deps.connectorTokens?.connectorDerivedAuth("gmail.googleapis.com", principal, candidate);
         if (auth) {
@@ -536,14 +567,13 @@ export async function gmailSent(ctx: ApiCtx): Promise<void> {
       accountType,
     });
   } catch (error) {
-    let status = 502;
-    if (error instanceof GmailReadError) {
-      if ([401, 403].includes(error.status)) status = 409;
-      else if (error.status === 404) status = 404;
-    }
+    const upstream = error instanceof GmailApiError ? error.status : 0;
+    const reconnect = upstream === 401 || upstream === 403;
+    let status = upstream === 404 ? 404 : 502;
+    if (reconnect) status = 409;
     return sendJson(ctx.res, status, {
       error: "gmail_unavailable",
-      message: error instanceof GmailReadError ? error.message : "Couldn't load sent mail from Gmail. Try again.",
+      message: reconnect ? "Reconnect Google to read sent mail." : "Couldn't load sent mail from Gmail. Try again.",
     });
   }
 }
@@ -553,9 +583,26 @@ export const connectorRoutes: ReadonlyArray<Route<ApiCtx>> = [
   { method: "GET", path: "/v1/connectors/gmail/sent", auth: "source", handle: gmailSent },
   { method: "POST", path: "/v1/connectors/oauth/consent/mint", auth: { aud: "oauth-consent" }, handle: consentMint },
   { method: "GET", path: "/v1/connectors/oauth/consent/redeem/:linkId", auth: "source", handle: consentRedeem },
-  { match: (m, p) => m === "GET" && parseOAuthRoute(p)?.action === "start", auth: "source", handle: oauthStart },
-  { method: "GET", path: "/v1/connectors/oauth/status", auth: "source", handle: oauthStatus },
-  { method: "POST", path: "/v1/connectors/oauth/revoke", auth: "either", handle: oauthRevoke },
-  { method: "POST", path: "/v1/connectors/token", auth: "source", handle: setToken },
-  { method: "GET", path: "/v1/connectors/catalog", auth: "source", handle: catalog },
+  {
+    match: (m, p) => m === "GET" && parseOAuthRoute(p)?.action === "start",
+    actor: "query.principalId",
+    auth: "source",
+    handle: oauthStart,
+  },
+  {
+    method: "GET",
+    path: "/v1/connectors/oauth/status",
+    actor: "query.principalId",
+    auth: "source",
+    handle: oauthStatus,
+  },
+  {
+    method: "POST",
+    path: "/v1/connectors/oauth/revoke",
+    actor: "body.principalId",
+    auth: "either",
+    handle: oauthRevoke,
+  },
+  { method: "POST", path: "/v1/connectors/token", actor: "body.principalId", auth: "source", handle: setToken },
+  { method: "GET", path: "/v1/connectors/catalog", auth: "either", handle: catalog },
 ];

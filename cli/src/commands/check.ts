@@ -5,7 +5,7 @@ import { readEnvFile } from "../util.ts";
 import { CliError, errMessage, header, note, ok, step, warn } from "../log.ts";
 import { validateSandboxLayer, type SandboxValidation } from "../sandbox-layer.ts";
 import { discoverPlugins, type ResolvedPlugin } from "../plugins.ts";
-import { mockHarnessWarning, type QmConfig } from "../config.ts";
+import type { QmConfig } from "../config.ts";
 import { computedSecrets, runtimeSecretNames, type ComputedSecret } from "../secrets.ts";
 import { hostedServiceEnv, isVirtualService, runnableServices } from "../services.ts";
 import { serviceEnvironment } from "../backends/aws.ts";
@@ -30,6 +30,8 @@ export function runChecks(
   const configError = (message: string, clause = "config.v1"): void => void configErrors.push({ clause, message });
   const provider = hostingProvider(config.target);
   configErrors.push(...provider.validateConfig(config, plugins));
+  if (config.target === "render" && layer.hasDockerfile)
+    configError("Render Sandboxes use the Render base image; sandbox/Dockerfile is not supported");
   for (const skill of config.skills) {
     const path = resolve(configDir, skill);
     let isDirectory: boolean;
@@ -143,8 +145,6 @@ export function runChecks(
     const optional = secrets.filter((secret) => !secret.required).map((secret) => secret.name);
     if (optional.length) step(`optional secrets: ${optional.join(", ")}`);
     for (const w of layer.warnings) warn(w);
-    const mockHarness = mockHarnessWarning(config);
-    if (mockHarness) warn(mockHarness);
   }
 
   const errors = [

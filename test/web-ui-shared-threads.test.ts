@@ -9,14 +9,19 @@ import { join } from "node:path";
 import { createServer as createHttpServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { createServer } from "../src/api/server.ts";
-import { buildApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import { testConfig } from "./support/test-config.ts";
+import { createPostgresReplayDedupe } from "../src/auth/replay-dedupe.ts";
 
 const SECRET = "core-signing-secret".repeat(3);
 
-const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "webui-shared-")) }));
+const config = testConfig({ dataDir: mkdtempSync(join(tmpdir(), "webui-shared-")) });
+const built = buildApp(config);
 built.runtime.start();
-const core = createServer(built.app, { signingSecret: SECRET });
+const core = createServer(built.app, {
+  replayDedupe: createPostgresReplayDedupe(config.databaseUrl!),
+  signingSecret: SECRET,
+});
 core.listen(0);
 const corePort = (core.address() as AddressInfo).port;
 

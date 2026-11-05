@@ -9,14 +9,17 @@ import { join } from "node:path";
 import { createServer as createHttpServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { createServer } from "../src/api/server.ts";
-import { buildApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import { testConfig } from "./support/test-config.ts";
+import { createPostgresReplayDedupe } from "../src/auth/replay-dedupe.ts";
+import { testDatabaseUrl } from "./support/test-database.ts";
 
 const SECRET = "core-signing-secret".repeat(3);
 const PUBLIC = "https://core.public.example";
 
 const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "webui-wh-")) }));
 const core = createServer(built.app, {
+  replayDedupe: createPostgresReplayDedupe(testDatabaseUrl()),
   signingSecret: SECRET,
   webhookReceiver: built.webhookReceiver,
   publicUrl: PUBLIC,
@@ -232,4 +235,20 @@ test("webhook history is relayed with the authenticated viewer, not a query-stri
   assert.deepEqual(await owner.json(), { events: [] });
   const stranger = await fetch(`${path}?viewer=history-owner`, asUser("stranger"));
   assert.equal(stranger.status, 404);
+});
+
+test("create accepts every scheme core verifies, including Linear, and core rejects unknown schemes", async () => {
+  const create = (scheme: string) =>
+    fetch(
+      `${webBase}/api/webhooks`,
+      asUser("linear-user", {
+        method: "POST",
+        body: JSON.stringify({ action: "triage Linear issues", verification: { scheme } }),
+      }),
+    );
+  const linear = await create("linear");
+  assert.equal(linear.status, 200);
+  const created = (await linear.json()) as { webhook: { verification: { scheme: string } } };
+  assert.equal(created.webhook.verification.scheme, "linear");
+  assert.equal((await create("bitbucket")).status, 400);
 });

@@ -29,7 +29,7 @@ function configWith(body: string): QmConfig {
 function configText(over: { services?: string; env?: string } = {}): string {
   return `{
     "contract": 1, "orgId": "acme", "publicUrl": "https://agent.example.com", "target": "docker",
-    "services": ${over.services ?? '["core", "web-ui", "admin", "portal", "auth"]'},
+    "services": ${over.services ?? '["core", "web-ui", "portal", "auth"]'},
     "plugins": [], "skills": [],
     "env": ${over.env ?? '{ "auth": { "AUTH_EMAIL_TRANSPORT": "resend", "AUTH_ALLOWED_EMAIL_DOMAIN": "example.com" } }'}
   }`;
@@ -43,7 +43,7 @@ test("the auth service is a first-class, privately addressed service with its ow
   assert.equal(def.docker.hostPortOffset, undefined, "docker must not publish the broker on a host port");
   const offsets = SERVICE_NAMES.map((name) => serviceDef(name).docker.hostPortOffset);
   assert.equal(new Set(offsets).size, offsets.length, "host port offsets stay unique");
-  const slots = SERVICE_NAMES.map((name) => serviceDef(name).dev.portSlotOffset);
+  const slots = SERVICE_NAMES.map((name) => serviceDef(name).dev?.portSlotOffset);
   assert.equal(new Set(slots).size, slots.length, "dev port slots stay unique");
   assert.ok(def.order < serviceDef("portal").order, "the broker comes up before the portal that publishes it");
   assert.deepEqual(
@@ -71,7 +71,7 @@ test("fly derives the portal's whole OIDC block from the broker, over the privat
   assert.match(core, /AUTH_ALLOWED_EMAIL_DOMAIN = "example\.com"/, "core refuses in-domain external invites");
 
   const auth = derivedTomlFor(brokerConfig(), "auth", repoRoot);
-  assert.equal(auth, readFileSync(join(repoRoot, "deploy", "auth", "fly.toml"), "utf8"));
+  assert.equal(auth, readFileSync(join(repoRoot, "cli", "templates", "fly", "auth.toml"), "utf8"));
   assert.match(auth, /AUTH_ISSUER = "https:\/\/agent\.example\.com\/idp"/);
   assert.match(auth, /AUTH_REDIRECT_URI = "https:\/\/agent\.example\.com\/auth\/callback"/);
 });
@@ -108,7 +108,7 @@ test("docker and AWS wire the broker with parity", () => {
 
   const aws = configWith(`{
     "contract": 1, "orgId": "acme", "publicUrl": "https://agent.example.com", "target": "aws",
-    "services": ["core", "web-ui", "admin", "portal", "auth"], "plugins": [], "skills": [],
+    "services": ["core", "web-ui", "portal", "auth"], "plugins": [], "skills": [],
     "env": { "core": { "AWS_DEPLOY_IMAGE": "acme-sandbox" }, "auth": { "AUTH_EMAIL_TRANSPORT": "smtp", "AUTH_ALLOWED_EMAIL_DOMAIN": "example.com" } },
     "aws": {
       "accountId": "123456789012", "region": "us-west-2", "cluster": "acme-qm",
@@ -118,7 +118,6 @@ test("docker and AWS wire the broker with parity", () => {
       "services": {
         "core": { "ecrRepository": "acme-qm-core", "ecsService": "acme-qm-core", "cpu": 2048, "memory": 4096 },
         "web-ui": { "ecrRepository": "acme-qm-web-ui", "ecsService": "acme-qm-web-ui", "cpu": 512, "memory": 1024 },
-        "admin": { "ecrRepository": "acme-qm-admin", "ecsService": "acme-qm-admin", "cpu": 512, "memory": 1024 },
         "portal": { "ecrRepository": "acme-qm-portal", "ecsService": "acme-qm-portal", "cpu": 512, "memory": 1024 },
         "auth": { "ecrRepository": "acme-qm-auth", "ecsService": "acme-qm-auth", "cpu": 256, "memory": 512 }
       }

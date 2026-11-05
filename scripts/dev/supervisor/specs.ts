@@ -9,8 +9,6 @@ export interface SpecInputs {
   web?: boolean;
   webUiBasePath: string;
   slack?: { botToken: string; appToken: string };
-  sessionStore: string;
-  runStore: string;
   databaseUrl: string;
   adminGrantsSeed: string;
   coreSigningSecret: string;
@@ -25,7 +23,6 @@ export function buildChildSpecs(i: SpecInputs): ChildSpec[] {
   const siblingBase = Object.fromEntries(
     Object.entries(base).filter(([key]) => key !== "HOME" && key !== "CODEX_HOME"),
   );
-  siblingBase.CODEX_AUTH_FILE = "";
   const orgId = i.baseEnv.DEV_INSTANCE_ORG_ID || "acme";
   const signing: Record<string, string> = i.coreSigningSecret ? { CORE_SIGNING_SECRET: i.coreSigningSecret } : {};
   const specs: ChildSpec[] = [
@@ -36,8 +33,6 @@ export function buildChildSpecs(i: SpecInputs): ChildSpec[] {
       env: {
         ...base,
         ORG_ID: orgId,
-        SESSION_STORE: i.sessionStore,
-        RUN_STORE: i.runStore,
         PORT: String(i.ports.core),
         ...(i.databaseUrl ? { DATABASE_URL: i.databaseUrl } : {}),
         ...(i.adminGrantsSeed ? { ADMIN_GRANTS: i.adminGrantsSeed } : {}),
@@ -91,7 +86,6 @@ export function buildChildSpecs(i: SpecInputs): ChildSpec[] {
         CORE_API_URL: `http://localhost:${i.ports.core}`,
         CORE_ORG_ID: orgId,
         WEB_UI_UPSTREAM: `http://localhost:${i.ports.web}`,
-        ADMIN_UPSTREAM: `http://localhost:${i.ports.web}/admin`,
         PORTAL_SESSION_SECRET: i.portalSessionSecret,
         NODE_ENV: "development",
         PORTAL_LOCAL_AUTH_BYPASS: i.baseEnv.PORTAL_LOCAL_AUTH_BYPASS ?? "1",

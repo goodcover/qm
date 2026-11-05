@@ -1,4 +1,5 @@
-import type { Webhook } from "../../types.ts";
+import { withRowTenant } from "../tenant-ingress.ts";
+import type { Webhook } from "../../triggers/types.ts";
 import { WEBHOOK_SCHEMES } from "../../webhooks/verifiers.ts";
 import type { CreateWebhookInput } from "../../webhooks/webhook-store.ts";
 import { errMessage } from "../../util/errors.ts";
@@ -51,7 +52,13 @@ export function redactWebhook(w: Webhook): Webhook {
   return { ...w, verification: { ...w.verification, secret: "***" } };
 }
 
-async function incomingWebhook(ctx: BaseCtx): Promise<void> {
+function incomingWebhook(ctx: BaseCtx): Promise<void> {
+  return withRowTenant(ctx.req, ctx.res, ctx.deps.tenancy, { table: "webhooks", id: ctx.params.id! }, () =>
+    receiveWebhook(ctx),
+  );
+}
+
+async function receiveWebhook(ctx: BaseCtx): Promise<void> {
   const { req, res, deps, params } = ctx;
   if (!deps.webhookReceiver) {
     req.resume();
@@ -189,14 +196,26 @@ const disableWebhook = (ctx: ApiCtx): Promise<void> => setWebhookEnabled(ctx, fa
 const enableWebhook = (ctx: ApiCtx): Promise<void> => setWebhookEnabled(ctx, true);
 
 export const webhookRawRoutes: ReadonlyArray<Route<BaseCtx>> = [
-  { method: "POST", path: "/v1/webhooks/incoming/:id", auth: "public", handle: incomingWebhook },
+  { method: "POST", path: "/v1/webhooks/incoming/:id", auth: "public", tenant: "row", handle: incomingWebhook },
 ];
 
 export const webhookRoutes: ReadonlyArray<Route<ApiCtx>> = [
-  { method: "POST", path: "/v1/webhooks", auth: "either", handle: createWebhook },
-  { method: "GET", path: "/v1/webhooks", auth: "either", handle: listWebhooks },
-  { method: "GET", path: "/v1/webhooks/:id/events", auth: "either", handle: listWebhookEvents },
-  { method: "POST", path: "/v1/webhooks/:id/update", auth: "either", handle: updateWebhook },
-  { method: "POST", path: "/v1/webhooks/:id/disable", auth: "either", handle: disableWebhook },
+  { method: "POST", path: "/v1/webhooks", actor: "body.createdBy", auth: "either", handle: createWebhook },
+  { method: "GET", path: "/v1/webhooks", actor: "query.viewer", auth: "either", handle: listWebhooks },
+  { method: "GET", path: "/v1/webhooks/:id/events", actor: "query.viewer", auth: "either", handle: listWebhookEvents },
+  {
+    method: "POST",
+    path: "/v1/webhooks/:id/update",
+    actor: "query.principalId",
+    auth: "either",
+    handle: updateWebhook,
+  },
+  {
+    method: "POST",
+    path: "/v1/webhooks/:id/disable",
+    actor: "query.principalId",
+    auth: "either",
+    handle: disableWebhook,
+  },
   { method: "POST", path: "/v1/webhooks/:id/enable", auth: "either", handle: enableWebhook },
 ];

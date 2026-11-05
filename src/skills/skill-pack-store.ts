@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { ScopeId } from "../types.ts";
-import { createMemoryMap, type DurableMap } from "../persistence/durable-map.ts";
+import type { DurableMap } from "../persistence/durable-map.ts";
 import type { PackConfig } from "./normalize.ts";
 
 type PackKind = "git";
@@ -39,15 +39,14 @@ export interface SkillPackStore {
   create(input: NewSkillPack): Promise<SkillPack>;
   get(id: string): Promise<SkillPack | null>;
   list(): Promise<SkillPack[]>;
+  acrossTenants(): Promise<Array<{ tenantId: string; id: string }>>;
   update(id: string, patch: Partial<Omit<SkillPack, "id" | "createdAt">>): Promise<SkillPack>;
   remove(id: string): Promise<void>;
   recordImport(id: string, result: ImportRecord): Promise<void>;
 }
 
-export function createSkillPackStore(
-  opts: { backing?: DurableMap<SkillPack>; now?: () => number } = {},
-): SkillPackStore {
-  const packs = opts.backing ?? createMemoryMap<SkillPack>();
+export function createSkillPackStore(opts: { backing: DurableMap<SkillPack>; now?: () => number }): SkillPackStore {
+  const packs = opts.backing;
   const now = opts.now ?? (() => Date.now());
   return {
     async create(input) {
@@ -57,6 +56,7 @@ export function createSkillPackStore(
     },
     get: (id) => packs.get(id),
     list: () => packs.all(),
+    acrossTenants: async () => (await packs.acrossTenants()).map(({ tenantId, id }) => ({ tenantId, id })),
     async update(id, patch) {
       const merged = await packs.merge(id, patch);
       if (!merged) throw new Error(`unknown skill pack: ${id}`);

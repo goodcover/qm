@@ -1,8 +1,7 @@
 import { externalSlackCapabilityAllowed } from "./external-slack-capability.ts";
 import { MemoryDisclosureDenied } from "../memory/disclosure.ts";
 import { MemoryFactsMissing } from "../memory/facts.ts";
-import { reportBackendError, startTiming } from "../../plugins/chassis/src/error-reporting.ts";
-import { traceStatus } from "../../plugins/chassis/src/timing.ts";
+import { nameRequest, reportBackendError } from "../../plugins/chassis/src/error-reporting.ts";
 import {
   createServer as createHttpServer,
   type IncomingMessage,
@@ -21,54 +20,38 @@ import {
   SOURCE_AUTH_REPLAY_WINDOW_MS,
   type SourceAuth,
 } from "../auth/source-auth.ts";
-import { verifyCapabilityToken, CONTROL_PLANE_AUD, type CapabilityClaims } from "../auth/capability-token.ts";
+import { CONTROL_PLANE_AUD, type CapabilityClaims } from "../auth/capability-token.ts";
+import { boundTenant, TenantUnavailable } from "../tenants/context.ts";
+import { capabilityToken, requestCapability, withRequestTenant } from "./tenant-ingress.ts";
 import { verifyPortalIdentity, PORTAL_IDENTITY_HEADER, type PortalIdentity } from "../auth/portal-identity.ts";
-import { isUserScoped, userScopedField, assertedActor, isUnclassifiedWrite } from "./user-scoped-routes.ts";
 import { errMessage } from "../util/errors.ts";
 import { parseScopeId, scopeId } from "../types.ts";
-import { canonicalPayload } from "../../plugins/chassis/src/source-auth-sign.ts";
 import { armBodyDeadline, PayloadTooLargeError, readRawBody, sendJson, verifyOrReject } from "./http.ts";
-import { findRoute, run, type ApiCtx, type BaseCtx, type Route, type RouteAuth } from "./routes/route.ts";
+import { findRoute, run, type AdminAccess, type ApiCtx, type BaseCtx, type Route } from "./routes/route.ts";
 import { apiRoutes, rawRoutes } from "./routes/index.ts";
 import { proxyDeploymentSubdomain } from "./routes/deployments.ts";
 import { CAPABILITY_HEADER } from "./contract.ts";
 import { livePersonCapability } from "./artifact-share.ts";
 import { canonicalPerson, samePerson } from "../directory/person.ts";
 
-const safeDecode = (s: string): string => {
-  try {
-    return decodeURIComponent(s);
-  } catch {
-    return "";
-  }
-};
-
 async function capabilityAdminDenied(
-  method: string,
-  pathname: string,
+  access: AdminAccess,
+  params: Record<string, string>,
   url: URL,
   claims: CapabilityClaims,
   config: ServerDeps["config"],
 ): Promise<string | null> {
-  if (method === "GET" && pathname === "/v1/admin/whoami") return null;
+  if (access.agent === "anyone") return null;
   if (claims.aud !== CONTROL_PLANE_AUD) return "admin routes require the per-turn agent token";
-  if (!livePersonCapability(claims) && !unattendedAdminReadAllowed(method, pathname, claims)) {
-    return "admin actions through the agent require a turn the admin started themselves — autonomous turns (crons, webhooks) cannot act as an admin";
+  if (!livePersonCapability(claims) && !(access.unattended && claims.grants?.includes(access.unattended.grant))) {
+    return access.unattended
+      ? `admin actions through the agent require a turn the admin started themselves — this autonomous run lacks the unattended grant ${access.unattended.grant}, which only a cron's org-admin owner can add, from a live turn in their own DM. Report this failure where the run delivers instead of finishing silently.`
+      : "admin actions through the agent require a turn the admin started themselves — autonomous turns (crons, webhooks) cannot use this route. Report this failure where the run delivers instead of finishing silently.";
   }
-  if (pathname.startsWith("/v1/admin/grants")) {
-    return "admin grant changes (promote/revoke) are portal-only — the agent cannot manage who governs the org";
-  }
-  if (pathname.startsWith("/v1/admin/impersonate")) {
-    return "impersonating a user is portal-only — the agent cannot act as another person";
-  }
-  if (pathname.startsWith("/v1/admin/principal-links")) {
-    return "identity links are portal-only — the agent cannot decide which sign-ins belong to one person";
-  }
-  if (method === "GET" && isAdminContentRead(pathname) && parseScopeId(claims.scopeId).kind !== "personal") {
-    let target = "";
-    if (pathname.startsWith("/v1/admin/scopes/"))
-      target = safeDecode(pathname.slice("/v1/admin/scopes/".length).split("/")[0] ?? "");
-    else if (pathname === "/v1/admin/memory") target = url.searchParams.get("scope") ?? "";
+  if (typeof access.agent === "object") return access.agent.portalOnly;
+  if (access.privateRead && parseScopeId(claims.scopeId).kind !== "personal") {
+    const target =
+      access.privateRead === "unless-org-scope" ? (params.scope ?? url.searchParams.get("scope") ?? "") : "";
     if (
       parseScopeId(target).kind !== "org" &&
       (!livePersonCapability(claims) ||
@@ -80,70 +63,15 @@ async function capabilityAdminDenied(
   return null;
 }
 
-const UNATTENDED_READ_PATHS: Record<string, (pathname: string) => boolean> = {
-  "admin.sessions.read": (p) =>
-    p === "/v1/admin/sessions" ||
-    /^\/v1\/admin\/sessions\/[^/]+$/.test(p) ||
-    p === "/v1/admin/scopes" ||
-    p === "/v1/admin/errors" ||
-    p === "/v1/admin/runs",
-  "admin.audit.read": (p) => p === "/v1/admin/audit",
-  "admin.metrics.read": (p) => p === "/v1/admin/metrics",
-  "admin.egress.read": (p) => p === "/v1/admin/egress",
-  "admin.files.read": (p) =>
-    p === "/v1/admin/files" || p === "/v1/admin/files/read" || p === "/v1/admin/files/download",
-};
+const WRITE_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 
-function unattendedAdminReadAllowed(method: string, pathname: string, claims: CapabilityClaims): boolean {
-  if (method !== "GET") return false;
-  return (claims.grants ?? []).some((grant) => UNATTENDED_READ_PATHS[grant]?.(pathname) === true);
+function needlessEscape(escaped: string): boolean {
+  const char = String.fromCharCode(Number.parseInt(escaped.slice(0, 2), 16));
+  return encodeURIComponent(char) === char;
 }
 
-function isAdminContentRead(pathname: string): boolean {
-  if (pathname === "/v1/admin/memory" || pathname === "/v1/admin/scopes") return true;
-  if (pathname === "/v1/admin/keychain") return true;
-  if (pathname === "/v1/admin/volumes") return true;
-  if (pathname.startsWith("/v1/admin/scopes/")) return true;
-  if (pathname.startsWith("/v1/admin/sessions")) return true;
-  if (pathname.startsWith("/v1/admin/files")) return true;
-  if (
-    pathname === "/v1/admin/runs" ||
-    pathname === "/v1/admin/audit" ||
-    pathname === "/v1/admin/security/flags" ||
-    pathname === "/v1/admin/errors" ||
-    pathname === "/v1/admin/egress"
-  )
-    return true;
-  if (pathname === "/v1/admin/crons" || pathname === "/v1/admin/deployments" || pathname === "/v1/admin/skills")
-    return true;
-  if (pathname === "/v1/admin/deliveries/shadow") return true;
-  if (pathname.startsWith("/v1/admin/slack-mirror")) return true;
-  if (pathname.startsWith("/v1/admin/ambient-judgments")) return true;
-  if (pathname.startsWith("/v1/admin/ack-emoji-picks")) return true;
-  if (pathname.startsWith("/v1/admin/skills/")) return true;
-  if (pathname.startsWith("/v1/admin/users/")) return true;
-  return false;
-}
-
-function strictPostAllowed(pathname: string, body: unknown): boolean {
-  if (
-    pathname === "/v1/surface-context" ||
-    pathname === "/v1/projects" ||
-    pathname === "/v1/memory/search" ||
-    pathname === "/v1/search" ||
-    pathname.startsWith("/v1/run-signals/")
-  )
-    return true;
-  if (/^\/v1\/projects\/[^/]+(?:\/members(?:\/[^/]+)?)?$/.test(pathname)) return true;
-  if (/^\/v1\/skills\/[^/]+\/restore$/.test(pathname)) return true;
-  return (
-    /^\/v1\/triggers\/[^/]+\/consent$/.test(pathname) && (body as { decision?: unknown } | null)?.decision === "decline"
-  );
-}
-
-function capabilityFromHeaders(req: IncomingMessage): string | null {
-  const h = req.headers[CAPABILITY_HEADER];
-  return typeof h === "string" && h ? h : null;
+function canonicalPath(req: IncomingMessage, pathname: string): boolean {
+  return (req.url ?? "/").split("?", 1)[0] === pathname && !pathname.split("%").slice(1).some(needlessEscape);
 }
 
 interface GateResult {
@@ -157,6 +85,7 @@ interface Wiring {
   deps: ServerDeps;
   secret: string | undefined;
   auth: SourceAuth | null;
+  operator: { secret: string; auth: SourceAuth } | null;
   requirePortalIdentity: boolean;
   allowUnsignedSourceAuth: boolean;
 }
@@ -178,17 +107,21 @@ async function verifyCapability(
   { app, deps, secret }: Wiring,
   method: string,
   pathname: string,
-  requiredAud: string | null,
+  required: { aud: string; bearer?: true } | null,
 ): Promise<CapabilityClaims | null> {
-  const capToken = capabilityFromHeaders(req);
+  const requiredAud = required?.aud ?? null;
+  const capToken = capabilityToken(req, required?.bearer === true);
   if (!capToken) {
     sendJson(res, 401, { error: "unauthorized", message: `${requiredAud} capability token required` });
     return null;
   }
-  const capSecret = deps.capabilitySecret ?? secret;
-  const capability = capSecret ? await verifyCapabilityToken(capToken, capSecret) : null;
+  const capability = await requestCapability(req, capToken, deps.capabilitySecret ?? secret);
   if (!capability) {
     sendJson(res, 401, { error: "unauthorized", message: "invalid or expired capability token" });
+    return null;
+  }
+  if (capability.tenant !== boundTenant()) {
+    sendJson(res, 401, { error: "unauthorized", message: "capability token belongs to another tenant" });
     return null;
   }
   if (
@@ -257,25 +190,35 @@ async function gate(
   pathname: string,
   url: URL,
   raw: string,
-  routeAuth: RouteAuth | undefined,
+  route: Pick<Route, "auth" | "actor" | "admin" | "allowedInStrict"> | undefined,
+  params: Record<string, string>,
 ): Promise<GateResult | null> {
+  const routeAuth = route?.auth;
   const { deps, secret, auth, requirePortalIdentity, allowUnsignedSourceAuth } = wiring;
   const isPublicRoute = routeAuth === "public";
-  const requiredAud = typeof routeAuth === "object" ? routeAuth.aud : null;
+  const requiredAuth = typeof routeAuth === "object" ? routeAuth : null;
+  const requiredAud = requiredAuth?.aud ?? null;
   let capability: CapabilityClaims | null = null;
-  const capToken = capabilityFromHeaders(req);
+  const capToken = capabilityToken(req, false);
   if (isPublicRoute) {
     void isPublicRoute;
+  } else if (routeAuth === "operator") {
+    if (!wiring.operator) {
+      sendJson(res, 503, { error: "operator_auth_unavailable", message: "OPERATOR_SIGNING_SECRET is not configured" });
+      return null;
+    }
+    const signed = { method, path: pathname + url.search, body: raw };
+    if (!(await verifyOrReject(req, res, wiring.operator.secret, wiring.operator.auth, signed, true))) return null;
   } else if (requiredAud || capToken) {
-    capability = await verifyCapability(req, res, wiring, method, pathname, requiredAud);
+    capability = await verifyCapability(req, res, wiring, method, pathname, requiredAuth);
     if (!capability) return null;
     if (routeAuth === "either") {
       if (capability.aud !== undefined && capability.aud !== CONTROL_PLANE_AUD) {
         sendJson(res, 403, { error: "forbidden", message: "capability token audience not valid for this route" });
         return null;
       }
-      if (pathname.startsWith("/v1/admin/")) {
-        const denied = await capabilityAdminDenied(method, pathname, url, capability, deps.config);
+      if (route?.admin) {
+        const denied = await capabilityAdminDenied(route.admin, params, url, capability, deps.config);
         if (denied) {
           sendJson(res, 403, { error: "forbidden", message: denied });
           return null;
@@ -291,7 +234,7 @@ async function gate(
       res,
       secret,
       auth,
-      canonicalPayload(method, pathname + url.search, raw),
+      { method, path: pathname + url.search, body: raw },
       method !== "GET",
       allowUnsignedSourceAuth,
     ))
@@ -311,7 +254,7 @@ async function gate(
     capability &&
     !requiredAud &&
     method !== "GET" &&
-    !strictPostAllowed(pathname, body) &&
+    !route?.allowedInStrict &&
     deps.config &&
     (await deps.config.getSecurityPostureDurable(capability.scopeId)) === "strict"
   ) {
@@ -326,14 +269,14 @@ async function gate(
     const token = Array.isArray(rawToken) ? rawToken[0] : rawToken;
     actor = token && psecret ? await verifyPortalIdentity(token, psecret, Date.now()) : null;
     if (actor && deps.identity) {
-      await deps.identity.refresh(Boolean(actor.authenticatedAs));
-      if (
-        deps.identity.classify(actor.p).type !== "internal" ||
-        (actor.authenticatedAs &&
-          (deps.identity.classify(actor.authenticatedAs).type !== "internal" ||
-            !samePerson(actor.authenticatedAs, actor.imp ?? actor.p)))
-      )
-        actor = null;
+      const identity = deps.identity;
+      const verified = ({ p, imp, authenticatedAs }: PortalIdentity) =>
+        identity.classify(p).type === "internal" &&
+        (!authenticatedAs ||
+          (identity.classify(authenticatedAs).type === "internal" && samePerson(authenticatedAs, imp ?? p)));
+      await identity.refresh();
+      if (!verified(actor) && actor.authenticatedAs) await identity.refresh(true);
+      if (!verified(actor)) actor = null;
     }
     if (actor)
       actor = { ...actor, p: canonicalPerson(actor.p), ...(actor.imp ? { imp: canonicalPerson(actor.imp) } : {}) };
@@ -344,20 +287,17 @@ async function gate(
         body !== null &&
         typeof body === "object" &&
         (body as { surface?: unknown }).surface === "web";
-      const needsActor =
-        isUserScoped(method, pathname) ||
-        webTurn ||
-        pathname.startsWith("/v1/admin/") ||
-        isUnclassifiedWrite(method, pathname);
+      const routeActor = route?.actor ?? (WRITE_METHODS.has(method) ? "person" : undefined);
+      const needsActor = webTurn || (routeActor !== undefined && routeActor !== "system");
       if (needsActor) {
         if (!psecret || !actor) {
           sendJson(res, 401, { error: "unauthorized", message: "portal identity required" });
           return null;
         }
-        const field = webTurn ? undefined : userScopedField(method, pathname);
+        const field = !webTurn && routeActor?.includes(".") ? routeActor : undefined;
         let asserted: unknown = null;
         if (webTurn) asserted = (body as { actor?: { externalId?: unknown } }).actor?.externalId ?? null;
-        else if (field) asserted = assertedActor(field, url, body, req);
+        else if (field) asserted = assertedActorField(field, url, body);
         const actorId = actor.p;
         const matchesActor = (value: unknown): boolean => typeof value === "string" && samePerson(value, actorId);
         if ((field && !matchesActor(asserted)) || (!field && asserted !== null && !matchesActor(asserted))) {
@@ -370,6 +310,13 @@ async function gate(
   return { body, capability, actor };
 }
 
+function assertedActorField(field: string, url: URL, body: unknown): unknown {
+  const [where, name] = field.split(".", 2) as [string, string];
+  if (where === "query") return url.searchParams.get(name);
+  const value = body && typeof body === "object" ? (body as Record<string, unknown>)[name] : undefined;
+  return typeof value === "string" ? value : null;
+}
+
 function baseCtx(req: IncomingMessage, res: ServerResponse, wiring: Wiring): BaseCtx {
   const url = new URL(req.url ?? "/", "http://localhost");
   return { req, res, ...wiring, url, pathname: url.pathname, method: req.method ?? "GET", params: {} };
@@ -380,6 +327,11 @@ function respondError(req: IncomingMessage, res: ServerResponse, err: unknown): 
     const status = err instanceof MemoryFactsMissing ? 404 : 403;
     if (!res.headersSent)
       sendJson(res, status, { error: status === 404 ? "not_found" : "forbidden", message: err.message });
+    else res.destroy();
+    return;
+  }
+  if (err instanceof TenantUnavailable) {
+    if (!res.headersSent) sendJson(res, 503, { error: "tenant_unavailable", message: err.message });
     else res.destroy();
     return;
   }
@@ -419,7 +371,17 @@ function buildFastify(wiring: Wiring, server: Server): { fastify: FastifyInstanc
       const base = baseCtx(req, res, wiring);
       const raw = rawBodies.get(req) ?? "";
       const found = findRoute(matchRoutes, base.method, base.pathname);
-      const g = await gate(req, res, wiring, base.method, base.pathname, base.url, raw, found?.route.auth);
+      const g = await gate(
+        req,
+        res,
+        wiring,
+        base.method,
+        base.pathname,
+        base.url,
+        raw,
+        found?.route,
+        found?.params ?? {},
+      );
       if (!g) return;
       if (found) {
         const ctx: ApiCtx = {
@@ -474,7 +436,8 @@ function buildFastify(wiring: Wiring, server: Server): { fastify: FastifyInstanc
       url.pathname,
       url,
       raw,
-      request.routeOptions.config.route?.auth,
+      request.routeOptions.config.route,
+      request.params as Record<string, string>,
     );
     if (!result) {
       reply.hijack();
@@ -521,34 +484,27 @@ type ServerOptions = Omit<ServerDeps, "control">;
 
 function buildServer(app: App, deps: ServerOptions, allowUnsignedSourceAuth: boolean): Server {
   const requirePortalIdentity = Boolean(deps.requireSignedPortalIdentity || deps.production);
-  const auth = deps.signingSecret
-    ? createSourceAuth({
-        signingSecret: deps.signingSecret,
-        ...(deps.replayDedupe ? { dedupe: deps.replayDedupe } : {}),
-      })
-    : null;
+  if (deps.signingSecret && !deps.replayDedupe) throw new Error("source auth requires a replay dedupe store");
+  const auth =
+    deps.signingSecret && deps.replayDedupe
+      ? createSourceAuth({ signingSecret: deps.signingSecret, dedupe: deps.replayDedupe })
+      : null;
+  const operatorSecret = deps.operatorSigningSecret;
+  const operator =
+    isStrongSigningSecret(operatorSecret) && operatorSecret !== deps.signingSecret && deps.replayDedupe
+      ? { secret: operatorSecret, auth: createSourceAuth({ signingSecret: operatorSecret, dedupe: deps.replayDedupe }) }
+      : null;
   const wiring: Wiring = {
     app,
     deps: { ...deps, control: createControlService(app, deps.scheduler, deps.admin) },
     secret: deps.signingSecret,
     auth,
+    operator,
     requirePortalIdentity,
     allowUnsignedSourceAuth,
   };
-  const requestNames = new WeakMap<IncomingMessage, string>();
+  const capabilitySecret = deps.capabilitySecret ?? deps.signingSecret;
   const server = createHttpServer((req, res) => {
-    const finishTiming =
-      req.url === "/healthz" || req.url === "/readyz"
-        ? undefined
-        : startTiming("http.server", `${req.method ?? "GET"} /*`);
-    if (finishTiming)
-      res.once("close", () =>
-        finishTiming({
-          name: `${req.method ?? "GET"} ${requestNames.get(req) ?? "/*"}`,
-          status: res.writableFinished ? traceStatus(res.statusCode) : "cancelled",
-          data: { url: req.url, http_status: res.writableFinished ? String(res.statusCode) : undefined },
-        }),
-      );
     req.on("error", () => res.destroy());
     res.on("error", () => res.destroy());
     void front(req, res).catch((err: unknown) => respondError(req, res, err));
@@ -562,28 +518,33 @@ function buildServer(app: App, deps: ServerOptions, allowUnsignedSourceAuth: boo
   server.maxConnections = 1024;
 
   async function front(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    armBodyDeadline(req, 30_000);
+    armBodyDeadline(req, deps.requestBodyDeadlineMs ?? 30_000);
     const base = baseCtx(req, res, wiring);
     if (await proxyDeploymentSubdomain(base)) {
-      requestNames.set(req, "/deployment-proxy/*");
+      nameRequest(base.method, "/deployment-proxy/*");
       return;
+    }
+    if (!canonicalPath(req, base.pathname)) {
+      sendJson(res, 404, { error: "not_found", message: `${base.method} ${base.pathname}` });
+      return void req.resume();
     }
     const raw = findRoute(rawRoutes, base.method, base.pathname);
     if (raw) {
-      if ("path" in raw.route) requestNames.set(req, raw.route.path);
+      if ("path" in raw.route) nameRequest(base.method, raw.route.path);
       const routeAuth = raw.route.auth;
-      if (typeof routeAuth === "object") {
-        base.capability = await verifyCapability(req, res, wiring, base.method, base.pathname, routeAuth.aud);
-        if (!base.capability) return void req.resume();
-      }
-      await run(raw.route, raw.params, base);
-      return;
+      return withRequestTenant(req, res, raw.route, capabilitySecret, deps.tenancy, async () => {
+        if (typeof routeAuth === "object") {
+          base.capability = await verifyCapability(req, res, wiring, base.method, base.pathname, routeAuth);
+          if (!base.capability) return void req.resume();
+        }
+        await run(raw.route, raw.params, base);
+      });
     }
     const matched = findRoute(apiRoutes, base.method, base.pathname);
-    if (matched && "path" in matched.route) requestNames.set(req, matched.route.path);
+    if (matched && "path" in matched.route) nameRequest(base.method, matched.route.path);
     const routeAuth = matched?.route.auth;
     const acceptsSourceAuth = !matched || routeAuth === "source" || routeAuth === "either";
-    if (wiring.secret && !capabilityFromHeaders(req) && routeAuth !== "public" && acceptsSourceAuth) {
+    if (wiring.secret && !capabilityToken(req, false) && routeAuth !== "public" && acceptsSourceAuth) {
       const timestamp = Number(req.headers["x-timestamp"] ?? 0);
       if (
         !Number.isFinite(timestamp) ||
@@ -599,7 +560,7 @@ function buildServer(app: App, deps: ServerOptions, allowUnsignedSourceAuth: boo
     }
     rawBodies.set(req, await readRawBody(req, matched?.route.maxBodyBytes));
     await ready;
-    routing(req, res);
+    await withRequestTenant(req, res, matched?.route, capabilitySecret, deps.tenancy, () => routing(req, res));
   }
   return server;
 }
