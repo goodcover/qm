@@ -103,9 +103,10 @@ or token re-entry. Ops owns the release's immutable image pins and rollout recor
 ## Historical deployed baseline: Claude Code alongside Codex
 
 The instructions in this section describe the pre-0.1.15 deployed baseline.
-They are not configuration instructions for this source candidate. The 0.1.15
-candidate retires native Codex and OpenCode; use the [Pi subscription migration
-guide](UPGRADE-0.1.15.md) when preparing a separately authorized rollout.
+They are not configuration instructions for the current source. Production now
+runs 0.1.15-gc.1 on Pi; see [UPGRADE-0.1.15.md](UPGRADE-0.1.15.md). The 0.1.16
+source removes the Claude Code harness and the harness picker entirely; see
+[UPGRADE-0.1.16.md](UPGRADE-0.1.16.md).
 
 The deployed core already includes the Claude Code harness. Adding a token to
 Keychain does not automatically approve the harness or connect the credential
@@ -137,9 +138,11 @@ it when expired or revoked. The entry's ID is safe to keep in ops configuration.
 
 ## Upstream updates and CI
 
-The current 0.1.15 source candidate adopts Pi while retaining ChatGPT subscription
-access. Use [the candidate upgrade guide](UPGRADE-0.1.15.md) for its configuration,
-migration, and rollback requirements. The version notes below are historical.
+Production runs 0.1.15-gc.1, which adopted Pi while retaining ChatGPT subscription
+access ([UPGRADE-0.1.15.md](UPGRADE-0.1.15.md)). The 0.1.16 source candidate is not
+deployed. Use [its upgrade guide](UPGRADE-0.1.16.md) for its configuration, its
+three-hop database migration and recovery requirements. The version notes below are
+historical.
 
 The historical 0.1.13 source merge retained Goodcover's Codex 0.156.1 and Claude Agent SDK
 0.3.280, Plain OAuth and MCP catalog support, model reasoning capabilities,

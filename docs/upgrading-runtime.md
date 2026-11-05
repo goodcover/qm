@@ -50,8 +50,13 @@ Session, run and directory tables start from one base schema (`sessions/store/00
 directory tables from an older release refuses to start: first run a release that applies
 those migrations but predates the base schema until its migrations finish, then upgrade.
 
-This release also drops `sessions.status`, `tasks`, `task_events`, and the old
-transcript view. Memory heads move to `memory_facts`; new facts do not update old
+A database from before `surfaces/0004-settled-runs-rewrite` must also boot a release
+that records it, so that rows written in the older origin shapes are converted before
+`surfaces/0005-retired-origin-sweep` runs. A worker or server boot records it; a
+migration-only run does not.
+
+Upgrading from releases before 0.1.15 also drops `sessions.status`, `tasks`,
+`task_events`, and the old transcript view. Memory heads move to `memory_facts`; new facts do not update old
 memory revisions. File ACL grants migrate from paths to artifact identifiers,
 removing grants that cannot be mapped. Cron ownership and history also change.
 Qualify these transitions against an isolated database copy before promotion.
