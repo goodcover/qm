@@ -1469,7 +1469,9 @@ export function buildApp(
       resolveModelProviderKeys(),
       resolveCompanySubscriptionKeys(),
     ]);
-    return { ...claude, ...metered, ...chatgpt };
+    const keys = { ...metered, ...claude, ...chatgpt };
+    if (companyClaudeAuthEnv && !claude.anthropic) delete keys.anthropic;
+    return keys;
   };
   const resolveBrowserCompanyKeys = async (includeSubscription = true): Promise<ProviderKeys> =>
     includeSubscription ? resolveCompanyProviderKeys() : resolveModelProviderKeys();

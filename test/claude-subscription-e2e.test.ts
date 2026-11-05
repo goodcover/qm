@@ -4,6 +4,7 @@ import { test, type TestContext } from "node:test";
 import { buildApp } from "./support/build-app.ts";
 import { testConfig } from "./support/test-config.ts";
 import { createAgent } from "../src/agent/agent-run.ts";
+import { hashId } from "../src/util/crypto.ts";
 
 const SUBSCRIPTION_TOKEN = "sk-ant-oat01-personal-e2e";
 
@@ -158,6 +159,49 @@ test("a company Claude subscription token in ANTHROPIC_API_KEY serves company tu
   built.runtime.start();
   try {
     await assertSubscriptionTurn(built, seen, submitted.runId!, companyToken);
+  } finally {
+    await built.runtime.stop();
+  }
+});
+
+test("a company Claude subscription credential owns company Claude turns beside a metered key and fails closed without it", async (t) => {
+  const seen = fakeAnthropic(t);
+  const ownerId = "claude-owner";
+  const service = "claude-code";
+  const envKey = "CLAUDE_CODE_OAUTH_TOKEN";
+  const companyToken = "sk-ant-oat01-company-keychain-e2e";
+  const credentialId = hashId([ownerId, service, `env:${envKey}`]);
+  const built = buildApp(testConfig({ anthropicApiKey: "sk-ant-api03-metered", claudeAuthCredential: credentialId }), {
+    agent: undefined,
+  });
+  assert.equal((await built.keychain!.save({ ownerId, service, secret: companyToken, envKey })).id, credentialId);
+  const turn = (threadRef: string) =>
+    built.app.turn({
+      surface: "slack",
+      actor: { externalId: "U1" },
+      conversation: { kind: "dm", threadRef },
+      text: "ping",
+      origin: { kind: "human" },
+      async: true,
+    });
+  const first = await turn("claude-company-keychain-e2e");
+  built.runtime.start();
+  try {
+    await assertSubscriptionTurn(built, seen, first.runId!, companyToken);
+    await built.keychain!.remove(ownerId, credentialId);
+    seen.length = 0;
+    const second = await turn("claude-company-keychain-missing-e2e");
+    const deadline = Date.now() + 20_000;
+    while (((await built.runs.get(second.runId!))?.errorAttempts ?? 0) === 0) {
+      assert.ok(Date.now() < deadline, "the turn without its subscription credential fails");
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.notEqual((await built.runs.get(second.runId!))?.status, "done");
+    assert.deepEqual(
+      seen.filter((call) => call.headers.get("x-api-key")),
+      [],
+      "no request falls back to the metered key",
+    );
   } finally {
     await built.runtime.stop();
   }
