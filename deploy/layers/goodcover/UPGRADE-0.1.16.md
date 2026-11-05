@@ -286,18 +286,31 @@ application:
    - **Claude.** Save a developer Claude subscription setup token (from
      `claude setup-token`) as an environment credential named
      `CLAUDE_CODE_OAUTH_TOKEN`, and set `CLAUDE_AUTH_CREDENTIAL` to its ID.
-   - **Plain.** Register a developer Plain client with `client_secret_post`, set
+   - **Plain.** Register a developer Plain client with `client_secret_post` and the
+     dev instance's callback, `<dev origin>/v1/connectors/oauth/plain/callback`. Set
      `PLAIN_OAUTH_CLIENT_ID` and `PLAIN_OAUTH_CLIENT_SECRET`, and connect a developer
      Plain workspace in Keychain. The admin API no longer creates `auth: "oauth"`
-     servers, so seed the legacy record through the store from the checkout, with
-     `PLAIN_OWNER` set to the principal that connected Plain, then restart:
+     servers, so stop the dev instance and seed the legacy record through the store
+     from the checkout. Run it with the dev instance's environment, including its
+     `DATABASE_URL`, `ORG_ID` and `CONNECTOR_SECRET_KEY`, and with `PLAIN_OWNER` set to
+     the principal that connected Plain. Then start the instance again:
 
      ```sh
      node --input-type=module -e '
      const { loadConfig } = await import("./src/config.ts");
-     const { buildApp } = await import("./src/wiring.ts");
+     const config = loadConfig();
      const owner = process.env.PLAIN_OWNER;
+     if (config.production) throw new Error("refusing: NODE_ENV is production");
      if (!owner) throw new Error("set PLAIN_OWNER");
+     const { default: pg } = await import("pg");
+     const db = new pg.Client({ connectionString: config.databaseUrl });
+     await db.connect();
+     const booted = await db.query("SELECT 1 FROM qm_schema_migrations WHERE id = $1", ["surfaces/0005-retired-origin-sweep"]).catch(() => ({ rowCount: 0 }));
+     const seeded = await db.query("SELECT 1 FROM mcp_servers WHERE id = $1", ["plain"]).catch(() => ({ rowCount: 0 }));
+     await db.end();
+     if (!booted.rowCount) throw new Error("refusing: this database has not run 0.1.16");
+     if (seeded.rowCount) throw new Error("refusing: a plain MCP record already exists");
+     const { buildApp } = await import("./src/wiring.ts");
      const built = buildApp(loadConfig());
      await built.mcpServers.put({
        id: "plain", name: "Plain", url: "https://mcp.plain.com/mcp", auth: "oauth",
@@ -307,7 +320,12 @@ application:
      process.exit(0);'
      ```
 
-     Match `credentialScope` to production's Plain record, as shown in `/settings`.
+     The guard refuses production config, a database that has not run 0.1.16 (such
+     as live 0.1.15 production, where the store would otherwise apply hop 3
+     migrations out of order), and any database that already has a `plain` record.
+     Before running it, set `credentialScope` and `readOnly` to match production's
+     Plain record, as shown in `/settings`, and add its `approval` and `catalog`
+     values if it has them.
 
    Run the step 6 checks there. For the rotation check, a second process must read
    back the rotated login. Then break each subscription credential in turn, with an
@@ -371,13 +389,6 @@ them.
 
 ## Goodcover divergences carried forward
 
-- **Deployed apps on the QM origin.** Dan authorized removing the deployed-app
-  browser sandbox on 2026-09-17; see `app-origin/README.md`. Apps proxied through
-  `/d/`, the admin deployment proxy and `/deployments/` therefore run on the QM origin
-  without a sandbox CSP, and can make authenticated same-origin requests as the
-  viewer. Upstream's documentation of sandboxed proxied HTML, including
-  `docs/porter.md`, does not apply to this fork.
-- **No age-based credential sweep.** Upstream deletes command credential directories
-  in `/tmp` after two hours. Goodcover removed that sweep because it could delete the
-  credentials of a command still running. A directory left behind by a crash remains
-  until that computer is replaced.
+The deployed-app origin and the missing credential sweep carry forward unchanged.
+The layer README records both under
+[Divergences from upstream](README.md#divergences-from-upstream).

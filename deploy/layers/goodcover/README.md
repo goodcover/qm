@@ -105,6 +105,19 @@ create a second connection with production bot credentials for local QA. The
 0.1.12 source update accepts the existing 0.1.11 installation without migration
 or token re-entry. Ops owns the release's immutable image pins and rollout record.
 
+## Divergences from upstream
+
+- **Deployed apps on the QM origin.** Dan authorized removing the deployed-app
+  browser sandbox on 2026-09-17; see `app-origin/README.md`. Apps proxied through
+  `/d/`, the admin deployment proxy and `/deployments/` run on the QM origin without
+  a sandbox CSP, and can make authenticated same-origin requests as the viewer.
+  Upstream's documentation of sandboxed proxied HTML, including `docs/porter.md`,
+  does not apply to this fork.
+- **No age-based credential sweep.** Upstream deletes command credential directories
+  in `/tmp` after two hours. Goodcover removed that sweep because it could delete the
+  credentials of a command still running. A directory left behind by a crash remains
+  until that computer is replaced.
+
 ## Historical deployed baseline: Claude Code alongside Codex
 
 The instructions in this section describe the pre-0.1.15 deployed baseline.
