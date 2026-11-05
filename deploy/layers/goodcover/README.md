@@ -162,7 +162,7 @@ The source build uses upstream Pi security.4 and patched HTTP, URI, IP parsing,
 glob expansion, and Mermaid dependencies so production dependency audits pass.
 The core image retains its build-time security audit.
 
-The historical GPT-6.1 Sol addition upgraded Codex to 0.159.2 for its native model catalog.
+The historical GPT-6.1 Sol addition upgraded the native Codex harness, since removed, to 0.159.2 for its model catalog.
 The organization and personal defaults remain unchanged. Axios is pinned by the
 lockfile at 1.20.0 so Slack dependencies pass the production security audit.
 

@@ -32,6 +32,10 @@ touch them.
 - **Multitenancy.** Upstream adds `tenant_id`, row-level security and tenant-first
   keys to every table. A single tenant on the table-owner login keeps working with
   no new settings.
+- **Scheduled work in the prompt.** Production limits the "Scheduled here" block to
+  10 each of scheduled tasks, webhooks and job watches. This candidate drops that
+  limit, as upstream did, and upstream now renders the block in the cached system
+  prompt. A scope with more scheduled work lists all of it.
 
 ## Goodcover routing and spend policy
 
@@ -42,7 +46,9 @@ These Goodcover rules sit on top of upstream:
   an ultrafast variant, fails closed even when an OpenAI key exists.
 - **Rotated logins are saved.** Upstream now saves refreshed keychain files only when
   the caller opts in. Goodcover's company ChatGPT refresh opts in, so each rotation
-  is persisted and the next refresh does not reuse a spent token.
+  is persisted and the next refresh does not reuse a spent token. The person who owns
+  the company ChatGPT credential can still save it from their own commands, outside
+  that lock. Keep it owned by an account that never runs commands with it.
 - **Claude subscription.** When `CLAUDE_AUTH_CREDENTIAL` is configured, company Claude
   traffic uses only that credential, and the company subscription is reported as
   Anthropic. A saved or environment Anthropic API key cannot take it over. If the
@@ -158,10 +164,21 @@ configuration and the table-owner `DATABASE_URL`:
 3. **Hop 3.** Run this candidate's `node src/migrate-main.ts`, then start the
    candidate privately.
 
-Before hop 3, run the row checks of `surfaces/0005-retired-origin-sweep` (in
-`src/surfaces/origin-migration.ts`) read-only, and continue only when none returns a
-row. If any does, repeat hop 2's worker step first. Do not rely on hop 3 to catch
-them: migrations run in id order, and most of hop 3 commits before `surfaces/0005`.
+Before hop 3, run the row checks of `surfaces/0005-retired-origin-sweep` read-only.
+From this candidate's checkout, print the migration's check block and run it inside
+a read-only transaction:
+
+```sh
+{ echo 'BEGIN TRANSACTION READ ONLY;'
+  node --input-type=module -e 'const { RETIRED_ORIGIN_SWEEP_MIGRATION: m } = await import("./src/surfaces/origin-migration.ts"); console.log(`${m.statements[0]};`)'
+  echo 'ROLLBACK;'
+} | psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q
+```
+
+Continue only when it exits 0 with no output. An error names the table holding rows
+in the old shape; repeat hop 2's worker step, then check again. Do not rely on hop 3
+to catch them: migrations run in id order, and most of hop 3 commits before
+`surfaces/0005`.
 If hop 3 fails there anyway, restore the backup. On first start, the candidate also
 delivers outbox rows left at cutover if they are less than six hours old.
 
@@ -175,6 +192,9 @@ and ending with this candidate's code:
 - **Hop 2** added 16 ids. Its worker recorded `surfaces/0004` about three seconds
   after start, with no Slack or model credentials. It started no run, delivery or
   cron.
+- **The `surfaces/0005` pre-check** above refused before the worker step, exited 0
+  after it, and named `deliveries` when an old-shape row was inserted in a
+  rolled-back transaction.
 - **Hop 3** added 377 ids, then the candidate served `/healthz` and `/readyz`. The
   `plain` MCP record kept `auth: "oauth"` and `oauthPrincipalId`, the paused cron
   stayed paused, and keychain secrets still decrypted.
@@ -254,24 +274,35 @@ application:
 
 ## Rollout checklist (requires separate approval)
 
-1. **Build.** Build core, web-ui and portal from this exact merged source with
+1. **Prove credentials before touching production.** Before hop 1, boot this
+   candidate as a web-only dev instance on a fresh database, with developer-owned
+   ChatGPT and Claude subscription credentials (never production ones). Run the
+   step 6 checks there. Then break each subscription credential in turn, with an API
+   key and a fallback runtime configured, and confirm the turn fails without any
+   request to `api.openai.com` or to a metered Anthropic key. The broken Claude
+   subscription also logs `[pi] fallback … skipped`; a broken ChatGPT login fails
+   without attempting a fallback. A credential problem found only at step 6 comes
+   after an irreversible migration.
+2. **Build.** Build core, web-ui and portal from this exact merged source with
    `GIT_SHA`. Publish only to Goodcover ECR. Keep the `0.1.15-gc.1` digests.
-2. **Back up.** Take a fresh backup, then decode it, verify its checksum, restore it
+3. **Back up.** Take a fresh backup, then decode it, verify its checksum, restore it
    into an isolated database and retain it. Capture the deployed ConfigMaps and
    image pins.
-3. **Stop old writers.** Stop every v0.1.15 core, worker and background process,
+4. **Stop old writers.** Stop every v0.1.15 core, worker and background process,
    including Slack. Drain or cancel pending runs, so the bridge workers cannot
    execute them with upstream code.
-4. **Run the hops.** Run hops 1 to 3 as separate jobs with no startup probe, as
+5. **Run the hops.** Run hops 1 to 3 as separate jobs with no startup probe, as
    rehearsed. Check the ledger after each hop. Never edit or delete ledger entries.
-5. **Start privately.** Start the candidate privately with background work
+6. **Start privately.** Start the candidate privately with background work
    disabled. Verify health and the migration logs. Then verify:
    - one private ChatGPT-subscription turn;
    - one private Claude-subscription turn;
    - one read-only Plain MCP call from each of those turns;
    - a forced ChatGPT refresh that persists a rotated token;
    - the `/settings` admin pages;
-   - no OpenAI or Anthropic API key in use.
+   - no OpenAI or Anthropic API key in use: request captures label every route
+     "billed to the organization's subscription", and provider-console usage for
+     any API key stays flat.
 
    Watch for these log lines:
    - `[model] company ChatGPT auth … yielded no token`
@@ -280,9 +311,14 @@ application:
    - `[swallowed] chatgpt: company oauth refresh`
    - `[mcp] … lists more than 128 tools`
 
-6. **Resume.** Resume background work deliberately and watch Slack reconnect. Keep
-   the three paused crons paused unless their permissions are reviewed.
-7. **Update ops last.** Update the image pins and ConfigMaps in ops in a separate
+   If a rotation is dropped, or the provider reports `refresh_token_reused`, the
+   shared ChatGPT login must be reconnected; core will not fall back to a metered
+   key.
+
+7. **Resume.** Resume background work deliberately and watch Slack reconnect. Keep
+   the three paused crons paused unless their permissions are reviewed. Send one
+   Slack DM after the background handoff and confirm the reply arrives.
+8. **Update ops last.** Update the image pins and ConfigMaps in ops in a separate
    reviewed PR.
 
 ## Recovery

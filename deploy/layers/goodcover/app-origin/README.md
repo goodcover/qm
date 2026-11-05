@@ -1,5 +1,8 @@
 # Deployed apps on the QM origin
 
+Superseded: this records a 0.1.11-era derived image. Its change now lives in
+the source tree, and current releases build from source.
+
 Dan authorized removing QM's browser sandbox from deployed apps on 2026-09-17.
 Apps served through `/d/`, the admin deployment proxy, and `/deployments/` now
 run on the QM origin. They can use browser storage and make authenticated

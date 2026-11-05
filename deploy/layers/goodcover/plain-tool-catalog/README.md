@@ -1,5 +1,8 @@
 # Full Plain MCP catalog
 
+Superseded: this records a 0.1.11-era derived image. Its change now lives in
+the source tree, and current releases build from source.
+
 Release `0.1.11-gc.3` raises the per-server MCP tool limit from 64 to 128.
 Plain returned 77 tools during live integration; the old cap omitted thread
 search and other useful tools. This layer replaces only the MCP tool service
