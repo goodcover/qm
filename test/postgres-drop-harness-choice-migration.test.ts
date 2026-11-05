@@ -59,8 +59,8 @@ test("stored harness choices are dropped while their runtime selections stay rec
     });
     await insert("base_model_configs", "personal:a", { scopeId: "personal:a", harnessId: "claude", modelId: "x" });
     await insert("base_model_configs", "personal:b", { scopeId: "personal:b", modelId: "legacy-only" });
-    await insert("base_model_configs", "personal:goodcover", {
-      scopeId: "personal:goodcover",
+    await insert("base_model_configs", "personal:paused-owner", {
+      scopeId: "personal:paused-owner",
       harnessId: "pi",
       modelId: "gpt-6.1-sol",
       effortLevel: "max",
@@ -75,8 +75,8 @@ test("stored harness choices are dropped while their runtime selections stay rec
     await insert("crons", "c2", { id: "c2", runtime: null });
     await insert("crons", "paused", {
       id: "paused",
-      ownerScopeId: "personal:goodcover",
-      createdBy: "goodcover",
+      ownerScopeId: "personal:paused-owner",
+      createdBy: "paused-owner",
       enabled: false,
       schedule: { cron: "0 8 * * 1", timezone: "America/Los_Angeles" },
       runtime: { harnessId: "pi", modelId: "gpt-6.1-sol", effortLevel: "max", fastMode: true },
@@ -98,8 +98,8 @@ test("stored harness choices are dropped while their runtime selections stay rec
     });
     assert.deepEqual(base["personal:a"], { scopeId: "personal:a", modelId: "x", orgRevision: 0 });
     assert.deepEqual(base["personal:b"], { scopeId: "personal:b", modelId: "legacy-only" });
-    assert.deepEqual(base["personal:goodcover"], {
-      scopeId: "personal:goodcover",
+    assert.deepEqual(base["personal:paused-owner"], {
+      scopeId: "personal:paused-owner",
       modelId: "gpt-6.1-sol",
       effortLevel: "max",
       fastMode: true,
@@ -119,8 +119,8 @@ test("stored harness choices are dropped while their runtime selections stay rec
     assert.equal(crons.c2?.runtime, null);
     assert.deepEqual(crons.paused, {
       id: "paused",
-      ownerScopeId: "personal:goodcover",
-      createdBy: "goodcover",
+      ownerScopeId: "personal:paused-owner",
+      createdBy: "paused-owner",
       enabled: false,
       schedule: { cron: "0 8 * * 1", timezone: "America/Los_Angeles" },
       runtime: { modelId: "gpt-6.1-sol", effortLevel: "max", fastMode: true },

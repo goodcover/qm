@@ -260,35 +260,22 @@ function scheduleLabel(c: Cron): { label: string; timezone?: string } {
   };
 }
 
-const OBLIGATIONS_CAP = 10;
-
 export function renderStandingObligations(crons: Cron[], webhooks: Webhook[], monitors: Monitor[]): string {
   const summary = (text: string) => (text.length > 100 ? `${text.slice(0, 97)}…` : text);
   const schedules = crons
     .toSorted((a, b) => a.id.localeCompare(b.id))
-    .slice(0, OBLIGATIONS_CAP)
     .map((c) => ({ title: c.title || "Untitled scheduled task", ...scheduleLabel(c) }));
   const zones = [...new Set(schedules.flatMap((s) => (s.timezone ? [s.timezone] : [])))];
   const lines = [
     ...schedules.map((s) => `- ${s.title} — ${s.label}${zones.length > 1 && s.timezone ? ` (${s.timezone})` : ""}`),
-    ...webhooks
-      .toSorted((a, b) => a.id.localeCompare(b.id))
-      .slice(0, OBLIGATIONS_CAP)
-      .map((w) => `- Webhook: ${summary(w.action)}`),
+    ...webhooks.toSorted((a, b) => a.id.localeCompare(b.id)).map((w) => `- Webhook: ${summary(w.action)}`),
     ...monitors
       .toSorted((a, b) => a.id.localeCompare(b.id))
-      .slice(0, OBLIGATIONS_CAP)
       .map((m) => `- Job watch: ${summary(m.purpose ?? m.command)}`),
   ];
-  const omitted = crons.length + webhooks.length + monitors.length - lines.length;
   return [
     `## Scheduled here${zones.length === 1 ? ` (${zones[0]})` : ""}`,
     ...(lines.length ? lines : ["Nothing is scheduled here."]),
-    ...(omitted > 0
-      ? [
-          `…and ${omitted} more — use cron action=list, webhook action=list or background action=list to inspect the full inventory.`,
-        ]
-      : []),
   ].join("\n");
 }
 

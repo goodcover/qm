@@ -12748,9 +12748,6 @@ body.app-edit-embed .custom-chat-shell.app-edit-chat > .chat-bottom-dock {
   color: var(--foreground);
 }
 
-/* The wrapper draws no box of its own, so a steer that is the latest prompt sticks against the
-   scroller like any other prompt (a sticky row is confined to its parent's box) and releases
-   where the assistant turn it steered ends. */
 .inline-steer {
   display: contents;
 }
@@ -12981,7 +12978,6 @@ body.app-edit-embed .custom-chat-shell.app-edit-chat > .chat-bottom-dock {
   font-size: var(--font-12-5);
 }
 
-/* Project icons: one emoji or a workspace custom emoji in place of the folder. */
 .project-icon {
   display: inline-flex;
   align-items: center;

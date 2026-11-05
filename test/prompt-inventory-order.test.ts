@@ -61,17 +61,6 @@ test("prompt inventories keep identical bytes across permutations, including cap
     base.map((b) => ({ ...b, processId: b.id, command: b.id, threadRef: "t", cursor: 0, expiresAt: 100 })),
     (items) => renderStandingObligations([], [], items),
   );
-  const obligations = renderStandingObligations(
-    base.map((b) => ({ ...b, title: `Scheduled ${b.id}`, schedule: { everyMs: 60_000 } })),
-    base.map((b) => ({ ...b, action: b.id, verification: { scheme: "github" } })),
-    base.map((b) => ({ ...b, processId: b.id, command: b.id, threadRef: "t", cursor: 0, expiresAt: 100 })),
-  );
-  const rows = obligations.split("\n").filter((line) => line.startsWith("- "));
-  assert.equal(rows.length, 30);
-  for (const kind of ["Scheduled", "Webhook", "Job watch"])
-    assert.equal(rows.filter((line) => line.includes(kind)).length, 10);
-  assert.match(obligations, /285 more/);
-  for (const tool of ["cron", "webhook", "background"]) assert.ok(obligations.includes(`${tool} action=list`));
   assert.match(deliveryMenu([{ key: "x", label: "X", type: "slack", target: "x" }], "x"), /X \(default/);
 });
 

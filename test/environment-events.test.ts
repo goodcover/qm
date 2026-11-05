@@ -71,7 +71,7 @@ test("the local time names the user's zone", () => {
   assert.match(line, /\(America\/Los_Angeles\)$/);
 });
 
-test("scheduled work bounds its inventory while keeping readable titles and timings, never ids, owners or task bodies", () => {
+test("scheduled work lists every title with a readable timing and no ids, owners or task bodies", () => {
   const crons: Cron[] = Array.from({ length: 15 }, (_, i) => ({
     id: `cron-${i}`,
     ownerScopeId: "personal:U1",
@@ -84,11 +84,9 @@ test("scheduled work bounds its inventory while keeping readable titles and timi
     schedule: { cron: "0 8 * * 1,3,5", timezone: "America/Los_Angeles" },
   }));
   const text = renderStandingObligations(crons, [], []);
-  assert.equal(text.split("\n").filter((line) => line.startsWith("- ")).length, 10);
+  assert.equal(text.split("\n").filter((line) => line.startsWith("- ")).length, 15);
   assert.match(text, /^- Task 3 — .*8:00 AM.*Mon.*Wed.*Fri/m);
-  assert.match(text, /^- Task 14 — /m);
   assert.doesNotMatch(text, /cron-1|private instructions|private-owner/);
-  assert.match(text, /…and 5 more — use cron action=list/);
   const fallback = renderStandingObligations(
     [{ ...crons[0]!, schedule: { cron: "0 8 * * FRI#L", timezone: "America/Los_Angeles" } }],
     [],
