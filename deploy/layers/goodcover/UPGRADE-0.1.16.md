@@ -25,8 +25,10 @@ touch them.
 - **Credentials in shared conversations.** Upstream removed the owner credential
   computer. A command in a shared conversation that names a private credential now
   runs on the turn's scratch computer. Goodcover lays the current organization skills
-  onto that scratch computer at the same paths the skill tool reports. Room and
-  personal skills are not copied there.
+  that ship files onto that scratch computer, at the same paths the skill tool
+  reports. Room and personal skills are not copied there. A skill that fails to copy
+  is recorded as `tree_materialize_failed`, and the computer stays usable. Background
+  job computers do not get these skills.
 - **Multitenancy.** Upstream adds `tenant_id`, row-level security and tenant-first
   keys to every table. A single tenant on the table-owner login keeps working with
   no new settings.
@@ -42,13 +44,16 @@ These Goodcover rules sit on top of upstream:
   the caller opts in. Goodcover's company ChatGPT refresh opts in, so each rotation
   is persisted and the next refresh does not reuse a spent token.
 - **Claude subscription.** When `CLAUDE_AUTH_CREDENTIAL` is configured, company Claude
-  traffic uses only that credential. A saved or environment Anthropic API key cannot
-  take it over. If the subscription yields no token, company Claude requests fail
-  closed.
-- **Fallbacks.** A turn or summary served by a subscription may fall back only to
-  another subscription route, never to a metered key. Upstream now also falls back on
-  `auth` and `model_budget` failures. ChatGPT HTTP failures are classified `unknown`
-  and do not fall back at all.
+  traffic uses only that credential, and the company subscription is reported as
+  Anthropic. A saved or environment Anthropic API key cannot take it over. If the
+  subscription yields no token, company Claude requests fail closed. This includes
+  an `ANTHROPIC_API_KEY` set in per-tenant settings.
+- **Fallbacks.** A company turn or summary served by a subscription may fall back
+  only to another subscription route, never to a metered key. Routes record this as
+  `org_subscription` billing, and fallback notes say "billed to the organization's
+  subscription". Upstream now also falls back on `auth` and `model_budget` failures.
+  ChatGPT HTTP failures are classified `unknown` and do not fall back at all. A
+  person's own accounts keep upstream's fallback.
 - **Browser inference.** Upstream now reports the company subscription provider as
   `anthropic` whenever a Claude credential is configured. Goodcover keeps company
   OpenAI browser models on the ChatGPT subscription and off the gateway.
@@ -61,13 +66,23 @@ away.
 ## Connectors
 
 - **Plain over MCP.** Persisted MCP `auth: "oauth"` records keep their owner-token
-  discovery and their shared or per-user calls. Per-user and `oauth` servers now
-  require HTTPS, with no loopback exception.
+  discovery and their shared or per-user calls, and an admin can re-save them. New
+  servers can no longer choose `oauth`; they must use `oauth-user`. Per-user and
+  `oauth` servers now require HTTPS, with no loopback exception.
+- **Retiring `oauth` (Dan to decide).** Plain is registered as a confidential
+  `client_secret_post` client, and upstream's `oauth-user` supports only public PKCE
+  clients. Retiring `oauth` therefore needs a public Plain client and a one-time
+  reconnect by every user. After that, the Plain record moves to `oauth-user`, and
+  `oauth`, `oauthPrincipalId` and the built-in `plain` provider can be deleted.
 - **OAuth host conflicts.** `oauth-user` hosts that overlap a built-in connector or
   another server still fail closed. Matching ignores case, a trailing dot and
   subdomains.
 - **Tool cap.** The MCP tool cap moved into the client. Goodcover keeps 128 tools per
-  server; upstream's is 64.
+  server, upstream 64, because Plain lists 77. A server that lists more is now
+  logged: `[mcp] <host> lists more than 128 tools`. Upstream's alternative is
+  `catalog: true` on the Plain record, which serves Plain through one search,
+  describe and invoke tool and would let this divergence go. That changes how the
+  agent reaches Plain, so it is Dan's decision.
 - **Approval default.** The new default approval policy, `annotations`, makes tools
   annotated as destructive wait for a person. Unattended crons that call such tools
   will pause. Choose the approval policy for the Plain server before rollout.
@@ -77,12 +92,15 @@ away.
 
 ## Configuration to prepare, not apply
 
-Remove these inert keys from the ops ConfigMaps:
+After hop 3, remove these keys, which the candidate ignores, from the ops ConfigMaps:
 
 - `qm-core`: `HARNESS`, `CLAUDE_MODEL`, `SESSION_STORE`, `RUN_STORE` and
   `FILES_DIRECT_UPLOADS_ENABLED`.
 - `qm-web-ui`: `ADMIN_BASE_PATH` and `ADMIN_ENABLED`.
 - `qm-portal`: `ADMIN_UPSTREAM`.
+
+Keep `SESSION_STORE=postgres` and `RUN_STORE=postgres` for the B1 and B2 jobs, which
+still read them. Keep `CONNECTOR_SECRET_KEY` and `ORG_ID` identical across every hop.
 
 Keep `CODEX_AUTH_CREDENTIAL`, `CLAUDE_AUTH_CREDENTIAL`, `PI_MODEL`, `PI_JUDGE_MODEL`
 and `MODEL_PROVIDER=openai` unchanged. The real `qm-core` ConfigMap, with synthetic
@@ -99,8 +117,9 @@ For the Kubernetes rollout:
 - Upgrade core before web-ui and portal. Both resolve the tenant from core on every
   request.
 - Leave the sandbox image alone. The MicroVM agent source moved to
-  `cli/templates/aws/microvm-agent` with identical content. The Goodcover archive
-  digest is unchanged (`8dec1e24…`), so MicroVM 4.0 stays.
+  `cli/templates/aws/microvm-agent`. Its `agent.mjs` and `Dockerfile` are
+  byte-identical to `f43507f4`'s, and the Goodcover wrapper is unchanged, so the
+  source-built archive inputs are unchanged and deployed MicroVM 4.0 stays.
 - Expect `memory vector index` errors every 30 seconds. Upstream now tries
   `CREATE EXTENSION vector` even without an embedding model, and GC4's stock
   Postgres 17 has no pgvector. The errors do not block boot.
@@ -129,15 +148,43 @@ configuration and the table-owner `DATABASE_URL`:
 1. **Hop 1.** Run B1's `node src/migrate-main.ts`. Then confirm the ledger contains
    `sessions/store/0046-spend-days-cron-rebuild` and
    `runs/store/0010-drop-turn-metrics`, and that `session_entries` is gone.
-2. **Hop 2.** Run B2's `node src/migrate-main.ts`. Then, with
-   `BACKGROUND_DEPLOYMENT_ID` unset and no runs queued, run B2's
-   `node src/runs/worker-main.ts` until `surfaces/0004-settled-runs-rewrite`
-   appears in the ledger, and stop it.
+2. **Hop 2.** Run B2's `node src/migrate-main.ts`. Confirm no runs are pending or
+   running, because the B2 worker starts draining them right after the rewrite.
+   Then run B2's `node src/runs/worker-main.ts` with `BACKGROUND_DEPLOYMENT_ID`
+   unset and `BACKGROUND_WORK_ENABLED=false`. Stop it once it logs `draining runs`
+   and `surfaces/0004-settled-runs-rewrite` is in the ledger. Without
+   `BACKGROUND_WORK_ENABLED=false`, B2 would start crons, wakes and deliveries on
+   upstream code, which has none of Goodcover's protections.
 3. **Hop 3.** Run this candidate's `node src/migrate-main.ts`, then start the
    candidate privately.
 
-If `surfaces/0005` reports rows in the older origin shapes, boot B2's worker once
-more and rerun hop 3.
+Before hop 3, run the row checks of `surfaces/0005-retired-origin-sweep` (in
+`src/surfaces/origin-migration.ts`) read-only, and continue only when none returns a
+row. If any does, repeat hop 2's worker step first. Do not rely on hop 3 to catch
+them: migrations run in id order, and most of hop 3 commits before `surfaces/0005`.
+If hop 3 fails there anyway, restore the backup. On first start, the candidate also
+delivers outbox rows left at cutover if they are less than six hours old.
+
+**Synthetic rehearsal.** All three hops were run on an isolated local Postgres
+holding synthetic Goodcover-shaped rows, starting from `f43507f4`'s own migrations
+and ending with this candidate's code:
+
+- **Hop 1** added 46 ledger ids. It copied the expected transcript entries into
+  `items`, dropped the legacy tables, and stripped harness IDs. Model, effort, fast
+  mode and `enabled: false` were kept.
+- **Hop 2** added 16 ids. Its worker recorded `surfaces/0004` about three seconds
+  after start, with no Slack or model credentials. It started no run, delivery or
+  cron.
+- **Hop 3** added 377 ids, then the candidate served `/healthz` and `/readyz`. The
+  `plain` MCP record kept `auth: "oauth"` and `oauthPrincipalId`, the paused cron
+  stayed paused, and keychain secrets still decrypted.
+- **Timing at scale:** with 605 sessions, 114k transcript entries and 6k runs (107 MB),
+  hop 1 took 22 seconds, and hops 2 and 3 about 4 seconds each.
+- **Direct boot:** booting v0.1.16 directly on the 0.1.15-shaped database failed at
+  `admin/audit-log/0003-tenants`, after committing 12 tenancy ledger ids.
+
+The rehearsal is evidence that the procedure works, not qualification of production
+data. Repeat it on a restored copy of production.
 
 What the hops change:
 
@@ -146,13 +193,14 @@ What the hops change:
     transaction, then drops the legacy history tables. Allow two to three times the
     transcript storage in free disk.
   - **Other drops.** It drops `turn_metrics`, `approved_harness_configs`,
-    `connector_status`, `pinned_skills` and `internal_member_overrides`.
+    `connector_status`, `pinned_skills` and `internal_member_overrides`, plus the
+    `session_llm_requests.request` column.
   - **Harness IDs.** It strips every saved harness ID. Model IDs, effort, fast mode,
     cron ownership, enabled state and schedules are kept.
   - **Recipient consent.** It strips `recipientConsent` from crons, webhooks and
     loops, so teammate messages that were pending or declined start delivering.
 - **Hop 2 (B2).**
-  - It drops `rate_limit_windows`.
+  - It drops `rate_limit_windows`, `tool_calls` and the `items_search` index.
   - It backfills session facts, and rewrites stored Slack origins and destinations.
   - It records `surfaces/0004`, but only during a worker or server boot.
     `migrate-main` does not record it.
@@ -163,6 +211,8 @@ What the hops change:
     conversation.
   - **Retired tables.** It drops 13 retired key-value tables.
   - **Deployment names.** It fails if two deployments share a name.
+  - **Cron history.** It strips any `fireLog` left in cron records. B2's boot has
+    already imported it.
 
 **No rollback after hop 1 can be image-only.** Old code cannot run on the migrated
 schema. Recovery means restoring the database to its pre-hop-1 backup, together with
@@ -195,7 +245,8 @@ application:
 7. **MCP servers.** Check `mcp_servers` for private or in-cluster URLs. Choose the
    Plain approval policy.
 8. **Plain tokens.** Confirm stored Plain connector tokens have host `mcp.plain.com`.
-9. **Rehearse.** Run all three hops on the copy. Time each one against the job
+9. **Rehearse.** Run all three hops on the copy, on stock Postgres 17 without
+   pgvector, as in production. Time each one against the job
    timeout. Record the per-hop ledger additions. Hop 2 must record `surfaces/0004`,
    and hop 3 must finish. Afterwards, confirm credential and grant counts are
    unchanged, the three paused crons are still paused, and the `plain` MCP record
@@ -214,9 +265,21 @@ application:
 4. **Run the hops.** Run hops 1 to 3 as separate jobs with no startup probe, as
    rehearsed. Check the ledger after each hop. Never edit or delete ledger entries.
 5. **Start privately.** Start the candidate privately with background work
-   disabled. Verify health, migration logs, one private ChatGPT-subscription turn and
-   one private Claude-subscription turn. Check that no OpenAI or Anthropic API key is
-   in use.
+   disabled. Verify health and the migration logs. Then verify:
+   - one private ChatGPT-subscription turn;
+   - one private Claude-subscription turn;
+   - one read-only Plain MCP call from each of those turns;
+   - a forced ChatGPT refresh that persists a rotated token;
+   - the `/settings` admin pages;
+   - no OpenAI or Anthropic API key in use.
+
+   Watch for these log lines:
+   - `[model] company ChatGPT auth … yielded no token`
+   - `[model] company Claude subscription credential … yielded no token`
+   - `[pi] fallback … skipped`
+   - `[swallowed] chatgpt: company oauth refresh`
+   - `[mcp] … lists more than 128 tools`
+
 6. **Resume.** Resume background work deliberately and watch Slack reconnect. Keep
    the three paused crons paused unless their permissions are reviewed.
 7. **Update ops last.** Update the image pins and ConfigMaps in ops in a separate
@@ -235,3 +298,16 @@ set. If anything beyond `0000-tenancy/*`, `0001-tenancy/*` and
 If a concurrent index build or lock timeout interrupts a hop, find the blocker in
 `pg_stat_activity` and rerun the hop. The runner drops invalid indexes and rebuilds
 them.
+
+## Goodcover divergences carried forward
+
+- **Deployed apps on the QM origin.** Dan authorized removing the deployed-app
+  browser sandbox on 2026-09-17; see `app-origin/README.md`. Apps proxied through
+  `/d/`, the admin deployment proxy and `/deployments/` therefore run on the QM origin
+  without a sandbox CSP, and can make authenticated same-origin requests as the
+  viewer. Upstream's documentation of sandboxed proxied HTML, including
+  `docs/porter.md`, does not apply to this fork.
+- **No age-based credential sweep.** Upstream deletes command credential directories
+  in `/tmp` after two hours. Goodcover removed that sweep because it could delete the
+  credentials of a command still running. A directory left behind by a crash remains
+  until that computer is replaced.

@@ -82,6 +82,11 @@ builder in ops remains the record of that release. New sandbox work belongs here
 
 ## Application builds and production versions
 
+`app-origin/`, `plain-oauth/` and `plain-tool-catalog/` record how the 0.1.11-era
+images were derived from older pins. Their behavior now lives in this source tree,
+and current releases build every service from source, so their patches and
+Dockerfiles are no longer a build path.
+
 `deployed-baseline.json` records the production pins at fork setup, including
 QM package 0.1.11, its source commit, and MicroVM version 4.0. It is historical;
 `ops.py images` reads the authoritative current pins from ops.
