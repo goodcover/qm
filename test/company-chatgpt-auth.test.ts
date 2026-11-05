@@ -59,9 +59,10 @@ function fakeKeychain(state: FakeKeychainState): Keychain {
       return [{ credentialId: state.meta.id, ownerId, service: state.meta.service, files: state.files }];
     },
     async updateFiles(
-      materialized: { ownerId: string; service: string; files: CredentialFile[] },
+      materialized: { ownerId: string; service: string; files: CredentialFile[]; writeback?: boolean },
       files: CredentialFile[],
     ) {
+      if (!materialized.writeback) return;
       state.saves.push({ ownerId: materialized.ownerId, service: materialized.service, files });
       state.files = files;
       state.meta = { ...state.meta, fingerprint: `f${state.saves.length}`, updatedAt: state.saves.length };

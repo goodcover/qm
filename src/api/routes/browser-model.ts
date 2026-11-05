@@ -1,4 +1,4 @@
-import { modelRequestOverrides, resolveModel } from "../../model/pi-models.ts";
+import { CODEX_SUBSCRIPTION_PROVIDER, modelRequestOverrides, resolveModel } from "../../model/pi-models.ts";
 import { gatewayRoot } from "../../model/provider-endpoints.ts";
 import { resolveBrowserModel } from "../../model/browser-model.ts";
 import { BrowserCompletionError, nativeBrowserCompletion } from "../../model/browser-completion.ts";
@@ -59,7 +59,7 @@ async function browserModel(ctx: ApiCtx): Promise<void> {
     const chatgptSubscription =
       selected.account === "company" &&
       deps.providerKeys?.codexOAuth === true &&
-      (subscriptionModel?.provider === "openai" || subscriptionModel?.provider === "openai-codex");
+      (subscriptionModel?.provider === "openai" || subscriptionModel?.provider === CODEX_SUBSCRIPTION_PROVIDER);
     const nativeVariant = Boolean(modelRequestOverrides(capability.browserModel));
     if (nativeVariant && selected.account === "company") await gateway?.refresh?.();
     if (selected.account !== "company" || !gateway || nativeVariant || chatgptSubscription) {

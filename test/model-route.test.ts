@@ -91,7 +91,7 @@ function compact(agent: ReturnType<typeof createAgent>, route: Partial<CompactIn
 function turn(agent: ReturnType<typeof createAgent>, modelId: string): Promise<unknown> {
   let seq = 0;
   return agent.runTurn({
-    session: { id: `route-turn-${modelId.replaceAll("/", "-")}` } as AgentTurnInput["session"],
+    session: { id: `route-turn-${modelId}` } as AgentTurnInput["session"],
     input: "hello",
     systemPrompt: "BASE",
     history: [],
@@ -267,13 +267,12 @@ test("a fallback that fails keeps the original refusal and says what happened to
   );
 });
 
-for (const [anthropic, fallbackModel, expectedHosts] of [
-  ["sk-ant-oat01-subscription", "gpt-6-astra", ["api.anthropic.com"]],
-  ["sk-ant-oat01-subscription", "codex/gpt-6-astra", ["api.anthropic.com", "chatgpt.com"]],
-  ["sk-ant-api03-metered", "gpt-6-astra", ["api.anthropic.com", "api.openai.com"]],
+for (const [account, anthropic, fallbackModel, expectedHosts] of [
+  ["subscription", "sk-ant-oat01-subscription", "gpt-6-astra", ["api.anthropic.com"]],
+  ["subscription", "sk-ant-oat01-subscription", "codex/gpt-6-astra", ["api.anthropic.com", "chatgpt.com"]],
+  ["metered", "sk-ant-api03-metered", "gpt-6-astra", ["api.anthropic.com", "api.openai.com"]],
 ] as const) {
-  const subscription = anthropic.includes("oat");
-  test(`a ${subscription ? "subscription" : "metered"} Claude turn ${expectedHosts.length > 1 ? "falls back" : "never falls back"} to ${fallbackModel}`, async () => {
+  test(`a ${account} Claude turn ${expectedHosts.length > 1 ? "falls back" : "never falls back"} to ${fallbackModel}`, async () => {
     const agent = createAgent({
       resolveProviderKeys: async () => ({ anthropic, openai: "sk-openai", "openai-codex": CHATGPT_LOGIN }),
       resolveFallbackRuntime: () => ({ modelId: fallbackModel }),

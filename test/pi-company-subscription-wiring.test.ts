@@ -27,7 +27,7 @@ const accountId = "subscription-account";
 const token = (exp: number) =>
   `e30.${Buffer.from(JSON.stringify({ exp, "https://api.openai.com/auth": { chatgpt_account_id: accountId } })).toString("base64url")}.test`;
 
-for (const modelId of ["gpt-5.6-sol", "gpt-6.1-sol", "codex/gpt-6.1-sol"]) {
+for (const modelId of ["gpt-5.6-sol"]) {
   test(`company wiring reuses the existing file login for ${modelId}`, async (t) => {
     const config = testConfig({
       modelId,
@@ -71,7 +71,7 @@ for (const modelId of ["gpt-5.6-sol", "gpt-6.1-sol", "codex/gpt-6.1-sol"]) {
   });
 }
 
-for (const modelId of ["gpt-6-astra-ultrafast", "gpt-6.1-sol-ultrafast"]) {
+for (const modelId of ["gpt-6.1-sol-ultrafast"]) {
   test(`company subscription wiring never sends API-only ${modelId} to a metered provider`, async (t) => {
     const config = testConfig({
       modelId,

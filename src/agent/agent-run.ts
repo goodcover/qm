@@ -60,7 +60,6 @@ import { providerTurnError } from "../model/provider-error.ts";
 import { asError, swallow, swallowAs } from "../util/errors.ts";
 import { startPhase } from "../../plugins/chassis/src/error-reporting.ts";
 import {
-  CODEX_SUBSCRIPTION_PROVIDER,
   DEFAULT_AGENT_MODEL_ID,
   auxiliaryModelFor,
   defaultModel,
@@ -78,8 +77,7 @@ import {
   type ModelGatewayTransportConfig,
   type ModelRequestPurpose,
 } from "../model/provider-endpoints.ts";
-import { modelBilling, routeLabel, type ModelRoute } from "../model/model-route.ts";
-import { isClaudeSubscriptionToken } from "../model/claude-subscription.ts";
+import { modelBilling, routeLabel, servedBySubscription, type ModelRoute } from "../model/model-route.ts";
 import {
   type Agent,
   type CompactInput,
@@ -879,7 +877,7 @@ export function createAgent(opts?: AgentOptions): Agent {
       model,
       keys,
       ...(gateway ? { gateway } : {}),
-      billing: modelBilling(!!modelGatewayRequest(gateway, model), !!personalKeys),
+      billing: modelBilling(!!modelGatewayRequest(gateway, model), !!personalKeys, servedBySubscription(model, keys)),
     };
   };
   const servable = (route: ModelRoute): ModelRoute | undefined =>
@@ -888,10 +886,6 @@ export function createAgent(opts?: AgentOptions): Agent {
     routeFor(session.runtime?.modelId ?? baseModelId(), session.providerKeys);
   const utilityRoute = async (modelId?: string) =>
     servable(await routeFor(modelId ?? auxiliaryModelFor(baseModelId())));
-  const subscriptionServed = (route: ModelRoute): boolean =>
-    route.billing !== "model_gateway" &&
-    (route.model.provider === CODEX_SUBSCRIPTION_PROVIDER ||
-      (route.model.provider === "anthropic" && isClaudeSubscriptionToken(route.keys.anthropic)));
   const fallbackRoute = async (
     from: ModelRoute,
     fromModelIds: ReadonlySet<string>,
@@ -903,9 +897,9 @@ export function createAgent(opts?: AgentOptions): Agent {
     if (fromModelIds.has(runtime.modelId) || fromModelIds.has(served) || !resolveModel(served, !providerKeys))
       return undefined;
     const route = servable(await routeFor(runtime.modelId, providerKeys));
-    if (route && subscriptionServed(from) && !subscriptionServed(route)) {
+    if (route && from.billing === "org_subscription" && route.billing !== "org_subscription") {
       console.error(
-        `[pi] fallback ${routeLabel(route)} skipped: ${routeLabel(from)} is subscription-served and may only fall back to another subscription`,
+        `[pi] fallback ${routeLabel(route)} skipped: ${routeLabel(from)} may only fall back to another subscription`,
       );
       return undefined;
     }

@@ -78,7 +78,6 @@ for (const gateway of [false, true]) {
       const url = String(input instanceof Request ? input.url : input);
       if (url === endpoint) return originalFetch(input, init);
       providerUrls.push(url);
-      assert.equal(new URL(url).hostname, "chatgpt.com");
       return Response.json({ error: { message: "offline subscription response" } }, { status: 400 });
     });
     const post = () =>
@@ -91,6 +90,7 @@ for (const gateway of [false, true]) {
     assert.equal(first.status, 502);
     await first.arrayBuffer();
     assert.ok(providerUrls.length > 0);
+    assert.ok(providerUrls.every((url) => new URL(url).hostname === "chatgpt.com"));
     await built.keychain!.remove(ownerId, credentialId);
     providerUrls.length = 0;
     const missing = await post();

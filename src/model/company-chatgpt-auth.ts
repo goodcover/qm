@@ -136,7 +136,7 @@ export function keychainCompanyChatGPTAuth(
         cached = {
           revision,
           found: bundle ? authFromFiles(bundle.files) : null,
-          ...(bundle ? { bundle: { ...bundle, kind: "file" as const } } : {}),
+          ...(bundle ? { bundle: { ...bundle, kind: "file" as const, writeback: true } } : {}),
         };
       }
       const { found, bundle } = cached;
@@ -145,7 +145,7 @@ export function keychainCompanyChatGPTAuth(
         auth: found.auth,
         async write(next) {
           await deps.keychain.updateFiles(
-            { ...bundle, writeback: true },
+            bundle,
             bundle.files.map((file) =>
               file.path === found.path
                 ? { ...file, contentBase64: Buffer.from(JSON.stringify(next), "utf8").toString("base64") }

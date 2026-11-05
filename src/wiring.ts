@@ -1440,6 +1440,10 @@ export function buildApp(
     if (!companyChatGPTAuth) return {};
     try {
       const token = await companyChatGPTAuth.accessToken();
+      if (!token)
+        console.error(
+          `[model] company ChatGPT auth (${companyChatGPTAuth.description}) yielded no token (missing, removed, or not a ChatGPT login file)`,
+        );
       return token ? { [CODEX_SUBSCRIPTION_PROVIDER]: token } : {};
     } catch (e) {
       console.error(`[model] company ChatGPT auth (${companyChatGPTAuth.description}) unreadable: ${errMessage(e)}`);
@@ -1470,8 +1474,7 @@ export function buildApp(
       resolveCompanySubscriptionKeys(),
     ]);
     const keys = { ...metered, ...claude, ...chatgpt };
-    if (companyClaudeAuthEnv && !claude.anthropic) delete keys.anthropic;
-    return keys;
+    return companyClaudeAuthEnv && !claude.anthropic ? { ...keys, anthropic: undefined } : keys;
   };
   const resolveBrowserCompanyKeys = async (includeSubscription = true): Promise<ProviderKeys> =>
     includeSubscription ? resolveCompanyProviderKeys() : resolveModelProviderKeys();

@@ -199,8 +199,7 @@ export function baseModelProviders(config: Config): ModelProviderAvailability | 
 }
 
 export function companySubscriptionAuth(config: Config): ModelProvider | undefined {
-  if (config.anthropicApiKey ? isClaudeSubscriptionToken(config.anthropicApiKey) : config.claudeAuthCredential)
-    return "anthropic";
+  if (config.claudeAuthCredential || isClaudeSubscriptionToken(config.anthropicApiKey)) return "anthropic";
   if (config.codexAuthCredential) return "openai";
   return undefined;
 }
