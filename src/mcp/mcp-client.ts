@@ -144,6 +144,7 @@ export function createMcpClient(opts: { url: string; auth: McpAuth; fetch?: Addr
         "tools/list",
         async (client) => {
           const tools: McpRemoteTool[] = [];
+          const maxTools = opts?.maxTools ?? MAX_TOOLS;
           let cursor: string | undefined;
           do {
             const page = await client.listTools(cursor === undefined ? undefined : { cursor });
@@ -155,10 +156,14 @@ export function createMcpClient(opts: { url: string; auth: McpAuth; fetch?: Addr
                 ...(t.annotations ? { annotations: t.annotations } : {}),
               });
             cursor = page.nextCursor;
-          } while (cursor && tools.length < (opts?.maxTools ?? MAX_TOOLS));
+          } while (cursor && tools.length < maxTools);
+          if (cursor || tools.length > maxTools)
+            console.error(
+              `[mcp] ${endpoint.host} lists more than ${maxTools} tools; only the first ${maxTools} are available`,
+            );
           const about = (client.getServerVersion()?.description || client.getInstructions() || "").trim();
           return {
-            tools: tools.slice(0, opts?.maxTools ?? MAX_TOOLS),
+            tools: tools.slice(0, maxTools),
             ...(about ? { about } : {}),
           };
         },

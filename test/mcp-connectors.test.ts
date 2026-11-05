@@ -58,14 +58,52 @@ test("mcp client keeps the server's own description, else its instructions", asy
   assert.equal(about, "Call search first.\nThen update.");
 });
 
-test("mcp client caps a server's tool list", async (t) => {
+test("mcp client caps a server's tool list and says what it cut", async (t) => {
   const tools = Array.from({ length: 200 }, (_, i) => ({ name: `t${i}`, inputSchema: { type: "object" as const } }));
   const mcp = await startMcpTestServer(t, { tools, pageSize: 40 });
+  const logged = t.mock.method(console, "error", () => {});
   const listed = (await createMcpClient({ fetch: loopbackFetch, url: mcp.url, auth: { mode: "none" } }).listTools())
     .tools;
   assert.equal(listed.length, 128);
   assert.equal(listed.at(-1)?.name, "t127");
   assert.equal(mcp.requests.filter((r) => r.rpc === "tools/list").length, 4);
+  assert.equal(logged.mock.callCount(), 1);
+  assert.match(String(logged.mock.calls[0]!.arguments[0]), /more than 128 tools; only the first 128 are available/);
+});
+
+test("draft-7 definitions in an MCP tool schema reach the model intact and validate arguments", async (t) => {
+  const { validateToolArguments } = await import("@earendil-works/pi-ai");
+  const inputSchema = {
+    type: "object" as const,
+    properties: { customerId: { type: "string" }, filters: { $ref: "#/definitions/Filters" } },
+    required: ["customerId"],
+    definitions: {
+      Filters: { type: "object", properties: { status: { $ref: "#/definitions/Status" } } },
+      Status: { type: "string", enum: ["TODO", "DONE"] },
+    },
+  };
+  const mcp = await startMcpTestServer(t, { tools: [{ name: "searchThreads", description: "Search", inputSchema }] });
+  const store = createMcpServerStore(testMap<McpServer>());
+  const service = createMcpToolService({ fetch: loopbackFetch, servers: store });
+  t.after(() => service.close());
+  await store.put(server({ url: mcp.url }));
+  await service.refresh();
+  const parameters = (await service.toolDefs()).find((d) => d.name === "crm_searchThreads")!.inputSchema;
+  assert.deepEqual(parameters.definitions, inputSchema.definitions);
+  const tool = { name: "crm_searchThreads", description: "Search", parameters: parameters as never };
+  const valid = { customerId: "c1", filters: { status: "TODO" } };
+  assert.deepEqual(
+    validateToolArguments(tool, { type: "toolCall", id: "1", name: tool.name, arguments: valid }),
+    valid,
+  );
+  assert.throws(() =>
+    validateToolArguments(tool, {
+      type: "toolCall",
+      id: "2",
+      name: tool.name,
+      arguments: { customerId: "c1", filters: { status: "NOPE" } },
+    }),
+  );
 });
 
 test("mcp client surfaces tool errors and protocol errors", async (t) => {
@@ -582,7 +620,7 @@ for (const credentialHost of ["API.GITHUB.COM", "api.github.com.", "tools.exampl
     assert.equal(await service.call("crm_query", {}, "alice"), "ran query");
     assert.equal(tokenReads, 1);
     await store.put({ ...config, credentialHost });
-    await assert.rejects(service.call("crm_query", {}, "alice"), /conflicting OAuth|unknown MCP tool/);
+    await assert.rejects(service.call("crm_query", {}, "alice"), /conflicting OAuth credential host/);
     await service.refresh();
     assert.deepEqual(
       (await service.toolDefs()).filter((tool) => tool.serverId === "crm"),

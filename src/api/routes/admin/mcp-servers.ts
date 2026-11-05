@@ -92,6 +92,12 @@ export async function putMcpServer(ctx: ApiCtx): Promise<void> {
     return sendJson(ctx.res, 400, { error: "bad_request", message: `auth must be one of ${AUTH_MODES.join(", ")}` });
   }
   const existing = await ctx.deps.mcpServers.get(id);
+  if (auth === "oauth" && existing?.auth !== "oauth") {
+    return sendJson(ctx.res, 400, {
+      error: "bad_request",
+      message: "auth oauth is kept only for servers that already use it; register new servers with oauth-user",
+    });
+  }
   const approval = b.approval ?? existing?.approval ?? "annotations";
   if (!APPROVAL_POLICIES.includes(approval)) {
     return sendJson(ctx.res, 400, {

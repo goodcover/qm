@@ -125,6 +125,19 @@ test("MCP admin validates and preserves credential scope, without returning secr
   );
   assert.deepEqual([(await store.get("crm"))?.catalog, (await store.get("crm"))?.attestActor], [true, true]);
   assert.equal((await put({ catalog: false, attestActor: false })).status, 200);
+  assert.equal(
+    (await put({ auth: "oauth", credentialScope: "per-user", url: "https://mcp.plain.com/mcp" })).status,
+    400,
+    "a server that does not already use the legacy oauth mode cannot adopt it",
+  );
+  await store.put({
+    ...(await store.get("crm"))!,
+    auth: "oauth",
+    url: "https://mcp.plain.com/mcp",
+    credentialScope: "per-user",
+    credentialHost: "mcp.plain.com",
+    oauthPrincipalId: "owner-bob",
+  });
   const oauth = await put({
     auth: "oauth",
     credentialScope: "per-user",
@@ -134,7 +147,7 @@ test("MCP admin validates and preserves credential scope, without returning secr
   assert.equal(oauth.status, 200);
   const oauthServer = ((await oauth.json()) as { server: McpServer & { hasBearerToken: boolean } }).server;
   assert.equal(oauthServer.credentialHost, "mcp.plain.com");
-  assert.equal(oauthServer.oauthPrincipalId, "admin-alice");
+  assert.equal(oauthServer.oauthPrincipalId, "owner-bob");
   assert.equal(oauthServer.hasBearerToken, false);
   assert.equal(
     (await put({ auth: "oauth", credentialHost: "mcp.plain.com", url: "https://evil.example/mcp" })).status,

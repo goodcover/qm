@@ -12,6 +12,7 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { perTenant } from "../tenants/context.ts";
 import { createMcpClient, mcpResultText, type McpAuth, type McpClient, type McpListing } from "./mcp-client.ts";
 import type { McpServer, McpServerStore } from "./mcp-server-store.ts";
+import { hostMatches } from "../resolution/egress-policy.ts";
 import { attestedPerson } from "../directory/person.ts";
 import type { AddressFetch } from "../util/network.ts";
 
@@ -45,12 +46,10 @@ function mcpToolNeedsApproval(
 }
 
 export function mcpOAuthHostConflict(server: Pick<McpServer, "id" | "credentialHost">, servers: McpServer[]): boolean {
-  const host = server.credentialHost?.toLowerCase().replace(/\.+$/, "");
-  if (!host || /[\s/\\?#@]/.test(host) || PROVIDERS[server.id]) return true;
-  const overlaps = (other: string) => {
-    const normalized = other.toLowerCase().replace(/\.+$/, "");
-    return host === normalized || host.endsWith(`.${normalized}`) || normalized.endsWith(`.${host}`);
-  };
+  const host = server.credentialHost;
+  if (PROVIDERS[server.id]) return true;
+  if (!host) return false;
+  const overlaps = (other: string) => hostMatches(host, other) || hostMatches(other, host);
   return (
     Object.values(PROVIDERS).some((provider) => provider.hosts.some(overlaps)) ||
     servers.some((other) => other.id !== server.id && !!other.credentialHost && overlaps(other.credentialHost))
@@ -385,7 +384,9 @@ export function createMcpToolService(opts: {
     state.catalogs.clear();
     const all = await opts.servers.list();
     setPublicOAuthClients(mcpPublicOAuthClients(all));
-    const servers = all.filter((s) => s.enabled && (s.auth !== "oauth-user" || !mcpOAuthHostConflict(s, all)));
+    const conflicting = all.filter((s) => s.enabled && s.auth === "oauth-user" && mcpOAuthHostConflict(s, all));
+    for (const s of conflicting) record("list", s.id, "error: conflicting OAuth credential host");
+    const servers = all.filter((s) => s.enabled && !conflicting.includes(s));
     const next = (await Promise.all(servers.map(serverTools))).flat();
     const seen = new Set<string>();
     state.snapshot = next.filter((t) => (seen.has(t.name) ? false : (seen.add(t.name), true)));

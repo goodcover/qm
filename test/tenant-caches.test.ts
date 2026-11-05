@@ -188,7 +188,6 @@ function signInServer(id: string): McpServer {
     name: id,
     url: `https://${id}.example/mcp`,
     auth: "oauth-user",
-    credentialHost: `${id}.example`,
     tools: [{ name: "lookup", description: "Look something up", inputSchema: { type: "object" } }],
     readOnly: true,
     enabled: true,
