@@ -1,26 +1,24 @@
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingHttpHeaders } from "node:http";
 import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { mock, test, type TestContext } from "node:test";
-import type { ChildProcess } from "node:child_process";
 import type { Options } from "@anthropic-ai/claude-agent-sdk";
 import type { Message } from "@earendil-works/pi-ai";
+import { sleep } from "../src/util/async.ts";
 import {
   CLAUDE_CODE_TEST_SYSTEM,
   claudeCodeSession,
   lastAssistant,
   lookupTool,
 } from "./support/claude-code-session.ts";
-import { processAlive } from "./support/fake-claude-code.ts";
+import { lastUser, type Block } from "./support/fake-claude-code.ts";
 import { anthropicMessage } from "./support/gateway-stream.ts";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 
 const TOKEN = "sk-ant-oat01-binary-contract-test";
 
-type Block = Record<string, unknown> & { type: string };
 type WireMessage = { role: string; content: string | Block[] };
 interface Captured {
   path: string;
@@ -42,17 +40,26 @@ function reply(model: string, block: Block, stop: string): string {
   });
 }
 
-const RATE_LIMIT_HEADERS = {
-  "anthropic-ratelimit-unified-status": "allowed",
+const OVERAGE_IN_USE = {
+  "anthropic-ratelimit-unified-status": "rejected",
   "anthropic-ratelimit-unified-reset": String(Math.floor(Date.now() / 1000) + 3600),
   "anthropic-ratelimit-unified-representative-claim": "five_hour",
-  "anthropic-ratelimit-unified-5h-utilization": "0.12",
-  "anthropic-ratelimit-unified-overage-status": "rejected",
-  "anthropic-ratelimit-unified-overage-disabled-reason": "org_level_disabled",
+  "anthropic-ratelimit-unified-overage-status": "allowed",
+  "anthropic-ratelimit-unified-overage-in-use": "true",
 };
 
 function systemText(call: Captured): string {
   return (call.body.system ?? []).map((block) => block.text).join("\n");
+}
+
+function withoutCacheMarks(call: Captured): WireMessage[] {
+  return (call.body.messages ?? []).map((message) => ({
+    role: message.role,
+    content:
+      typeof message.content === "string"
+        ? message.content
+        : message.content.map(({ cache_control: _cache, ...block }) => block as Block),
+  }));
 }
 
 function conversation(call: Captured): Array<{ role: string; content: Block[] }> {
@@ -79,7 +86,18 @@ function isTurn(call: Captured): boolean {
   return systemText(call).includes(CLAUDE_CODE_TEST_SYSTEM);
 }
 
-async function mockMessagesApi(t: TestContext, hang = false) {
+function running(options: Options): boolean {
+  const session = String(options.sessionId ?? options.resume);
+  return readdirSync("/proc").some((pid) => {
+    try {
+      return /^\d+$/.test(pid) && readFileSync(`/proc/${pid}/cmdline`, "utf8").includes(session);
+    } catch {
+      return false;
+    }
+  });
+}
+
+async function mockMessagesApi(t: TestContext, { hang = false, headers = {}, alwaysCallTool = false } = {}) {
   const captured: Captured[] = [];
   const server = createServer((req, res) => {
     let raw = "";
@@ -98,11 +116,10 @@ async function mockMessagesApi(t: TestContext, hang = false) {
       }
       if (hang) return;
       const model = String(call.body.model);
-      res.writeHead(200, { "content-type": "text/event-stream", ...RATE_LIMIT_HEADERS });
+      res.writeHead(200, { "content-type": "text/event-stream", ...headers });
       if (!isTurn(call)) return res.end(reply(model, { type: "text", text: "side request" }, "end_turn"));
-      const lastUser = conversation(call).findLast((message) => message.role === "user")!;
-      const result = lastUser.content.find((block) => block.type === "tool_result");
-      if (!result)
+      const result = lastUser({ messages: conversation(call) }).find((block) => block.type === "tool_result");
+      if (!result || alwaysCallTool)
         return res.end(
           reply(
             model,
@@ -125,35 +142,26 @@ async function mockMessagesApi(t: TestContext, hang = false) {
 async function pointClaudeCodeAt(t: TestContext, url: string) {
   const real = await import("@anthropic-ai/claude-agent-sdk");
   const spawned: Options[] = [];
-  const children: ChildProcess[] = [];
   const mocked = mock.module("@anthropic-ai/claude-agent-sdk", {
     namedExports: {
       ...real,
       query: ({ prompt, options }: { prompt: AsyncIterable<never>; options: Options }) => {
         spawned.push(options);
-        const spawn = options.spawnClaudeCodeProcess!;
-        return real.query({
-          prompt,
-          options: {
-            ...options,
-            env: { ...options.env, ANTHROPIC_BASE_URL: url },
-            spawnClaudeCodeProcess: (spawnOptions) => {
-              const child = spawn(spawnOptions);
-              children.push(child as unknown as ChildProcess);
-              return child;
-            },
-          },
-        });
+        return real.query({ prompt, options: { ...options, env: { ...options.env, ANTHROPIC_BASE_URL: url } } });
       },
     },
   });
   t.after(() => mocked.restore());
-  return { spawned, children };
+  return spawned;
+}
+
+function cleanedUp(spawned: readonly Options[]): boolean {
+  return spawned.every((options) => !running(options) && !existsSync(String(options.env?.CLAUDE_CONFIG_DIR)));
 }
 
 test("the bundled Claude Code binary serves QM tool turns with only QM's tools and a faithful history", async (t) => {
   const api = await mockMessagesApi(t);
-  const sdk = await pointClaudeCodeAt(t, api.url);
+  const spawned = await pointClaudeCodeAt(t, api.url);
   const executed: string[] = [];
   const description = `${"D".repeat(6000)} end of description`;
   const tools = [lookupTool(executed), { ...lookupTool([]), name: "long_doc", description }];
@@ -161,16 +169,11 @@ test("the bundled Claude Code binary serves QM tool turns with only QM's tools a
   await first.session.prompt("Compare alpha");
   await first.close();
   const live = api.captured.filter(isTurn);
-  t.diagnostic(`paths: ${api.captured.map((call) => call.path).join(", ")}`);
-  t.diagnostic(`user-agent: ${String(live[0]?.headers["user-agent"])}`);
-  t.diagnostic(
-    `system blocks: ${JSON.stringify((live[0]?.body.system ?? []).map((block) => block.text.slice(0, 80)))}`,
-  );
-  t.diagnostic(`claude code reminder: ${JSON.stringify(environmentReminder(live[0]!))}`);
   assert.equal(lastAssistant(first.session).stopReason, "stop", JSON.stringify(lastAssistant(first.session)));
   assert.deepEqual(executed, ["alpha"]);
   assert.deepEqual(lastAssistant(first.session).content, [{ type: "text", text: "done after record alpha" }]);
   assert.equal(live.length, 2, "one tool step and one closing step");
+  assert.equal(api.captured.length, live.length, "Claude Code made no request of its own");
   for (const call of live) {
     assert.equal(call.headers.authorization, `Bearer ${TOKEN}`);
     assert.equal(call.headers["x-api-key"], undefined);
@@ -185,53 +188,43 @@ test("the bundled Claude Code binary serves QM tool turns with only QM's tools a
     assert.equal(offered.get("mcp__qm__long_doc"), description, "a long tool description arrives whole");
     assert.ok(!environmentReminder(call).includes("<total_tokens>"), "no per-step token countdown");
   }
-  assert.ok(
-    sdk.children.every((child) => !processAlive(child)),
-    "every Claude Code process exited",
-  );
-  assert.ok(sdk.spawned.every((options) => !existsSync(String(options.env?.CLAUDE_CONFIG_DIR))));
+  assert.ok(cleanedUp(spawned), "every Claude Code process exited and its directory is gone");
 
   api.captured.length = 0;
   const second = await claudeCodeSession({ anthropic: TOKEN }, tools, [...first.session.messages] as Message[]);
   await second.session.prompt("And again?");
   await second.close();
   const resumed = api.captured.find(isTurn)!;
-  const before = conversation(live[1]!);
-  const after = conversation(resumed);
+  const before = withoutCacheMarks(live[1]!);
+  const after = withoutCacheMarks(resumed);
   assert.deepEqual(
     after.slice(0, before.length),
     before,
-    "the imported history is the conversation Claude Code sent live",
+    "the next turn's request starts with the previous request byte for byte, so its prompt cache is read",
   );
   assert.deepEqual(
-    after.slice(before.length).map((message) => [message.role, message.content.map((block) => block.text)]),
+    conversation(resumed)
+      .slice(conversation(live[1]!).length)
+      .map((message) => [message.role, message.content.map((block) => block.text)]),
     [
       ["assistant", ["done after record alpha"]],
       ["user", ["And again?"]],
     ],
   );
-  assert.equal(
-    environmentReminder(resumed),
-    environmentReminder(live[0]!),
-    "Claude Code's own reminder is identical across queries",
-  );
+  assert.ok(cleanedUp(spawned));
 });
 
 test("aborting a turn kills the real Claude Code process mid-request", async (t) => {
-  const api = await mockMessagesApi(t, true);
-  const sdk = await pointClaudeCodeAt(t, api.url);
+  const api = await mockMessagesApi(t, { hang: true });
+  const spawned = await pointClaudeCodeAt(t, api.url);
   const { session, close } = await claudeCodeSession({ anthropic: TOKEN }, [lookupTool([])]);
   const prompting = session.prompt("this request never answers");
-  for (let i = 0; i < 400 && !api.captured.some((call) => call.path === "/v1/messages"); i++)
-    await new Promise((resolve) => setTimeout(resolve, 25));
-  const child = sdk.children[0];
-  assert.ok(processAlive(child), "Claude Code is running and waiting on the API");
+  for (let i = 0; i < 400 && !api.captured.some((call) => call.path === "/v1/messages"); i++) await sleep(25);
+  assert.ok(running(spawned[0]!), "Claude Code is running and waiting on the API");
   await session.abort();
   await prompting.catch(() => undefined);
   await close();
-  for (let i = 0; i < 400 && processAlive(child); i++) await new Promise((resolve) => setTimeout(resolve, 25));
-  assert.ok(!processAlive(child));
-  assert.ok(!existsSync(String(sdk.spawned[0]!.env?.CLAUDE_CONFIG_DIR)));
+  assert.ok(cleanedUp(spawned), "the real Claude Code process is gone and its directory removed once QM closes");
   assert.equal(lastAssistant(session).stopReason, "aborted");
 });
 
@@ -241,10 +234,7 @@ test("text a person types reaches the real binary verbatim: no slash commands, n
   const work = join(tmpdir(), "qm-claude-code-cwd");
   mkdirSync(join(work, ".claude"), { recursive: true });
   writeFileSync(join(work, "CLAUDE.md"), "PLANTED-CLAUDE-MD");
-  writeFileSync(
-    join(work, ".claude", "settings.json"),
-    JSON.stringify({ env: { PLANTED_SETTING: "1" }, model: "claude-haiku-4-5" }),
-  );
+  writeFileSync(join(work, ".claude", "settings.json"), JSON.stringify({ model: "claude-haiku-4-5" }));
   writeFileSync(join(work, ".mcp.json"), JSON.stringify({ mcpServers: { planted: { command: "/bin/false" } } }));
   t.after(() => {
     rmSync(join(work, "CLAUDE.md"), { force: true });
@@ -270,4 +260,20 @@ test("text a person types reaches the real binary verbatim: no slash commands, n
     ["mcp__qm__lookup"],
     "a planted .mcp.json added no tools",
   );
+});
+
+test("Claude reporting extra usage in use stops the turn through the real binary", async (t) => {
+  const api = await mockMessagesApi(t, { headers: OVERAGE_IN_USE, alwaysCallTool: true });
+  const spawned = await pointClaudeCodeAt(t, api.url);
+  const { session, close } = await claudeCodeSession({ anthropic: TOKEN }, [lookupTool([])]);
+  await session.prompt("Compare alpha").catch(() => undefined);
+  await close();
+  const failed = lastAssistant(session);
+  assert.equal(failed.stopReason, "error");
+  assert.equal(failed.providerError?.code, "overage_in_use", failed.errorMessage);
+  assert.ok(
+    api.captured.filter(isTurn).length <= 2,
+    `the query stops at the first overage report; only a request already in flight can follow it (saw ${api.captured.filter(isTurn).length})`,
+  );
+  assert.ok(cleanedUp(spawned));
 });

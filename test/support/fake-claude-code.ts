@@ -1,7 +1,7 @@
+import type { ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import type { ChildProcess } from "node:child_process";
 import { mock } from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
@@ -16,8 +16,6 @@ export interface Turn {
 }
 
 export interface FakeRequest {
-  call: FakeCall;
-  system: string;
   messages: Turn[];
   tools: string[];
 }
@@ -196,16 +194,17 @@ export function fakeClaudeCode(model: Model, tweak: Partial<Pick<FakeCall, "init
     };
     const drain = (): SDKUserMessage[] => inbox.splice(0);
 
+    const client = new Client({ name: "fake-claude-code", version: "0" });
+
     async function* run(): AsyncGenerator<SDKMessage> {
       call.child = options.spawnClaudeCodeProcess!({
         command: process.execPath,
         args: ["-e", "setInterval(() => {}, 1000)"],
         cwd: options.cwd!,
         env: options.env as Record<string, string>,
-        signal: new AbortController().signal,
+        signal: options.abortController!.signal,
       }) as unknown as ChildProcess;
       const server = (options.mcpServers?.qm as { instance?: McpServer } | undefined)?.instance;
-      const client = new Client({ name: "fake-claude-code", version: "0" });
       if (server) {
         const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
         await server.connect(serverSide);
@@ -228,12 +227,7 @@ export function fakeClaudeCode(model: Model, tweak: Partial<Pick<FakeCall, "init
       if (!first) return;
       conversation.push({ role: "user", content: first.message.content as unknown as Block[] });
       for (;;) {
-        const reply = await model({
-          call,
-          system: String(options.systemPrompt ?? ""),
-          messages: conversation,
-          tools: offered,
-        });
+        const reply = await model({ messages: conversation, tools: offered });
         if (reply.rateLimit)
           yield {
             type: "rate_limit_event",
@@ -242,9 +236,8 @@ export function fakeClaudeCode(model: Model, tweak: Partial<Pick<FakeCall, "init
             session_id: "fake",
           } as unknown as SDKMessage;
         if (reply.endWithoutResult) {
-          call.child?.kill("SIGKILL");
-          await new Promise((resolve) => call.child?.once("exit", resolve));
-          return;
+          await stopChild("SIGKILL");
+          throw new Error("Claude Code process terminated by signal SIGKILL");
         }
         if (reply.error) {
           yield {
@@ -309,12 +302,23 @@ export function fakeClaudeCode(model: Model, tweak: Partial<Pick<FakeCall, "init
       }
     }
 
+    async function stopChild(signal: NodeJS.Signals): Promise<void> {
+      const child = call.child;
+      if (!processAlive(child)) return;
+      const exited = new Promise((resolve) => child!.once("exit", resolve));
+      child!.kill(signal);
+      await exited;
+    }
+
     const generator = run();
+    const finish = generator.return.bind(generator);
     return Object.assign(generator, {
-      close() {
+      async return(value: undefined): Promise<IteratorResult<SDKMessage, void>> {
         call.closed = true;
-        call.child?.kill("SIGTERM");
-        void generator.return(undefined);
+        await stopChild("SIGTERM");
+        await client.close();
+        void finish(value);
+        return { done: true, value };
       },
       async interrupt() {},
     });
@@ -342,7 +346,7 @@ export async function installFakeClaudeCode(
   };
 }
 
-export function lastUser(request: Pick<FakeRequest, "messages">): Block[] {
+export function lastUser(request: { messages: ReadonlyArray<{ role: string; content: Block[] }> }): Block[] {
   return request.messages.findLast((message) => message.role === "user")?.content ?? [];
 }
 

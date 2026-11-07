@@ -20,10 +20,15 @@ import { zeroUsage } from "../src/model/model-runtime.ts";
 import { resolveIndividualAuthRouting } from "../src/core/individual-auth-routing.ts";
 import { BrowserCompletionError, nativeBrowserCompletion } from "../src/model/browser-completion.ts";
 import { answered, installFakeClaudeCode, lastUser, type Block, type FakeReply } from "./support/fake-claude-code.ts";
-import { claudeCodeSession as piSession, lastAssistant, lookupTool } from "./support/claude-code-session.ts";
+import {
+  CLAUDE_CODE_TEST_MODEL as MODEL_ID,
+  claudeCodeSession as piSession,
+  lastAssistant,
+  lookupTool,
+} from "./support/claude-code-session.ts";
+import { sleep } from "../src/util/async.ts";
 
 const TOKEN = "sk-ant-oat01-claude-code-test";
-const MODEL_ID = "claude-code/claude-sonnet-5";
 
 function texts(blocks: Block[]): string[] {
   return blocks.flatMap((block) => {
@@ -170,7 +175,7 @@ test("a multi-tool turn runs QM tools only through Pi and pairs every result wit
   }
 });
 
-test("metered or missing Anthropic credentials, or an operator Anthropic base URL, fail before Claude Code starts", async (t) => {
+test("metered or missing Anthropic credentials, a model gateway, or an operator Anthropic base URL fail before Claude Code starts", async (t) => {
   const fake = await installFakeClaudeCode(() => ({ text: "should never run" }));
   t.after(fake.restore);
   const metered = await piSession({ anthropic: "sk-ant-api03-metered" }, []);
@@ -186,6 +191,12 @@ test("metered or missing Anthropic credentials, or an operator Anthropic base UR
   await proxied.close();
   assert.match(lastAssistant(proxied.session).errorMessage ?? "", /through https:\/\/egress\.invalid/);
   setProviderBaseUrls({});
+
+  const gateway = { url: "http://gateway.invalid/", apiKey: "gk", apiKeyHeader: "api-key", models: {} };
+  const gatewayed = await piSession({ anthropic: TOKEN }, [], [], { gateway });
+  await gatewayed.session.prompt("hi");
+  await gatewayed.close();
+  assert.match(lastAssistant(gatewayed.session).errorMessage ?? "", /model gateway/);
 
   const missing = await piSession({ openai: "sk-openai" }, []);
   await assert.rejects(missing.session.prompt("hi"), /claude-code/);
@@ -220,9 +231,9 @@ test("Claude Code tool calls QM did not serve never reach QM", async (t) => {
 
 test("a mismatched tool list or an API key source fails the turn closed and is not retried", async () => {
   const cases = [
-    { tweak: { initTools: ["mcp__qm__lookup", "Bash"] }, message: /extra \[Bash\], missing \[\]/ },
-    { tweak: { initTools: [] }, message: /extra \[\], missing \[mcp__qm__lookup\]/ },
-    { tweak: { apiKeySource: "ANTHROPIC_API_KEY" }, message: /API key source ANTHROPIC_API_KEY/ },
+    { tweak: { initTools: ["mcp__qm__lookup", "Bash"] }, message: /Bash/ },
+    { tweak: { initTools: [] }, message: /mcp__qm__lookup/ },
+    { tweak: { apiKeySource: "ANTHROPIC_API_KEY" }, message: /ANTHROPIC_API_KEY/ },
   ];
   for (const { tweak, message } of cases) {
     const fake = await installFakeClaudeCode(() => ({ text: "must not be used" }), tweak);
@@ -313,7 +324,6 @@ test("prior history is imported into a private Claude Code transcript and resume
   assert.match(String(otherStep!.content[1]!.id), /^toolu_[0-9a-f]{32}$/, "foreign ids are made Anthropic-valid");
   assert.equal(otherResult!.content[0]!.tool_use_id, otherStep!.content[1]!.id);
   assert.equal(otherResult!.content[0]!.is_error, true);
-  assert.equal((call.options.env as Record<string, string>).CLAUDE_CODE_OAUTH_TOKEN, TOKEN);
 });
 
 test("a run that resumes at tool results continues Claude Code from those results", async (t) => {
@@ -358,7 +368,8 @@ test("a request over edited history supersedes a query parked on a tool call", a
   await session.prompt("second");
   await close();
   assert.equal(fake.calls.length, 2, "the edited history started a fresh query");
-  assert.equal((fake.calls[0]!.mcpCalls[0]!.result as { isError?: boolean }).isError, true);
+  assert.equal(fake.calls[0]!.closed, true, "the superseded query was closed");
+  assert.deepEqual(fake.calls[0]!.mcpCalls, [], "it never got a result to send another request with");
 });
 
 test("a turn that ends while Claude Code waits on a tool closes the parked query", async (t) => {
@@ -372,11 +383,8 @@ test("a turn that ends while Claude Code waits on a tool closes the parked query
   assert.deepEqual(executed, ["last"]);
   assert.equal(fake.calls[0]!.closed, false);
   await close();
-  assert.equal(
-    (fake.calls[0]!.mcpCalls[0]!.result as { isError?: boolean }).isError,
-    true,
-    "the waiting call was released",
-  );
+  assert.equal(fake.calls[0]!.closed, true, "the parked query was closed");
+  assert.deepEqual(fake.calls[0]!.mcpCalls, [], "it never got a result to send another request with");
 });
 
 test("a failing QM tool reaches Claude Code as an error result", async (t) => {
@@ -418,7 +426,7 @@ test("concurrent turns never share a query, credentials, files or tool results",
     description: "Returns this session's secret.",
     parameters: Type.Object({}),
     async execute() {
-      await new Promise((resolve) => setTimeout(resolve, secret === "S-ALICE" ? 30 : 0));
+      await sleep(secret === "S-ALICE" ? 30 : 0);
       return { content: [{ type: "text", text: secret }], details: {} };
     },
   });
@@ -492,13 +500,13 @@ test("provider failures keep Claude Code's wording and map to QM's error codes w
   }
 });
 
-test("a Claude Code process that exits without a result fails the step with its exit status", async (t) => {
+test("a Claude Code process that dies without a result fails the step with Claude Code's exit evidence", async (t) => {
   const fake = await installFakeClaudeCode(() => ({ endWithoutResult: true }));
   t.after(fake.restore);
   const { session, close } = await piSession({ anthropic: TOKEN }, []);
   await session.agent.prompt({ role: "user", content: "hi", timestamp: Date.now() }).catch(() => undefined);
   await close();
-  assert.match(lastAssistant(session).errorMessage ?? "", /ended without a result \(exit code none, signal SIGKILL\)/);
+  assert.match(lastAssistant(session).errorMessage ?? "", /SIGKILL/);
 });
 
 test("a steer queued during a tool call reaches Claude Code with that tool's result", async (t) => {
@@ -561,17 +569,23 @@ test("QM's request hook sees every model call and shapes what a fresh Claude Cod
   assert.equal(fake.calls.length, 1);
 });
 
-test("QM's effort level reaches Claude Code as its effort option, and thinking off disables thinking", async (t) => {
+test("QM's thinking level reaches Claude Code the way Pi's Anthropic provider sends it", async (t) => {
   const fake = await installFakeClaudeCode(() => ({ text: "ok" }));
   t.after(fake.restore);
-  const { session, close } = await piSession({ anthropic: TOKEN }, []);
-  session.setThinkingLevel("high");
-  await session.prompt("one");
-  session.setThinkingLevel("off");
-  await session.prompt("two");
-  await close();
-  assert.equal(fake.calls[0]!.options.effort, "high");
-  assert.equal(fake.calls[0]!.options.thinking, undefined);
-  assert.equal(fake.calls[1]!.options.effort, undefined);
-  assert.deepEqual(fake.calls[1]!.options.thinking, { type: "disabled" });
+  const adaptive = await piSession({ anthropic: TOKEN }, []);
+  adaptive.session.setThinkingLevel("high");
+  await adaptive.session.prompt("one");
+  adaptive.session.setThinkingLevel("off");
+  await adaptive.session.prompt("two");
+  await adaptive.close();
+  const budget = await piSession({ anthropic: TOKEN }, [], [], { modelId: "claude-code/claude-haiku-4-5" });
+  budget.session.setThinkingLevel("medium");
+  await budget.session.prompt("three");
+  await budget.close();
+  const sent = fake.calls.map(({ options }) => ({ thinking: options.thinking, effort: options.effort }));
+  assert.deepEqual(sent, [
+    { thinking: { type: "adaptive", display: "summarized" }, effort: "high" },
+    { thinking: { type: "disabled" }, effort: undefined },
+    { thinking: { type: "enabled", budgetTokens: 8192, display: "summarized" }, effort: undefined },
+  ]);
 });

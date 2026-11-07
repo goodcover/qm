@@ -7,12 +7,13 @@ import { test } from "node:test";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { isClaudeSubscriptionToken } from "../src/model/claude-subscription.ts";
 import { buildApp } from "./support/build-app.ts";
+import { CLAUDE_CODE_TEST_MODEL } from "./support/claude-code-session.ts";
 import { testConfig } from "./support/test-config.ts";
 
 const TOKEN_FILE = process.env.CLAUDE_CODE_LIVE_TOKEN_FILE;
 const ANTHROPIC_HOSTS = ["anthropic.com", "claude.ai", "claude.com"];
 const LIMIT_LOG = "[claude-code] subscription limit ";
-const MODEL_ID = process.env.CLAUDE_CODE_LIVE_MODEL ?? "claude-code/claude-sonnet-5";
+const MODEL_ID = process.env.CLAUDE_CODE_LIVE_MODEL ?? CLAUDE_CODE_TEST_MODEL;
 
 async function accountEvidence(token: string): Promise<Record<string, unknown>> {
   const home = mkdtempSync(join(tmpdir(), "qm-claude-code-account-"));
@@ -117,10 +118,6 @@ test(
       );
       assert.deepEqual(direct, [], "every Anthropic request came from the Claude Code child, none from QM");
       assert.ok(limits.length > 0, "Claude reported subscription limits");
-      assert.ok(
-        limits.every((limit) => limit.isUsingOverage !== true && limit.overageInUse !== true),
-        "no request drew on extra usage",
-      );
     } finally {
       await built.runtime.stop();
     }

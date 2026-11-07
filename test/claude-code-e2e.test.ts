@@ -4,9 +4,9 @@ import { test } from "node:test";
 import { buildApp } from "./support/build-app.ts";
 import { testConfig } from "./support/test-config.ts";
 import { answered, installFakeClaudeCode, type FakeRequest } from "./support/fake-claude-code.ts";
+import { CLAUDE_CODE_TEST_MODEL as MODEL_ID } from "./support/claude-code-session.ts";
 
 const COMPANY_TOKEN = "sk-ant-oat01-company-claude-code-e2e";
-const MODEL_ID = "claude-code/claude-sonnet-5";
 
 function historyThenAnswer(requests: FakeRequest[]) {
   return (request: FakeRequest) => {
@@ -56,7 +56,9 @@ test("a QM turn on claude-code serves QM's real prompt and tools, records usage,
       requests[0]!.tools.every((name) => name.startsWith("mcp__qm__")),
       "only QM's tool catalog",
     );
-    assert.equal((call.options.env as Record<string, string>).CLAUDE_CODE_OAUTH_TOKEN, COMPANY_TOKEN);
+    const env = call.options.env as Record<string, string>;
+    assert.equal(env.CLAUDE_CODE_OAUTH_TOKEN, COMPANY_TOKEN);
+    assert.equal(env.CLAUDE_CODE_PROMPT_CACHE_TTL, "1h", "QM's long cache retention for turns reaches Claude Code");
     assert.ok(!call.options.resume, "the first turn has no prior history");
 
     const records = await built.sessions.listLlmRequests(session!.id);

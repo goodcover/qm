@@ -10,12 +10,18 @@ import type {
   SDKAssistantMessageError,
   SDKMessage,
   SDKUserMessage,
-  SpawnOptions,
   SpawnedProcess,
+  SpawnOptions,
 } from "@anthropic-ai/claude-agent-sdk";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { CallToolRequestSchema, ListToolsRequestSchema, type CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { createSession, type ContentBlock, type Message as TranscriptMessage } from "cc-session-io";
+import {
+  createSession,
+  openSession,
+  type ContentBlock,
+  type ImportAttachment,
+  type Message as TranscriptMessage,
+} from "cc-session-io";
 import {
   calculateCost,
   createAssistantMessageEventStream,
@@ -24,6 +30,7 @@ import {
   type Api,
   type AssistantMessage,
   type AssistantMessageEventStream,
+  type CacheRetention,
   type Context,
   type ImageContent,
   type Message,
@@ -35,6 +42,7 @@ import {
   type ToolResultMessage,
   type Usage,
 } from "@earendil-works/pi-ai";
+import { adjustMaxTokensForThinking } from "@earendil-works/pi-ai/api/simple-options";
 import { transformMessages } from "@earendil-works/pi-ai/api/transform-messages";
 import { MAX_TOOL_RESULT_CHARS } from "../agent/agent-tools/record.ts";
 import { hashId } from "../util/crypto.ts";
@@ -53,6 +61,9 @@ const RESUMED_AT_TOOL_RESULTS = "[system] The run resumed after the tool results
 
 const QM_RESULT_CAP_AS_TOKENS = String(MAX_TOOL_RESULT_CHARS);
 const NEVER_RESUME_INTERRUPTED_TURN_AGE_MS = "1";
+const THINKING_DISPLAY = "summarized";
+const ANNOUNCED = new Set(["environment", "model", "date"]);
+const announcements = new Map<string, ImportAttachment["attachment"][]>();
 
 const ERROR_TYPES: Record<SDKAssistantMessageError, string> = {
   authentication_failed: "authentication_error",
@@ -70,11 +81,22 @@ const ERROR_TYPES: Record<SDKAssistantMessageError, string> = {
   unknown: "api_error",
 };
 
-function claudeCodeEnv(token: string, home: string, longestToolDescription = 0): Record<string, string> {
+function cacheEnv(retention: CacheRetention | undefined): Record<string, string> {
+  if (retention === "none") return { DISABLE_PROMPT_CACHING: "1" };
+  return { CLAUDE_CODE_PROMPT_CACHE_TTL: retention === "long" ? "1h" : "5m" };
+}
+
+function claudeCodeEnv(
+  token: string,
+  home: string,
+  longestToolDescription: number,
+  retention: CacheRetention | undefined,
+): Record<string, string> {
   return {
     PATH: "/usr/local/bin:/usr/bin:/bin",
     HOME: home,
     CLAUDE_CONFIG_DIR: home,
+    CLAUDE_CODE_TMPDIR: home,
     CLAUDE_CODE_OAUTH_TOKEN: token,
     CLAUDE_AGENT_SDK_CLIENT_APP: CLIENT_APP,
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
@@ -85,6 +107,7 @@ function claudeCodeEnv(token: string, home: string, longestToolDescription = 0):
     CLAUDE_CODE_RESUME_INTERRUPTED_TURN_MAX_AGE_MS: NEVER_RESUME_INTERRUPTED_TURN_AGE_MS,
     MAX_MCP_OUTPUT_TOKENS: QM_RESULT_CAP_AS_TOKENS,
     ...(longestToolDescription ? { CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH: String(longestToolDescription) } : {}),
+    ...cacheEnv(retention),
   };
 }
 
@@ -122,6 +145,7 @@ interface Step {
 
 interface Live {
   query?: Query;
+  abort: AbortController;
   model: Model<Api>;
   input: EventStream<SDKUserMessage, void>;
   served: Map<string, string>;
@@ -131,11 +155,13 @@ interface Live {
   awaiting: string[];
   failure?: Error;
   apiError?: { kind: SDKAssistantMessageError; text: string };
+  authError?: string;
   child?: ChildProcess;
-  exit?: string;
   exited: Promise<void>;
   markExited: () => void;
   dir: string;
+  session: string;
+  closing?: Promise<void>;
   closed: boolean;
   finished: boolean;
 }
@@ -313,12 +339,24 @@ function deliver(live: Live, id: string, result: CallToolResult): void {
   waiting(result);
 }
 
-function effortFor(model: Model<Api>, reasoning: string | undefined): EffortLevel | undefined {
-  if (!reasoning) return undefined;
+function effortFor(model: Model<Api>, reasoning: string): EffortLevel {
   const mapped = model.thinkingLevelMap?.[reasoning as keyof NonNullable<Model<Api>["thinkingLevelMap"]>];
   if (typeof mapped === "string") return mapped as EffortLevel;
   if (reasoning === "minimal" || reasoning === "low") return "low";
   return reasoning === "medium" ? "medium" : "high";
+}
+
+function thinkingFor(
+  model: Model<Api>,
+  options: SimpleStreamOptions | undefined,
+): Pick<Options, "thinking" | "effort"> {
+  const reasoning = options?.reasoning;
+  if (!reasoning)
+    return model.reasoning && model.thinkingLevelMap?.off !== null ? { thinking: { type: "disabled" } } : {};
+  if ((model as Model<"anthropic-messages">).compat?.forceAdaptiveThinking === true)
+    return { thinking: { type: "adaptive", display: THINKING_DISPLAY }, effort: effortFor(model, reasoning) };
+  const { thinkingBudget } = adjustMaxTokensForThinking(undefined, model.maxTokens, reasoning, options.thinkingBudgets);
+  return { thinking: { type: "enabled", budgetTokens: thinkingBudget, display: THINKING_DISPLAY } };
 }
 
 function started(step: Step): void {
@@ -480,13 +518,21 @@ function onStreamEvent(live: Live, event: Record<string, unknown> & { type: stri
 
 function apiFailure(live: Live, text: string, status: number | null | undefined): ClaudeCodeFailure {
   const kind = live.apiError?.kind;
-  return new ClaudeCodeFailure(text || live.apiError?.text || `Claude Code failed${kind ? ` (${kind})` : ""}`, {
+  const evidence = [...new Set([text, live.apiError?.text, live.authError].filter(Boolean))].join(" — ");
+  return new ClaudeCodeFailure(evidence || `Claude Code failed${kind ? ` (${kind})` : ""}`, {
     ...(typeof status === "number" ? { status } : {}),
     ...(kind ? { type: ERROR_TYPES[kind], code: kind } : {}),
   });
 }
 
+function stop(live: Live): void {
+  if (live.finished) return;
+  live.abort.abort();
+  live.child?.kill("SIGKILL");
+}
+
 function fail(live: Live, error: Error): void {
+  stop(live);
   if (live.failure) swallow("claude-code: later failure", error);
   else live.failure = error;
   const step = live.step;
@@ -501,14 +547,20 @@ function onMessage(live: Live, message: SDKMessage): void {
     const foreign = message.tools.filter((name) => !live.served.has(name));
     const missing = [...live.served.keys()].filter((name) => !message.tools.includes(name));
     if (foreign.length || missing.length)
-      throw new ClaudeCodeFailure(
-        `Claude Code's tools differ from QM's: extra [${foreign.join(", ")}], missing [${missing.join(", ")}], MCP servers [${servers}]`,
-        { type: "invalid_request_error" },
+      return fail(
+        live,
+        new ClaudeCodeFailure(
+          `Claude Code's tools differ from QM's: extra [${foreign.join(", ")}], missing [${missing.join(", ")}], MCP servers [${servers}]`,
+          { type: "invalid_request_error" },
+        ),
       );
     if (message.apiKeySource !== "none")
-      throw new ClaudeCodeFailure(
-        `Claude Code reported API key source ${message.apiKeySource}; this route only uses a subscription login`,
-        { type: "permission_error" },
+      return fail(
+        live,
+        new ClaudeCodeFailure(
+          `Claude Code reported API key source ${message.apiKeySource}; this route only uses a subscription login`,
+          { type: "permission_error" },
+        ),
       );
     console.error(
       `[claude-code] query started cc=${message.claude_code_version} model=${message.model} apiKeySource=${message.apiKeySource} tools=${message.tools.length}`,
@@ -516,6 +568,7 @@ function onMessage(live: Live, message: SDKMessage): void {
     return;
   }
   if (message.type === "auth_status" && message.error) {
+    live.authError = message.error;
     console.error(`[claude-code] auth_status ${JSON.stringify(message)}`);
     return;
   }
@@ -543,9 +596,12 @@ function onMessage(live: Live, message: SDKMessage): void {
     const info = message.rate_limit_info;
     console.error(`[claude-code] subscription limit ${JSON.stringify(info)}`);
     if (info.isUsingOverage === true || info.overageInUse === true)
-      throw new ClaudeCodeFailure(
-        "Claude reported that this request is drawing on extra usage (overage); the claude-code route refuses metered usage",
-        { type: "invalid_request_error", code: "overage_in_use" },
+      return fail(
+        live,
+        new ClaudeCodeFailure(
+          "Claude reported that this request is drawing on extra usage (overage); the claude-code route refuses metered usage",
+          { type: "invalid_request_error", code: "overage_in_use" },
+        ),
       );
     return;
   }
@@ -564,6 +620,23 @@ function onMessage(live: Live, message: SDKMessage): void {
   }
 }
 
+function rememberAnnouncements(live: Live): void {
+  if (!live.query || !live.finished) return;
+  try {
+    const latest = new Map<string, ImportAttachment["attachment"]>();
+    const transcript = openSession({
+      sessionId: live.session,
+      projectPath: realpathSync(WORK_DIR),
+      claudeDir: live.dir,
+    });
+    for (const record of transcript.attachments)
+      if (ANNOUNCED.has(record.attachment.type)) latest.set(record.attachment.type, record.attachment);
+    if (latest.size === ANNOUNCED.size) announcements.set(live.model.id, [...latest.values()]);
+  } catch (e) {
+    swallow("claude-code: reading what Claude Code announced", e);
+  }
+}
+
 function spawnTracked(live: Live) {
   return (options: SpawnOptions): SpawnedProcess => {
     const child = spawn(options.command, options.args, {
@@ -573,42 +646,41 @@ function spawnTracked(live: Live) {
       stdio: ["pipe", "pipe", "pipe"],
     });
     live.child = child;
-    child.stderr?.on("data", (data: Buffer) => console.error(`[claude-code] ${data.toString().trimEnd()}`));
-    child.once("exit", (code, signal) => {
-      live.exit = `exit code ${code ?? "none"}, signal ${signal ?? "none"}`;
-      live.markExited();
-    });
+    child.stderr.on("data", (data: Buffer) => console.error(`[claude-code] ${data.toString().trimEnd()}`));
+    child.once("exit", live.markExited);
     child.once("error", (error) => {
-      live.exit = `spawn error: ${errMessage(error)}`;
-      live.markExited();
+      swallow("claude-code: the Claude Code process failed", error);
+      if (child.pid === undefined) live.markExited();
     });
     return child as unknown as SpawnedProcess;
   };
 }
 
-async function closeLive(live: Live, reason: string): Promise<void> {
-  if (live.closed) return live.exited;
+async function teardown(live: Live, reason: string): Promise<void> {
   live.closed = true;
+  stop(live);
   live.input.end();
-  for (const [id, resolve] of live.waiting) {
-    live.waiting.delete(id);
-    resolve({ content: [{ type: "text", text: reason }], isError: true });
-  }
   const step = live.step;
   live.step = undefined;
   if (step) failStep(step, new Error(reason), true);
   try {
-    live.query?.close();
+    await live.query?.return(undefined);
   } catch (e) {
     swallow("claude-code: closing the query", e);
   }
   if (!live.child) live.markExited();
   await live.exited;
+  rememberAnnouncements(live);
   try {
     rmSync(live.dir, { recursive: true, force: true });
   } catch (e) {
     swallow("claude-code: removing the query directory", e);
   }
+}
+
+function closeLive(live: Live, reason: string): Promise<void> {
+  live.closing ??= teardown(live, reason);
+  return live.closing;
 }
 
 function refusalFor(closed: boolean, token: string | undefined, gateway: boolean): ClaudeCodeFailure | undefined {
@@ -679,8 +751,7 @@ export function createClaudeCodeConnection({ gateway = false }: { gateway?: bool
     request: ClaudeCodeRequest,
     token: string,
     step: Step,
-    signal: AbortSignal | undefined,
-    reasoning: string | undefined,
+    streamOptions: SimpleStreamOptions | undefined,
   ): Promise<void> => {
     const previous = live;
     live = undefined;
@@ -705,6 +776,7 @@ export function createClaudeCodeConnection({ gateway = false }: { gateway?: bool
     let markExited!: () => void;
     const exited = new Promise<void>((resolve) => (markExited = resolve));
     const target: Live = {
+      abort: new AbortController(),
       model,
       input: new EventStream<SDKUserMessage, void>(
         () => false,
@@ -718,24 +790,26 @@ export function createClaudeCodeConnection({ gateway = false }: { gateway?: bool
       exited,
       markExited,
       dir,
+      session: randomUUID(),
       closed: false,
       finished: false,
     };
     live = target;
-    bindAbort(target, signal);
+    bindAbort(target, streamOptions?.signal);
     if (target.closed) return;
     const { history, prompt } = splitPrompt(request.messages);
-    const sessionId = randomUUID();
+    const sessionId = target.session;
     if (history.length) {
       const session = createSession({ projectPath: work, claudeDir: dir, cwd: work, model: request.model, sessionId });
-      session.importMessages(history);
+      const announced = announcements.get(model.id) ?? [];
+      session.importMessages(history, { attachments: announced.map((attachment) => ({ afterIndex: 0, attachment })) });
       session.save();
     }
-    const effort = effortFor(model, reasoning);
     const longest = Math.max(0, ...request.tools.map((tool) => tool.description.length));
     const options: Options = {
+      abortController: target.abort,
       cwd: work,
-      env: claudeCodeEnv(token, dir, longest),
+      env: claudeCodeEnv(token, dir, longest, streamOptions?.cacheRetention),
       systemPrompt: request.system,
       model: request.model,
       tools: [],
@@ -750,10 +824,7 @@ export function createClaudeCodeConnection({ gateway = false }: { gateway?: bool
       extraArgs: { "disable-slash-commands": null },
       ...(request.tools.length ? { mcpServers: { [SERVER]: toolServer(request.tools, target) } } : {}),
       ...(history.length ? { resume: sessionId } : { sessionId }),
-      ...(effort ? { effort } : {}),
-      ...(!reasoning && model.reasoning && model.thinkingLevelMap?.off !== null
-        ? { thinking: { type: "disabled" as const } }
-        : {}),
+      ...thinkingFor(model, streamOptions),
       spawnClaudeCodeProcess: spawnTracked(target),
     };
     if (target.closed || connectionClosed) return closeLive(target, "QM ended the turn");
@@ -763,15 +834,12 @@ export function createClaudeCodeConnection({ gateway = false }: { gateway?: bool
       for await (const message of target.query) {
         if (target.closed) break;
         onMessage(target, message);
+        if (target.failure) break;
       }
-      if (!target.closed && !target.finished) {
-        await target.exited;
-        const ended = `Claude Code ended without a result (${target.exit ?? "process state unknown"})`;
-        throw apiFailure(target, [target.apiError?.text, ended].filter(Boolean).join(" — "), undefined);
-      }
+      if (!target.closed && !target.finished) throw apiFailure(target, "Claude Code ended without a result", undefined);
     } catch (error) {
       if (target.closed) swallow("claude-code: error after the query was closed", error);
-      else fail(target, asError(error));
+      else fail(target, error instanceof ClaudeCodeFailure ? error : apiFailure(target, errMessage(error), undefined));
     } finally {
       if (target.failure || target.finished) await closeLive(target, "The Claude Code query ended");
     }
@@ -804,7 +872,7 @@ export function createClaudeCodeConnection({ gateway = false }: { gateway?: bool
         if (shaped !== undefined && !isRequest(shaped))
           throw new Error("QM's request hook returned a payload the claude-code route cannot send");
         if (continuing) attach(continuing, step, messages, options?.signal);
-        else await start(model, shaped ?? request, token!, step, options?.signal, options?.reasoning);
+        else await start(model, shaped ?? request, token!, step, options);
       })().catch((error) => {
         const failure = asError(error);
         if (live?.step === step) fail(live, failure);
