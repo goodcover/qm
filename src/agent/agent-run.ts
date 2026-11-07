@@ -3,9 +3,11 @@ import {
   applyFastSpeed,
   buildModelRuntime,
   piUsageToCallUsage,
+  providerKey,
   wantsFastMode,
   withRequestHeaders,
   type ProviderKeys,
+  type QmModelRuntime,
 } from "../model/model-runtime.ts";
 import {
   recordSteerIntake,
@@ -391,6 +393,7 @@ interface TurnSession {
   agentSession: AgentSession;
   ref: ToolContextRef & { effortLevel?: string };
   composedPromptTokens: number;
+  modelRuntime: QmModelRuntime;
   agentDir: string;
   ephemeralCwd?: string;
 }
@@ -776,6 +779,7 @@ export async function oneShot(
     return piLastAssistantTextOrThrow(session);
   } finally {
     removeIsolatedDirs({ agentDir, ephemeralCwd });
+    await modelRuntime.close();
   }
 }
 
@@ -881,7 +885,7 @@ export function createAgent(opts?: AgentOptions): Agent {
     };
   };
   const servable = (route: ModelRoute): ModelRoute | undefined =>
-    route.billing === "model_gateway" || route.keys[String(route.model.provider)] ? route : undefined;
+    route.billing === "model_gateway" || providerKey(route.keys, String(route.model.provider)) ? route : undefined;
   const sessionRoute = (session: Pick<CompactInput, "runtime" | "providerKeys">) =>
     routeFor(session.runtime?.modelId ?? baseModelId(), session.providerKeys);
   const utilityRoute = async (modelId?: string) =>
@@ -961,6 +965,7 @@ export function createAgent(opts?: AgentOptions): Agent {
       }));
     } catch (err) {
       removeIsolatedDirs({ agentDir, ephemeralCwd });
+      await modelRuntime.close();
       throw err;
     }
 
@@ -1021,6 +1026,7 @@ export function createAgent(opts?: AgentOptions): Agent {
       agentSession: session,
       ref,
       composedPromptTokens: countTokens(systemPrompt),
+      modelRuntime,
       agentDir,
       ...(ephemeralCwd ? { ephemeralCwd } : {}),
     };
@@ -1651,6 +1657,7 @@ export function createAgent(opts?: AgentOptions): Agent {
         });
       } finally {
         removeIsolatedDirs(entry);
+        await entry.modelRuntime.close();
       }
     },
 
@@ -1677,14 +1684,18 @@ export function createAgent(opts?: AgentOptions): Agent {
     async compactHistory(input: CompactInput): Promise<string> {
       const summarize = async (route: ModelRoute) => {
         const runtime = await buildModelRuntime(route.keys, route.gateway, "compaction");
-        return summarizeHistory(input.history, route.model, (summaryModel, context, options) => {
-          input.recordModelCall({
-            model: route.modelId,
-            inputTokens: countTokens(context.systemPrompt ?? "") + countTokens(JSON.stringify(context.messages)),
-            entryCount: input.history.length,
+        try {
+          return await summarizeHistory(input.history, route.model, (summaryModel, context, options) => {
+            input.recordModelCall({
+              model: route.modelId,
+              inputTokens: countTokens(context.systemPrompt ?? "") + countTokens(JSON.stringify(context.messages)),
+              entryCount: input.history.length,
+            });
+            return runtime.streamSimple(summaryModel, context, options);
           });
-          return runtime.streamSimple(summaryModel, context, options);
-        });
+        } finally {
+          await runtime.close();
+        }
       };
       const primary = servable(await sessionRoute(input));
       if (!primary)
@@ -1774,11 +1785,13 @@ export function createAgent(opts?: AgentOptions): Agent {
       if (!route) return undefined;
       const prompt = `Candidates: ${candidates.join(", ")}\n\nMessage: ${text.slice(0, 2000)}`;
       const runtime = await buildModelRuntime(route.keys, route.gateway, "ack_emoji");
-      const reply = await runtime.completeSimple(
-        route.model,
-        { systemPrompt: ACK_EMOJI_PROMPT, messages: [{ role: "user", content: prompt, timestamp: Date.now() }] },
-        { maxTokens: 64, signal: AbortSignal.timeout(2_000) },
-      );
+      const reply = await runtime
+        .completeSimple(
+          route.model,
+          { systemPrompt: ACK_EMOJI_PROMPT, messages: [{ role: "user", content: prompt, timestamp: Date.now() }] },
+          { maxTokens: 64, signal: AbortSignal.timeout(2_000) },
+        )
+        .finally(() => runtime.close());
       if (reply.stopReason === "error") throw providerTurnError(reply);
       const raw = reply.content.find((block) => block.type === "text")?.text;
       if (!raw) return undefined;

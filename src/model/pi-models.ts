@@ -20,6 +20,7 @@ import { MODEL_REGISTRY, type ModelEntry } from "./model-registry.ts";
 import { providerBaseUrl } from "./provider-endpoints.ts";
 import { type CustomRuntimeModel, isCustomModelId, resolveCustomModel } from "./custom-providers.ts";
 import type { ProviderKeys } from "./model-runtime.ts";
+import { CLAUDE_CODE_PREFIX, CLAUDE_CODE_PROVIDER } from "./claude-subscription.ts";
 
 const getModel = getBuiltinModel as unknown as (provider: string, id: string) => Model<Api> | undefined;
 
@@ -108,6 +109,7 @@ export function modelIdReserved(id: string): boolean {
   return (
     isGatewayModelId(id) ||
     id.startsWith(CODEX_SUBSCRIPTION_PREFIX) ||
+    id.startsWith(CLAUDE_CODE_PREFIX) ||
     catalogModelIdTaken(id) ||
     overlayModel(id) !== undefined ||
     overlayUnavailableReason(id) !== undefined
@@ -228,6 +230,17 @@ export function modelRequestOverrides(id: string): ModelEntry["request"] {
 }
 
 export function resolveBuiltinModel(id: string): PiModel | undefined {
+  if (id.startsWith(CLAUDE_CODE_PREFIX)) {
+    const native = resolveBuiltinModel(id.slice(CLAUDE_CODE_PREFIX.length));
+    if (native?.provider !== "anthropic") return undefined;
+    return {
+      ...native,
+      id,
+      name: `${native.name} via Claude Code`,
+      provider: CLAUDE_CODE_PROVIDER,
+      api: CLAUDE_CODE_PROVIDER as Api,
+    };
+  }
   if (id.startsWith(CODEX_SUBSCRIPTION_PREFIX)) {
     const providerId = codexProviderModelId(id);
     if (modelRequestOverrides(providerId)) return undefined;
@@ -382,7 +395,7 @@ export function modelServiceable(id: string, providers: ModelProviderAvailabilit
         resolveModel(codexSubscriptionModelId(id))?.provider === CODEX_SUBSCRIPTION_PROVIDER)
     );
   if (provider === CODEX_SUBSCRIPTION_PROVIDER) return providers.codexOAuth === true;
-  if (provider === "anthropic") return providers.anthropic;
+  if (provider === "anthropic" || provider === CLAUDE_CODE_PROVIDER) return providers.anthropic;
   if (provider === "openrouter") return providers.openrouter;
   return true;
 }

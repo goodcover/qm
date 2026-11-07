@@ -1,3 +1,6 @@
+export const CLAUDE_CODE_PROVIDER = "claude-code";
+export const CLAUDE_CODE_PREFIX = "claude-code/";
+
 const CLAUDE_SUBSCRIPTION_BETAS = ["claude-code-20250219", "oauth-2025-04-20"];
 
 export function isClaudeSubscriptionToken(key: string | undefined): boolean {
