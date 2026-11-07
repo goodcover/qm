@@ -407,6 +407,7 @@ import {
 import { createPostgresErrorLog } from "./admin/postgres-error-log.ts";
 import { errMessage, reportFailureAs, swallowAs } from "./util/errors.ts";
 import { sleep, withTimeout } from "./util/async.ts";
+import { privateHostsFetch } from "./util/network.ts";
 import { createSlackInstallationStore, type SlackInstallationStore } from "./surfaces/slack-installation.ts";
 import { createSurfaceRegistry } from "./surfaces/registry.ts";
 import { createSlackSurface } from "./surfaces/slack/adapter.ts";
@@ -1325,6 +1326,7 @@ export function buildApp(
   const mcpToolService = createMcpToolService({
     servers: mcpServers,
     audit: auditLog,
+    ...(config.mcpPrivateHosts ? { fetch: privateHostsFetch(config.mcpPrivateHosts) } : {}),
     ...(keychain ? { userTokens: keychain } : {}),
     ...(config.publicWebUrl
       ? {

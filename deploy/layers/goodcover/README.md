@@ -117,6 +117,12 @@ or token re-entry. Ops owns the release's immutable image pins and rollout recor
   in `/tmp` after two hours. Goodcover removed that sweep because it could delete the
   credentials of a command still running. A directory left behind by a crash remains
   until that computer is replaced.
+- **Private MCP hosts.** Upstream refuses MCP endpoints that resolve to private
+  network addresses. Goodcover's SigNoz MCP server runs in the cluster at
+  `signoz-mcp.signoz.svc.cluster.local`, so core's `MCP_PRIVATE_HOSTS` lists that
+  host. MCP calls to a listed host may reach private addresses. The list holds
+  exact host names, with no wildcards. It lives only in the core ConfigMap, so the
+  admin UI cannot widen it, and OAuth discovery still refuses private addresses.
 
 ## Historical deployed baseline: Claude Code alongside Codex
 

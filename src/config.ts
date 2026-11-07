@@ -72,6 +72,7 @@ export interface Config extends SandboxSettings, DeploySettings {
   securityPosture: SecurityPosture;
   sharingPosture: SharingPosture;
   egressServiceHosts?: string[];
+  mcpPrivateHosts?: string[];
   brandingDefault?: OrgBranding;
   modelId?: string;
   codexAuthCredential?: string;
@@ -299,6 +300,19 @@ function choiceEnvStrict<T extends string>(name: string, value: string | undefin
   throw new Error(`${name}=${JSON.stringify(value)} is not recognized — use ${choices.join(", ")}, or unset it.`);
 }
 
+function mcpPrivateHosts(value: string): string[] {
+  return value
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .map((entry) => {
+      const host = entry.toLowerCase();
+      if (host.includes("*") || URL.parse(`http://${host}`)?.hostname !== host)
+        throw new Error(`MCP_PRIVATE_HOSTS entry ${JSON.stringify(entry)} must be an exact host name`);
+      return host;
+    });
+}
+
 function csvPaths(value: string | undefined): string[] | undefined {
   if (value === undefined) return undefined;
   if (boolEnv(value) === false) return [];
@@ -521,6 +535,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
             .filter(Boolean),
         }
       : {}),
+    ...(env.MCP_PRIVATE_HOSTS?.trim() ? { mcpPrivateHosts: mcpPrivateHosts(env.MCP_PRIVATE_HOSTS) } : {}),
     ...(orgBrandingFromEnv(env) ? { brandingDefault: orgBrandingFromEnv(env) } : {}),
     ...(env.PI_MODEL ? { modelId: env.PI_MODEL } : {}),
     ...(codexAuthCredential ? { codexAuthCredential } : {}),

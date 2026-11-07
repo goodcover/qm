@@ -210,6 +210,37 @@ test("production wiring never uses operator fallback tokens for per-user MCP cal
   assert.equal(remote.requests.length, 0, "production wiring refuses a loopback MCP server");
 });
 
+test("production wiring reaches a private MCP host only when the operator lists it", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mcp-private-hosts-"));
+  const built = buildApp(testConfig({ dataDir: dir, mcpPrivateHosts: ["localhost"] }));
+  const remote = await startMcpTestServer(t, {
+    tools: [{ name: "query", inputSchema: { type: "object" } }],
+    call: () => ({ content: [{ type: "text", text: "metrics ok" }] }),
+  });
+  t.after(async () => {
+    built.mcpToolService.close();
+    await rm(dir, { recursive: true, force: true });
+  });
+  const server = (id: string, host: string): McpServer => ({
+    id,
+    name: id,
+    url: `http://${host}:${new URL(remote.url).port}/mcp`,
+    auth: "none",
+    readOnly: true,
+    enabled: true,
+    updatedAt: Date.now(),
+    updatedBy: "internal:admin",
+  });
+  await built.mcpServers.put(server("listed", "localhost"));
+  await built.mcpToolService.refresh();
+  assert.equal(await built.mcpToolService.call("listed_query", {}, "internal:alice"), "metrics ok");
+  const reached = remote.requests.length;
+  await assert.rejects(built.mcpToolService.probe(server("unlisted", "127.0.0.1")), (e: unknown) =>
+    /127\.0\.0\.1 is a private network address/.test(errMessage(e)),
+  );
+  assert.equal(remote.requests.length, reached);
+});
+
 test("MCP admin accepts per-user OAuth servers, discovers endpoints only from public addresses, and never shadows built-in connectors", async (t) => {
   const dir = await mkdtemp(join(tmpdir(), "mcp-admin-oauth-"));
   const built = buildApp(testConfig({ dataDir: dir }));

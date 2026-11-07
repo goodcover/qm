@@ -973,3 +973,17 @@ test("The Render sandbox backend needs a tagged, digest-pinned RENDER_SANDBOX_IM
     enabledSandboxBackends(loadConfig({ ...secondary, RENDER_SANDBOX_IMAGE: RENDER_IMAGE })).includes("render"),
   );
 });
+
+test("MCP_PRIVATE_HOSTS lists exact host names and refuses anything else", () => {
+  assert.equal(loadConfig({}).mcpPrivateHosts, undefined);
+  assert.deepEqual(
+    loadConfig({ MCP_PRIVATE_HOSTS: " Signoz-MCP.signoz.svc.cluster.local, 10.0.0.5 ," }).mcpPrivateHosts,
+    ["signoz-mcp.signoz.svc.cluster.local", "10.0.0.5"],
+  );
+  for (const entry of ["*.svc.cluster.local", "signoz/mcp", "user@signoz", "two words"]) {
+    assert.throws(
+      () => loadConfig({ MCP_PRIVATE_HOSTS: entry }),
+      /MCP_PRIVATE_HOSTS entry .* must be an exact host name/,
+    );
+  }
+});

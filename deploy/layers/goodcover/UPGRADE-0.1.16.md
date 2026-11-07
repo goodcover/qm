@@ -95,7 +95,9 @@ away.
   will pause. Choose the approval policy for the Plain server before rollout.
 - **Network.** MCP and OAuth endpoints now refuse private addresses and ignore
   `HTTP(S)_PROXY`. Core must reach `mcp.plain.com` and `signin.auth.plain.com` over
-  public DNS.
+  public DNS. The in-cluster SigNoz MCP server keeps working only through
+  `MCP_PRIVATE_HOSTS`; see the layer README's
+  [Divergences from upstream](README.md#divergences-from-upstream).
 
 ## Configuration to prepare, not apply
 
@@ -105,6 +107,9 @@ After hop 3, remove these keys, which the candidate ignores, from the ops Config
   `FILES_DIRECT_UPLOADS_ENABLED`.
 - `qm-web-ui`: `ADMIN_BASE_PATH` and `ADMIN_ENABLED`.
 - `qm-portal`: `ADMIN_UPSTREAM`.
+
+Add `MCP_PRIVATE_HOSTS: signoz-mcp.signoz.svc.cluster.local` to `qm-core` before the
+candidate starts.
 
 Keep `SESSION_STORE=postgres` and `RUN_STORE=postgres` for the B1 and B2 jobs, which
 still read them. Keep `CONNECTOR_SECRET_KEY` and `ORG_ID` identical across every hop.

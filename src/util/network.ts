@@ -97,6 +97,12 @@ export function addressGuardedFetch(
 
 export const publicFetch = addressGuardedFetch(isPrivateNetworkIp);
 
+export function privateHostsFetch(hosts: readonly string[]): AddressFetch {
+  const allowed = new Set(hosts);
+  const privateFetch = addressGuardedFetch(() => false);
+  return (input, init) => (allowed.has(new URL(input).hostname) ? privateFetch : publicFetch)(input, init);
+}
+
 async function guardedRequest(
   url: URL,
   init: RequestInit,
