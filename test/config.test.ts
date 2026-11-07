@@ -976,11 +976,12 @@ test("The Render sandbox backend needs a tagged, digest-pinned RENDER_SANDBOX_IM
 
 test("MCP_PRIVATE_HOSTS lists exact host names and refuses anything else", () => {
   assert.equal(loadConfig({}).mcpPrivateHosts, undefined);
+  assert.equal(loadConfig({ MCP_PRIVATE_HOSTS: " , " }).mcpPrivateHosts, undefined);
   assert.deepEqual(
-    loadConfig({ MCP_PRIVATE_HOSTS: " Signoz-MCP.signoz.svc.cluster.local, 10.0.0.5 ," }).mcpPrivateHosts,
-    ["signoz-mcp.signoz.svc.cluster.local", "10.0.0.5"],
+    loadConfig({ MCP_PRIVATE_HOSTS: " Metrics-MCP.observability.svc.cluster.local, 10.0.0.5 ," }).mcpPrivateHosts,
+    ["metrics-mcp.observability.svc.cluster.local", "10.0.0.5"],
   );
-  for (const entry of ["*.svc.cluster.local", "signoz/mcp", "user@signoz", "two words"]) {
+  for (const entry of ["*.svc.cluster.local", "metrics/mcp", "user@metrics", "two words"]) {
     assert.throws(
       () => loadConfig({ MCP_PRIVATE_HOSTS: entry }),
       /MCP_PRIVATE_HOSTS entry .* must be an exact host name/,

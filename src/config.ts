@@ -300,8 +300,8 @@ function choiceEnvStrict<T extends string>(name: string, value: string | undefin
   throw new Error(`${name}=${JSON.stringify(value)} is not recognized — use ${choices.join(", ")}, or unset it.`);
 }
 
-function mcpPrivateHosts(value: string): string[] {
-  return value
+function mcpPrivateHosts(value: string | undefined): { mcpPrivateHosts?: string[] } {
+  const hosts = (value ?? "")
     .split(",")
     .map((entry) => entry.trim())
     .filter(Boolean)
@@ -311,6 +311,7 @@ function mcpPrivateHosts(value: string): string[] {
         throw new Error(`MCP_PRIVATE_HOSTS entry ${JSON.stringify(entry)} must be an exact host name`);
       return host;
     });
+  return hosts.length ? { mcpPrivateHosts: hosts } : {};
 }
 
 function csvPaths(value: string | undefined): string[] | undefined {
@@ -535,7 +536,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
             .filter(Boolean),
         }
       : {}),
-    ...(env.MCP_PRIVATE_HOSTS?.trim() ? { mcpPrivateHosts: mcpPrivateHosts(env.MCP_PRIVATE_HOSTS) } : {}),
+    ...mcpPrivateHosts(env.MCP_PRIVATE_HOSTS),
     ...(orgBrandingFromEnv(env) ? { brandingDefault: orgBrandingFromEnv(env) } : {}),
     ...(env.PI_MODEL ? { modelId: env.PI_MODEL } : {}),
     ...(codexAuthCredential ? { codexAuthCredential } : {}),
