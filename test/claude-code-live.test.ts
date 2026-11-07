@@ -5,7 +5,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { query } from "@anthropic-ai/claude-agent-sdk";
-import { claudeCodeEnv } from "../src/model/claude-code.ts";
 import { isClaudeSubscriptionToken } from "../src/model/claude-subscription.ts";
 import { buildApp } from "./support/build-app.ts";
 import { testConfig } from "./support/test-config.ts";
@@ -19,7 +18,13 @@ async function accountEvidence(token: string): Promise<Record<string, unknown>> 
   const home = mkdtempSync(join(tmpdir(), "qm-claude-code-account-"));
   const session = query({
     prompt: (async function* () {})(),
-    options: { env: claudeCodeEnv(token, home), cwd: home, tools: [], settingSources: [], strictMcpConfig: true },
+    options: {
+      env: { PATH: "/usr/bin:/bin", HOME: home, CLAUDE_CONFIG_DIR: home, CLAUDE_CODE_OAUTH_TOKEN: token },
+      cwd: home,
+      tools: [],
+      settingSources: [],
+      strictMcpConfig: true,
+    },
   });
   try {
     const { subscriptionType, tokenSource, apiKeySource, apiProvider, organization } = await session.accountInfo();
@@ -106,7 +111,10 @@ test(
       t.diagnostic(`llm request records: ${JSON.stringify(records)}`);
       for (const line of evidence) t.diagnostic(line);
       assert.ok(tools.includes("history"), "the model called a QM tool and QM ran it");
-      assert.match(replies.at(-1) ?? "", /kiwi/i, "the resumed turn saw the first turn's tool call");
+      assert.ok(
+        (replies.at(-1) ?? "").toLowerCase().includes("kiwi"),
+        "the resumed turn saw the first turn's tool call",
+      );
       assert.deepEqual(direct, [], "every Anthropic request came from the Claude Code child, none from QM");
       assert.ok(limits.length > 0, "Claude reported subscription limits");
       assert.ok(

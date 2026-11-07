@@ -7,6 +7,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Options, SDKMessage, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import { sleep } from "../../src/util/async.ts";
 
 export type Block = Record<string, unknown> & { type: string };
 export interface Turn {
@@ -30,14 +31,12 @@ export interface FakeReply {
   rateLimit?: Record<string, unknown>;
   refusal?: boolean;
   endWithoutResult?: boolean;
-  usage?: { input: number; output: number; cacheRead?: number; cacheWrite?: number };
+  usage?: { input: number; output: number; cacheRead?: number };
 }
 
 export interface FakeCall {
   options: Options;
   history: Turn[];
-  transcriptFile?: string;
-  transcriptRecords: Array<Record<string, unknown>>;
   mcpCalls: Array<{ name: string; id: string; result: unknown }>;
   listedTools: Array<{ name: string; description?: string; inputSchema: unknown }>;
   child?: ChildProcess;
@@ -64,7 +63,7 @@ function streamEvents(id: string, reply: FakeReply): SDKMessage[] {
         input_tokens: usage.input,
         output_tokens: 1,
         cache_read_input_tokens: usage.cacheRead ?? 0,
-        cache_creation_input_tokens: usage.cacheWrite ?? 0,
+        cache_creation_input_tokens: 0,
       },
     },
   });
@@ -140,8 +139,8 @@ function assistantContent(reply: FakeReply): Block[] {
   ];
 }
 
-function readTranscript(options: Options): { file?: string; records: Array<Record<string, unknown>> } {
-  if (!options.resume) return { records: [] };
+function readTranscript(options: Options): Array<Record<string, unknown>> {
+  if (!options.resume) return [];
   const projects = join(String(options.env?.CLAUDE_CONFIG_DIR), "projects");
   for (const dir of existsSync(projects) ? readdirSync(projects) : []) {
     const file = join(projects, dir, `${options.resume}.jsonl`);
@@ -150,7 +149,7 @@ function readTranscript(options: Options): { file?: string; records: Array<Recor
       .split("\n")
       .filter(Boolean)
       .map((line) => JSON.parse(line) as Record<string, unknown>);
-    return { file, records };
+    return records;
   }
   throw new Error(`no transcript for resumed session ${options.resume}`);
 }
@@ -171,12 +170,9 @@ export function fakeClaudeCode(model: Model, tweak: Partial<Pick<FakeCall, "init
   const calls: FakeCall[] = [];
 
   function query({ prompt, options }: { prompt: AsyncIterable<SDKUserMessage>; options: Options }) {
-    const transcript = readTranscript(options);
     const call: FakeCall = {
       options,
-      history: historyFrom(transcript.records),
-      ...(transcript.file ? { transcriptFile: transcript.file } : {}),
-      transcriptRecords: transcript.records,
+      history: historyFrom(readTranscript(options)),
       mcpCalls: [],
       listedTools: [],
       closed: false,
@@ -336,10 +332,25 @@ export async function installFakeClaudeCode(
   const mocked = mock.module("@anthropic-ai/claude-agent-sdk", {
     namedExports: { ...real, query: fake.query },
   });
-  return { ...fake, restore: () => mocked.restore(), leftovers: () => leftovers(fake.calls) };
+  return {
+    ...fake,
+    async restore() {
+      mocked.restore();
+      const left = await leftovers(fake.calls);
+      if (left.length) throw new Error(`Claude Code queries were not cleaned up: ${left.join("; ")}`);
+    },
+  };
 }
 
-export async function leftovers(calls: readonly FakeCall[]): Promise<string[]> {
+export function lastUser(request: Pick<FakeRequest, "messages">): Block[] {
+  return request.messages.findLast((message) => message.role === "user")?.content ?? [];
+}
+
+export function answered(request: Pick<FakeRequest, "messages">): boolean {
+  return lastUser(request).some((block) => block.type === "tool_result");
+}
+
+async function leftovers(calls: readonly FakeCall[]): Promise<string[]> {
   const remaining = () =>
     calls.flatMap((call, index) => {
       const dir = String(call.options.env?.CLAUDE_CONFIG_DIR);
@@ -348,7 +359,7 @@ export async function leftovers(calls: readonly FakeCall[]): Promise<string[]> {
         ...(existsSync(dir) ? [`query ${index}: ${dir} still exists`] : []),
       ];
     });
-  for (let i = 0; i < 100 && remaining().length; i++) await new Promise((resolve) => setTimeout(resolve, 20));
+  for (let i = 0; i < 100 && remaining().length; i++) await sleep(20);
   return remaining();
 }
 

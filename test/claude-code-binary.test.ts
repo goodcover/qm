@@ -13,6 +13,10 @@ import {
   lookupTool,
 } from "./support/claude-code-session.ts";
 import { processAlive } from "./support/fake-claude-code.ts";
+import { anthropicMessage } from "./support/gateway-stream.ts";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const TOKEN = "sk-ant-oat01-binary-contract-test";
 
@@ -29,47 +33,18 @@ interface Captured {
   };
 }
 
-function sse(events: Array<Record<string, unknown>>): string {
-  return events.map((event) => `event: ${String(event.type)}\ndata: ${JSON.stringify(event)}\n\n`).join("");
-}
-
 function reply(model: string, block: Block, stop: string): string {
-  const toolUse = block.type === "tool_use";
-  return sse([
-    {
-      type: "message_start",
-      message: {
-        id: `msg_${Math.random().toString(36).slice(2)}`,
-        type: "message",
-        role: "assistant",
-        model,
-        content: [],
-        stop_reason: null,
-        usage: { input_tokens: 21, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
-      },
-    },
-    {
-      type: "content_block_start",
-      index: 0,
-      content_block: toolUse ? { ...block, input: {} } : { type: "text", text: "" },
-    },
-    {
-      type: "content_block_delta",
-      index: 0,
-      delta: toolUse
-        ? { type: "input_json_delta", partial_json: JSON.stringify(block.input) }
-        : { type: "text_delta", text: block.text },
-    },
-    { type: "content_block_stop", index: 0 },
-    { type: "message_delta", delta: { stop_reason: stop }, usage: { output_tokens: 6 } },
-    { type: "message_stop" },
-  ]);
+  return anthropicMessage(model, [block], stop, {
+    input_tokens: 21,
+    output_tokens: 1,
+    cache_read_input_tokens: 0,
+    cache_creation_input_tokens: 0,
+  });
 }
 
-const RESETS_AT = Math.floor(Date.now() / 1000) + 3600;
 const RATE_LIMIT_HEADERS = {
   "anthropic-ratelimit-unified-status": "allowed",
-  "anthropic-ratelimit-unified-reset": String(RESETS_AT),
+  "anthropic-ratelimit-unified-reset": String(Math.floor(Date.now() / 1000) + 3600),
   "anthropic-ratelimit-unified-representative-claim": "five_hour",
   "anthropic-ratelimit-unified-5h-utilization": "0.12",
   "anthropic-ratelimit-unified-overage-status": "rejected",
@@ -210,19 +185,6 @@ test("the bundled Claude Code binary serves QM tool turns with only QM's tools a
     assert.equal(offered.get("mcp__qm__long_doc"), description, "a long tool description arrives whole");
     assert.ok(!environmentReminder(call).includes("<total_tokens>"), "no per-step token countdown");
   }
-  const limits = first.session.messages.flatMap((message) =>
-    message.role === "assistant" ? (message.diagnostics ?? []).map((diagnostic) => diagnostic.details) : [],
-  );
-  assert.ok(limits.length > 0, "Claude Code reported the subscription window");
-  for (const limit of limits)
-    assert.deepEqual(limit, {
-      status: "allowed",
-      resetsAt: RESETS_AT,
-      rateLimitType: "five_hour",
-      overageStatus: "rejected",
-      overageDisabledReason: "org_level_disabled",
-      isUsingOverage: false,
-    });
   assert.ok(
     sdk.children.every((child) => !processAlive(child)),
     "every Claude Code process exited",
@@ -271,4 +233,41 @@ test("aborting a turn kills the real Claude Code process mid-request", async (t)
   assert.ok(!processAlive(child));
   assert.ok(!existsSync(String(sdk.spawned[0]!.env?.CLAUDE_CONFIG_DIR)));
   assert.equal(lastAssistant(session).stopReason, "aborted");
+});
+
+test("text a person types reaches the real binary verbatim: no slash commands, no @file reads, no planted project files", async (t) => {
+  const api = await mockMessagesApi(t);
+  await pointClaudeCodeAt(t, api.url);
+  const work = join(tmpdir(), "qm-claude-code-cwd");
+  mkdirSync(join(work, ".claude"), { recursive: true });
+  writeFileSync(join(work, "CLAUDE.md"), "PLANTED-CLAUDE-MD");
+  writeFileSync(
+    join(work, ".claude", "settings.json"),
+    JSON.stringify({ env: { PLANTED_SETTING: "1" }, model: "claude-haiku-4-5" }),
+  );
+  writeFileSync(join(work, ".mcp.json"), JSON.stringify({ mcpServers: { planted: { command: "/bin/false" } } }));
+  t.after(() => {
+    rmSync(join(work, "CLAUDE.md"), { force: true });
+    rmSync(join(work, ".mcp.json"), { force: true });
+    rmSync(join(work, ".claude"), { recursive: true, force: true });
+  });
+  const { session, close } = await claudeCodeSession({ anthropic: TOKEN }, [lookupTool([])]);
+  const typed = "/model claude-haiku-4-5 and also @/etc/hostname";
+  await session.prompt(typed);
+  await close();
+  const call = api.captured.find(isTurn)!;
+  assert.equal(call.body.model, "claude-sonnet-5", "the slash command did not switch models");
+  assert.deepEqual(
+    conversation(call)[0]!.content.map((block) => block.text),
+    [typed],
+    "the person's text arrived as written",
+  );
+  const wire = JSON.stringify(call.body);
+  assert.ok(!wire.includes("Called the Read tool"), "no file mentioned with @ was read from the host");
+  assert.ok(!wire.includes("PLANTED-CLAUDE-MD"), "a CLAUDE.md in the working directory was not loaded");
+  assert.deepEqual(
+    call.body.tools?.map((tool) => tool.name),
+    ["mcp__qm__lookup"],
+    "a planted .mcp.json added no tools",
+  );
 });

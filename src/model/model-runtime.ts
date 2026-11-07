@@ -42,6 +42,7 @@ import {
 } from "./pi-models.ts";
 import { providerTurnError } from "./provider-error.ts";
 import { perTenant } from "../tenants/context.ts";
+import { withCleanup } from "../util/errors.ts";
 
 export function piUsageToCallUsage(
   u: Partial<Usage> | undefined,
@@ -134,7 +135,7 @@ export async function buildModelRuntime(
     }));
   const modelsPath = customModelsPath();
   const runtime = await ModelRuntime.create({ credentials, modelsPath });
-  const claudeCode = createClaudeCodeConnection();
+  const claudeCode = createClaudeCodeConnection({ gateway: Boolean(modelGateway) });
   if (apiKeys[CLAUDE_CODE_PROVIDER])
     runtime.registerProvider(CLAUDE_CODE_PROVIDER, {
       api: CLAUDE_CODE_PROVIDER as Api,
@@ -264,17 +265,16 @@ export async function probeModel(
 }
 
 export async function withModelRuntime<T>(
-  keys: ProviderKeys,
+  keys: ProviderKeys | string,
   modelGateway: ModelGatewayTransportConfig | undefined,
-  purpose: ModelRequestPurpose,
+  purpose: ModelRequestPurpose | undefined,
   use: (runtime: QmModelRuntime) => Promise<T>,
 ): Promise<T> {
   const runtime = await buildModelRuntime(keys, modelGateway, purpose);
-  try {
-    return await use(runtime);
-  } finally {
-    await runtime.close();
-  }
+  return withCleanup(
+    () => use(runtime),
+    () => runtime.close(),
+  );
 }
 
 async function probeRuntime(

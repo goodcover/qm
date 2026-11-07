@@ -20,7 +20,12 @@ import { MODEL_REGISTRY, type ModelEntry } from "./model-registry.ts";
 import { providerBaseUrl } from "./provider-endpoints.ts";
 import { type CustomRuntimeModel, isCustomModelId, resolveCustomModel } from "./custom-providers.ts";
 import type { ProviderKeys } from "./model-runtime.ts";
-import { CLAUDE_CODE_PREFIX, CLAUDE_CODE_PROVIDER, claudeCodeNativeId } from "./claude-subscription.ts";
+import {
+  CLAUDE_CODE_PREFIX,
+  CLAUDE_CODE_PROVIDER,
+  claudeCodeModelId,
+  claudeCodeNativeId,
+} from "./claude-subscription.ts";
 
 const getModel = getBuiltinModel as unknown as (provider: string, id: string) => Model<Api> | undefined;
 
@@ -334,7 +339,8 @@ export function auxiliaryModelFor(baseModelId: string): string {
   if (!provider) return baseModelId;
   if (provider === CLAUDE_CODE_PROVIDER) {
     const native = auxiliaryModelForProvider("anthropic");
-    return native && resolveModel(CLAUDE_CODE_PREFIX + native) ? CLAUDE_CODE_PREFIX + native : baseModelId;
+    const twin = native ? claudeCodeModelId(native) : undefined;
+    return twin && resolveModel(twin) ? twin : baseModelId;
   }
   return auxiliaryModelForProvider(provider) ?? baseModelId;
 }

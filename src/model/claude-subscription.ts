@@ -5,6 +5,10 @@ export function claudeCodeNativeId(id: string): string {
   return id.slice(CLAUDE_CODE_PREFIX.length);
 }
 
+export function claudeCodeModelId(nativeId: string): string {
+  return CLAUDE_CODE_PREFIX + nativeId;
+}
+
 const CLAUDE_SUBSCRIPTION_BETAS = ["claude-code-20250219", "oauth-2025-04-20"];
 
 export function isClaudeSubscriptionToken(key: string | undefined): boolean {

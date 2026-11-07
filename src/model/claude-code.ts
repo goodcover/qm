@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type {
@@ -23,7 +23,6 @@ import {
   parseStreamingJson,
   type Api,
   type AssistantMessage,
-  type AssistantMessageDiagnostic,
   type AssistantMessageEventStream,
   type Context,
   type ImageContent,
@@ -38,6 +37,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { transformMessages } from "@earendil-works/pi-ai/api/transform-messages";
 import { MAX_TOOL_RESULT_CHARS } from "../agent/agent-tools/record.ts";
+import { hashId } from "../util/crypto.ts";
 import { asError, errMessage, swallow } from "../util/errors.ts";
 import { claudeCodeNativeId, isClaudeSubscriptionToken } from "./claude-subscription.ts";
 import { zeroUsage } from "./model-runtime.ts";
@@ -49,20 +49,10 @@ const ANTHROPIC_TOOL_NAME_LIMIT = 64;
 const TOOL_USE_ID = "claudecode/toolUseId";
 const CLIENT_APP = "qm/claude-code-provider";
 const WORK_DIR = join(tmpdir(), "qm-claude-code-cwd");
-const HOST_MANAGED_SETTINGS = ["managed-settings.json", "managed-settings.d", "managed-mcp.json"].map((name) =>
-  join("/etc/claude-code", name),
-);
 const RESUMED_AT_TOOL_RESULTS = "[system] The run resumed after the tool results above. Continue the task.";
 
-const EFFORT: Record<string, EffortLevel> = {
-  minimal: "low",
-  low: "low",
-  medium: "medium",
-  high: "high",
-  xhigh: "xhigh",
-  max: "max",
-};
-const EFFORT_LEVELS = new Set<string>(Object.values(EFFORT));
+const QM_RESULT_CAP_AS_TOKENS = String(MAX_TOOL_RESULT_CHARS);
+const NEVER_RESUME_INTERRUPTED_TURN_AGE_MS = "1";
 
 const ERROR_TYPES: Record<SDKAssistantMessageError, string> = {
   authentication_failed: "authentication_error",
@@ -80,7 +70,7 @@ const ERROR_TYPES: Record<SDKAssistantMessageError, string> = {
   unknown: "api_error",
 };
 
-export function claudeCodeEnv(token: string, home: string, longestToolDescription = 0): Record<string, string> {
+function claudeCodeEnv(token: string, home: string, longestToolDescription = 0): Record<string, string> {
   return {
     PATH: "/usr/local/bin:/usr/bin:/bin",
     HOME: home,
@@ -92,8 +82,8 @@ export function claudeCodeEnv(token: string, home: string, longestToolDescriptio
     DISABLE_COMPACT: "1",
     CLAUDE_CODE_SILENT_TURN_REMINDER: "0",
     CLAUDE_CODE_TOTAL_TOKENS_REMINDER: "off",
-    CLAUDE_CODE_RESUME_INTERRUPTED_TURN_MAX_AGE_MS: "1",
-    MAX_MCP_OUTPUT_TOKENS: String(MAX_TOOL_RESULT_CHARS),
+    CLAUDE_CODE_RESUME_INTERRUPTED_TURN_MAX_AGE_MS: NEVER_RESUME_INTERRUPTED_TURN_AGE_MS,
+    MAX_MCP_OUTPUT_TOKENS: QM_RESULT_CAP_AS_TOKENS,
     ...(longestToolDescription ? { CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH: String(longestToolDescription) } : {}),
   };
 }
@@ -137,12 +127,10 @@ interface Live {
   served: Map<string, string>;
   waiting: Map<string, (result: CallToolResult) => void>;
   ready: Map<string, CallToolResult>;
-  inputs: Map<string, Record<string, unknown>>;
   step?: Step;
   awaiting: string[];
   failure?: Error;
   apiError?: { kind: SDKAssistantMessageError; text: string };
-  limits: AssistantMessageDiagnostic[];
   child?: ChildProcess;
   exit?: string;
   exited: Promise<void>;
@@ -180,7 +168,7 @@ function newStep(stream: AssistantMessageEventStream, model: Model<Api>): Step {
 }
 
 function toolCallId(id: string): string {
-  return `toolu_${createHash("sha256").update(id).digest("hex").slice(0, 32)}`;
+  return `toolu_${hashId([id], 32)}`;
 }
 
 function isToolCall(block: AssistantMessage["content"][number]): block is ToolCall {
@@ -192,7 +180,7 @@ function imageBlock(image: ImageContent): ContentBlock {
 }
 
 function textBlocks(text: string): ContentBlock[] {
-  return text.trim() ? [{ type: "text", text }] : [];
+  return text.trim() ? [{ type: "text", text: text.toWellFormed() }] : [];
 }
 
 function userBlocks(content: string | (TextContent | ImageContent)[]): ContentBlock[] {
@@ -208,7 +196,7 @@ function messageBlocks(message: Message): ContentBlock[] {
         type: "tool_result",
         tool_use_id: message.toolCallId,
         content: message.content.map((block) =>
-          block.type === "text" ? { type: "text", text: block.text } : imageBlock(block),
+          block.type === "text" ? { type: "text", text: block.text.toWellFormed() } : imageBlock(block),
         ),
         ...(message.isError ? { is_error: true } : {}),
       },
@@ -262,12 +250,9 @@ function splitPrompt(messages: readonly TranscriptMessage[]): {
 }
 
 function userMessage(content: ContentBlock[]): SDKUserMessage {
-  const [first, ...rest] = content;
-  const literal =
-    first?.type === "text" && first.text.startsWith("/") ? [{ ...first, text: `\n${first.text}` }, ...rest] : content;
   return {
     type: "user",
-    message: { role: "user", content: literal as Exclude<SDKUserMessage["message"]["content"], string> },
+    message: { role: "user", content: content as Exclude<SDKUserMessage["message"]["content"], string> },
     parent_tool_use_id: null,
   };
 }
@@ -276,7 +261,7 @@ function mcpResult(result: ToolResultMessage): CallToolResult {
   return {
     content: result.content.map((block) =>
       block.type === "text"
-        ? { type: "text" as const, text: block.text }
+        ? { type: "text" as const, text: block.text.toWellFormed() }
         : { type: "image" as const, data: block.data, mimeType: block.mimeType },
     ),
     ...(result.isError ? { isError: true } : {}),
@@ -331,8 +316,9 @@ function deliver(live: Live, id: string, result: CallToolResult): void {
 function effortFor(model: Model<Api>, reasoning: string | undefined): EffortLevel | undefined {
   if (!reasoning) return undefined;
   const mapped = model.thinkingLevelMap?.[reasoning as keyof NonNullable<Model<Api>["thinkingLevelMap"]>];
-  if (mapped === null) return undefined;
-  return typeof mapped === "string" && EFFORT_LEVELS.has(mapped) ? (mapped as EffortLevel) : EFFORT[reasoning];
+  if (typeof mapped === "string") return mapped as EffortLevel;
+  if (reasoning === "minimal" || reasoning === "low") return "low";
+  return reasoning === "medium" ? "medium" : "high";
 }
 
 function started(step: Step): void {
@@ -457,7 +443,7 @@ function onStreamEvent(live: Live, event: Record<string, unknown> & { type: stri
     else if (block.type === "thinking")
       step.stream.push({ type: "thinking_end", contentIndex: at, content: block.thinking, partial: output });
     else if (block.type === "toolCall") {
-      block.arguments = live.inputs.get(block.id) ?? parseStreamingJson(step.json.get(index));
+      block.arguments = parseStreamingJson(step.json.get(index));
       step.calls.push(block.id);
       step.stream.push({ type: "toolcall_end", contentIndex: at, toolCall: block, partial: output });
     }
@@ -500,16 +486,13 @@ function apiFailure(live: Live, text: string, status: number | null | undefined)
   });
 }
 
-function recordLimits(live: Live, step: Step): void {
-  if (live.limits.length) step.output.diagnostics = [...(step.output.diagnostics ?? []), ...live.limits.splice(0)];
-}
-
 function fail(live: Live, error: Error): void {
   if (live.failure) swallow("claude-code: later failure", error);
   else live.failure = error;
   const step = live.step;
   live.step = undefined;
-  if (step) failStep(step, live.failure ?? error, false);
+  if (step) failStep(step, live.failure, false);
+  else swallow("claude-code: failure held for the next step", error);
 }
 
 function onMessage(live: Live, message: SDKMessage): void {
@@ -532,6 +515,10 @@ function onMessage(live: Live, message: SDKMessage): void {
     );
     return;
   }
+  if (message.type === "auth_status" && message.error) {
+    console.error(`[claude-code] auth_status ${JSON.stringify(message)}`);
+    return;
+  }
   if (message.type === "system" && message.subtype !== "status") {
     console.error(`[claude-code] ${message.subtype} ${JSON.stringify(message)}`);
     return;
@@ -550,15 +537,11 @@ function onMessage(live: Live, message: SDKMessage): void {
         .trim();
       live.apiError = { kind: message.error, text };
     }
-    for (const block of message.message.content)
-      if (block.type === "tool_use") live.inputs.set(block.id, block.input as Record<string, unknown>);
     return;
   }
   if (message.type === "rate_limit_event") {
     const info = message.rate_limit_info;
     console.error(`[claude-code] subscription limit ${JSON.stringify(info)}`);
-    live.limits.push({ type: "claude_code_rate_limit", timestamp: Date.now(), details: { ...info } });
-    if (live.step) recordLimits(live, live.step);
     if (info.isUsingOverage === true || info.overageInUse === true)
       throw new ClaudeCodeFailure(
         "Claude reported that this request is drawing on extra usage (overage); the claude-code route refuses metered usage",
@@ -628,13 +611,26 @@ async function closeLive(live: Live, reason: string): Promise<void> {
   }
 }
 
-function refusalFor(closed: boolean, token: string | undefined): string | undefined {
-  if (closed) return "This model runtime has been closed";
+function refusalFor(closed: boolean, token: string | undefined, gateway: boolean): ClaudeCodeFailure | undefined {
+  if (closed) return new ClaudeCodeFailure("This model runtime has been closed", { type: "invalid_request_error" });
   if (!isClaudeSubscriptionToken(token))
-    return "Claude Code models need a Claude subscription OAuth token; this route never uses a metered API key";
+    return new ClaudeCodeFailure(
+      "Claude Code models need a Claude subscription OAuth token; this route never uses a metered API key",
+      { type: "authentication_error" },
+    );
+  if (gateway)
+    return new ClaudeCodeFailure(
+      "This deployment routes models through a model gateway, which Claude Code would bypass",
+      { type: "invalid_request_error" },
+    );
   const baseUrl = providerBaseUrl("anthropic");
   return baseUrl
-    ? `This deployment sends Anthropic traffic through ${baseUrl}, which Claude Code would bypass`
+    ? new ClaudeCodeFailure(
+        `This deployment sends Anthropic traffic through ${baseUrl}, which Claude Code would bypass`,
+        {
+          type: "invalid_request_error",
+        },
+      )
     : undefined;
 }
 
@@ -650,7 +646,7 @@ function continues(live: Live | undefined, messages: readonly Message[]): live i
   return calls.every((id) => answered.has(id));
 }
 
-export function createClaudeCodeConnection(): ClaudeCodeConnection {
+export function createClaudeCodeConnection({ gateway = false }: { gateway?: boolean } = {}): ClaudeCodeConnection {
   let live: Live | undefined;
   let connectionClosed = false;
 
@@ -671,7 +667,6 @@ export function createClaudeCodeConnection(): ClaudeCodeConnection {
     }
     const tail = messages.slice(messages.findLastIndex((message) => message.role === "assistant") + 1);
     target.step = step;
-    recordLimits(target, step);
     bindAbort(target, signal);
     const steer = tail.flatMap((message) => (message.role === "user" ? userBlocks(message.content) : []));
     if (steer.length) target.input.push(userMessage(steer));
@@ -690,20 +685,23 @@ export function createClaudeCodeConnection(): ClaudeCodeConnection {
     const previous = live;
     live = undefined;
     if (previous) await closeLive(previous, "Superseded by a new request");
-    const managed = HOST_MANAGED_SETTINGS.filter((path) => existsSync(path));
-    if (managed.length)
-      throw new ClaudeCodeFailure(
-        `Host-wide Claude Code managed settings (${managed.join(", ")}) would apply to QM's queries; refusing to start Claude Code`,
-        { type: "permission_error" },
-      );
     const lost = unservable(request.tools);
     if (lost.length)
       throw new ClaudeCodeFailure(`Claude Code cannot receive these QM tools: ${lost.join("; ")}`, {
         type: "invalid_request_error",
       });
-    const dir = realpathSync(mkdtempSync(join(tmpdir(), "qm-claude-code-")));
     mkdirSync(WORK_DIR, { recursive: true });
     const work = realpathSync(WORK_DIR);
+    const sdk = await import("@anthropic-ai/claude-agent-sdk");
+    const managed = (await sdk.resolveSettings({ settingSources: [], cwd: work })).sources.filter(
+      (source) => source.source === "managed",
+    );
+    if (managed.length)
+      throw new ClaudeCodeFailure(
+        `Claude Code managed settings (${managed.map((source) => source.path ?? source.policyOrigin ?? "policy").join(", ")}) would apply to QM's queries; refusing to start Claude Code`,
+        { type: "permission_error" },
+      );
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "qm-claude-code-")));
     let markExited!: () => void;
     const exited = new Promise<void>((resolve) => (markExited = resolve));
     const target: Live = {
@@ -715,8 +713,6 @@ export function createClaudeCodeConnection(): ClaudeCodeConnection {
       served: new Map(request.tools.map((tool) => [tool.name, tool.name.slice(TOOL_PREFIX.length)])),
       waiting: new Map(),
       ready: new Map(),
-      inputs: new Map(),
-      limits: [],
       step,
       awaiting: [],
       exited,
@@ -750,6 +746,7 @@ export function createClaudeCodeConnection(): ClaudeCodeConnection {
       skills: [],
       settings: { autoMemoryEnabled: false },
       includePartialMessages: true,
+      verbatimPrompts: true,
       extraArgs: { "disable-slash-commands": null },
       ...(request.tools.length ? { mcpServers: { [SERVER]: toolServer(request.tools, target) } } : {}),
       ...(history.length ? { resume: sessionId } : { sessionId }),
@@ -759,9 +756,8 @@ export function createClaudeCodeConnection(): ClaudeCodeConnection {
         : {}),
       spawnClaudeCodeProcess: spawnTracked(target),
     };
-    const { query } = await import("@anthropic-ai/claude-agent-sdk");
     if (target.closed || connectionClosed) return closeLive(target, "QM ended the turn");
-    target.query = query({ prompt: target.input, options });
+    target.query = sdk.query({ prompt: target.input, options });
     target.input.push(userMessage(prompt));
     try {
       for await (const message of target.query) {
@@ -770,10 +766,12 @@ export function createClaudeCodeConnection(): ClaudeCodeConnection {
       }
       if (!target.closed && !target.finished) {
         await target.exited;
-        throw new Error(`Claude Code ended without a result (${target.exit ?? "process state unknown"})`);
+        const ended = `Claude Code ended without a result (${target.exit ?? "process state unknown"})`;
+        throw apiFailure(target, [target.apiError?.text, ended].filter(Boolean).join(" — "), undefined);
       }
     } catch (error) {
-      if (!target.closed) fail(target, asError(error));
+      if (target.closed) swallow("claude-code: error after the query was closed", error);
+      else fail(target, asError(error));
     } finally {
       if (target.failure || target.finished) await closeLive(target, "The Claude Code query ended");
     }
@@ -784,17 +782,15 @@ export function createClaudeCodeConnection(): ClaudeCodeConnection {
       const stream = createAssistantMessageEventStream();
       const step = newStep(stream, model);
       const token = options?.apiKey;
-      const refusal = refusalFor(connectionClosed, token);
+      const refusal = refusalFor(connectionClosed, token, gateway);
       if (refusal) {
-        queueMicrotask(() =>
-          failStep(step, new ClaudeCodeFailure(refusal, { type: "authentication_error", status: 401 }), false),
-        );
+        queueMicrotask(() => failStep(step, refusal, false));
         return stream;
       }
       const messages = transformMessages(context.messages, model, toolCallId);
       const request: ClaudeCodeRequest = {
         model: claudeCodeNativeId(model.id),
-        system: context.systemPrompt ?? "",
+        system: (context.systemPrompt ?? "").toWellFormed(),
         messages: claudeCodeTranscript(messages),
         tools: (context.tools ?? []).map((tool) => ({
           name: TOOL_PREFIX + tool.name,

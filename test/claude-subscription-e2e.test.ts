@@ -5,51 +5,15 @@ import { buildApp } from "./support/build-app.ts";
 import { testConfig } from "./support/test-config.ts";
 import { createAgent } from "../src/agent/agent-run.ts";
 import { hashId } from "../src/util/crypto.ts";
+import { anthropicMessage } from "./support/gateway-stream.ts";
 
 const SUBSCRIPTION_TOKEN = "sk-ant-oat01-personal-e2e";
 
-function sse(events: unknown[]): Response {
-  const body = events.map((e) => `event: ${(e as { type: string }).type}\ndata: ${JSON.stringify(e)}\n\n`).join("");
-  return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
-}
-
-function message(model: string, blocks: unknown[], stop: string): Response {
-  const events: unknown[] = [
-    {
-      type: "message_start",
-      message: {
-        id: "msg_e2e",
-        type: "message",
-        role: "assistant",
-        model,
-        content: [],
-        stop_reason: null,
-        usage: { input_tokens: 10, output_tokens: 1 },
-      },
-    },
-  ];
-  blocks.forEach((block, index) => {
-    const b = block as { type: string; text?: string; id?: string; name?: string; input?: unknown };
-    if (b.type === "text") {
-      events.push({ type: "content_block_start", index, content_block: { type: "text", text: "" } });
-      events.push({ type: "content_block_delta", index, delta: { type: "text_delta", text: b.text } });
-    } else {
-      events.push({
-        type: "content_block_start",
-        index,
-        content_block: { type: "tool_use", id: b.id, name: b.name, input: {} },
-      });
-      events.push({
-        type: "content_block_delta",
-        index,
-        delta: { type: "input_json_delta", partial_json: JSON.stringify(b.input) },
-      });
-    }
-    events.push({ type: "content_block_stop", index });
+function message(model: string, blocks: Array<Record<string, unknown> & { type: string }>, stop: string): Response {
+  return new Response(anthropicMessage(model, blocks, stop, { input_tokens: 10, output_tokens: 1 }), {
+    status: 200,
+    headers: { "content-type": "text/event-stream" },
   });
-  events.push({ type: "message_delta", delta: { stop_reason: stop }, usage: { output_tokens: 5 } });
-  events.push({ type: "message_stop" });
-  return sse(events);
 }
 
 type Seen = Array<{ headers: Headers; body: Record<string, unknown> }>;

@@ -707,6 +707,11 @@ async function createIsolatedResources(prefix: string, systemPrompt: string): Pr
   return { resourceLoader, settingsManager, cwd, agentDir, ...(ephemeralCwd ? { ephemeralCwd } : {}) };
 }
 
+async function releaseTurnSession(turn: { agentDir: string; ephemeralCwd?: string; modelRuntime: QmModelRuntime }) {
+  removeIsolatedDirs(turn);
+  await turn.modelRuntime.close();
+}
+
 function removeIsolatedDirs(dirs: { agentDir: string; ephemeralCwd?: string }): void {
   for (const dir of [dirs.agentDir, dirs.ephemeralCwd]) {
     if (!dir) continue;
@@ -732,55 +737,55 @@ export async function oneShot(
     recordLlmRequest?: (rec: TurnLlmRequestRecord) => void | Promise<void>;
   },
 ): Promise<string | undefined> {
-  const modelRuntime = await buildModelRuntime(keys, opts?.modelGateway, opts?.purpose);
-  const { resourceLoader, settingsManager, cwd, agentDir, ephemeralCwd } = await createIsolatedResources(
-    prefix,
-    systemPrompt,
-  );
-  try {
-    const { session } = await createAgentSession({
-      model,
-      modelRuntime,
-      resourceLoader,
-      settingsManager,
-      customTools: [],
-      noTools: "builtin",
-      sessionManager: SessionManager.inMemory(),
-      ...(opts?.thinkingLevel ? { thinkingLevel: opts.thinkingLevel } : {}),
-      cwd,
-      agentDir,
-    });
-    const messagesBefore = session.messages.length;
-    if (opts?.signal?.aborted) return undefined;
-    const onAbort = () => {
-      void session.abort().catch(() => undefined);
-    };
-    opts?.signal?.addEventListener("abort", onAbort, { once: true });
-    let recorded: Promise<void> = Promise.resolve();
-    let step = 0;
-    const unsubscribe = session.agent.subscribe((event) => {
-      if (event.type === "agent_start" && opts?.signal?.aborted) session.agent.abort();
-      if (event.type === "message_end" && event.message.role === "assistant" && opts?.recordLlmRequest) {
-        const record = opts.recordLlmRequest;
-        const call = event.message;
-        const at = step++;
-        recorded = recorded.then(() => recordOneShotCall(record, call, at, model));
-      }
-    });
+  return withModelRuntime(keys, opts?.modelGateway, opts?.purpose, async (modelRuntime) => {
+    const { resourceLoader, settingsManager, cwd, agentDir, ephemeralCwd } = await createIsolatedResources(
+      prefix,
+      systemPrompt,
+    );
     try {
-      await session.prompt(prompt);
-    } catch (err) {
-      throw piTurnError(session, err, messagesBefore);
+      const { session } = await createAgentSession({
+        model,
+        modelRuntime,
+        resourceLoader,
+        settingsManager,
+        customTools: [],
+        noTools: "builtin",
+        sessionManager: SessionManager.inMemory(),
+        ...(opts?.thinkingLevel ? { thinkingLevel: opts.thinkingLevel } : {}),
+        cwd,
+        agentDir,
+      });
+      const messagesBefore = session.messages.length;
+      if (opts?.signal?.aborted) return undefined;
+      const onAbort = () => {
+        void session.abort().catch(() => undefined);
+      };
+      opts?.signal?.addEventListener("abort", onAbort, { once: true });
+      let recorded: Promise<void> = Promise.resolve();
+      let step = 0;
+      const unsubscribe = session.agent.subscribe((event) => {
+        if (event.type === "agent_start" && opts?.signal?.aborted) session.agent.abort();
+        if (event.type === "message_end" && event.message.role === "assistant" && opts?.recordLlmRequest) {
+          const record = opts.recordLlmRequest;
+          const call = event.message;
+          const at = step++;
+          recorded = recorded.then(() => recordOneShotCall(record, call, at, model));
+        }
+      });
+      try {
+        await session.prompt(prompt);
+      } catch (err) {
+        throw piTurnError(session, err, messagesBefore);
+      } finally {
+        unsubscribe();
+        opts?.signal?.removeEventListener("abort", onAbort);
+        await recorded;
+      }
+      return piLastAssistantTextOrThrow(session);
     } finally {
-      unsubscribe();
-      opts?.signal?.removeEventListener("abort", onAbort);
-      await recorded;
+      removeIsolatedDirs({ agentDir, ephemeralCwd });
     }
-    return piLastAssistantTextOrThrow(session);
-  } finally {
-    removeIsolatedDirs({ agentDir, ephemeralCwd });
-    await modelRuntime.close();
-  }
+  });
 }
 
 async function recordOneShotCall(
@@ -964,8 +969,7 @@ export function createAgent(opts?: AgentOptions): Agent {
         agentDir,
       }));
     } catch (err) {
-      removeIsolatedDirs({ agentDir, ephemeralCwd });
-      await modelRuntime.close();
+      await releaseTurnSession({ agentDir, ephemeralCwd, modelRuntime });
       throw err;
     }
 
@@ -1656,8 +1660,7 @@ export function createAgent(opts?: AgentOptions): Agent {
           ...(entry.ref.silentRequested ? { silent: true } : {}),
         });
       } finally {
-        removeIsolatedDirs(entry);
-        await entry.modelRuntime.close();
+        await releaseTurnSession(entry);
       }
     },
 
