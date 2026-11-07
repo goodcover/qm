@@ -219,7 +219,7 @@ else console.log("{}");
   const config = {
     contract: 1,
     orgId: "acme",
-    publicUrl: "http://localhost:8080",
+    publicUrl: "https://agent.acme.example",
     target: "aws",
     services: ["core"],
     env: { core: { AWS_DEPLOY_IMAGE: "acme-microvm-app", AWS_DEPLOY_IMAGE_VERSION: "1" } },
@@ -311,7 +311,7 @@ else if (args.includes("describe-task-definition")) console.log(${JSON.stringify
 else if (args.includes("list-tasks")) console.log(JSON.stringify({ taskArns: ["live-core"] }));
 else if (args.includes("describe-tasks") && args.includes("live-core")) console.log(JSON.stringify({ tasks: [{ taskDefinitionArn: "task", lastStatus: "RUNNING", containers: [{ name: "core", networkInterfaces: [{ privateIpv4Address: "10.0.1.8" }] }] }] }));
 else if (args.includes("run-task")) console.log(JSON.stringify({ tasks: [{ taskArn: "canary" }] }));
-else if (args.includes("describe-tasks")) console.log(JSON.stringify({ tasks: [{ containers: [{ name: "core", exitCode: 0 }] }] }));
+else if (args.includes("describe-tasks")) console.log(JSON.stringify({ tasks: [{ lastStatus: "STOPPED", containers: [{ name: "core", exitCode: 0 }] }] }));
 else if (args.includes("dynamodb get-item") && args.includes("deployment/current")) console.log(JSON.stringify({ Item: { manifestId: { S: "manifest" } } }));
 else if (args.includes("dynamodb get-item") && args.includes("deployment/manifest/manifest")) console.log(JSON.stringify({ Item: { manifest: { S: ${JSON.stringify(JSON.stringify(manifest))} } } }));
 else if (args.includes("s3api get-object")) fs.writeFileSync(argv[argv.indexOf("--key") + 2], ${JSON.stringify(layerBody)});
@@ -482,7 +482,7 @@ test("infra delete-task-definitions requires explicit destructive confirmation",
       services: ["core"],
       plugins: [],
       skills: [],
-      env: { core: { HARNESS: "mock", AWS_DEPLOY_IMAGE: "acme-sandbox" } },
+      env: { core: { AWS_DEPLOY_IMAGE: "acme-sandbox" } },
       imageOverrides: {},
       aws: {
         accountId: "123456789012",
@@ -509,6 +509,7 @@ test("destructive commands reject extra positionals and boolean flags never cons
   for (const argv of [
     ["up", "unexpected"],
     ["up", "--dry-run", "unexpected"],
+    ["up", "--upgrade-minio", "unexpected"],
     ["sandbox", "build", "unexpected"],
     ["down", "--purge", "unexpected"],
     ["rollback", "unexpected"],
@@ -523,6 +524,9 @@ test("destructive commands reject extra positionals and boolean flags never cons
   const valuedBoolean = await run(["sandbox", "build", "--dry-run=false"]);
   assert.equal(valuedBoolean.exitCode, 2, valuedBoolean.out);
   assert.match(valuedBoolean.out, /--dry-run does not take a value/);
+  const valuedUpgrade = await run(["up", "--upgrade-minio=true"]);
+  assert.equal(valuedUpgrade.exitCode, 2, valuedUpgrade.out);
+  assert.match(valuedUpgrade.out, /--upgrade-minio does not take a value/);
 });
 
 test("unknown dev subcommands validate flags and extra arguments before reporting usage", async () => {

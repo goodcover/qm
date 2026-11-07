@@ -1,4 +1,4 @@
-import { resolvePgCaTrust } from "../persistence/pg-pool.ts";
+import { pgConnectionOptions, resolvePgCaTrust } from "../persistence/pg-pool.ts";
 import { randomUUID } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { PORTAL_IDENTITY_HEADER } from "../auth/portal-identity.ts";
@@ -47,7 +47,6 @@ export function deployedHealthUrls(flyAppName: string | undefined, publicWebUrl:
   const prefix = flyAppName.slice(0, -"-core".length);
   return [
     "http://127.0.0.1:8080/healthz",
-    `http://${prefix}-admin.internal:8080/healthz`,
     `http://${prefix}-web-ui.flycast/healthz`,
     `http://${prefix}-portal.internal:8080/healthz`,
     new URL("/healthz", publicWebUrl).toString(),
@@ -189,7 +188,7 @@ export async function checkLiveSession(
     const titleSignal = (timing.timeout ?? AbortSignal.timeout)(60_000);
     let persisted = (await request("GET", sessionPath, undefined, false, titleSignal)) as {
       session?: { title?: string | null };
-      entries?: Array<{ type?: string }>;
+      items?: Array<{ kind?: string; variant?: string | null }>;
     };
     while (!persisted.session?.title?.trim() && timing.now() < titleDeadline && !titleSignal.aborted) {
       await timing.sleep(Math.min(500, titleDeadline - timing.now()));
@@ -198,9 +197,9 @@ export async function checkLiveSession(
     }
     if (timing.now() >= titleDeadline || titleSignal.aborted || !persisted.session?.title?.trim())
       throw new Error("live session has no generated title");
-    if (!persisted.entries?.some((entry) => entry.type === "user"))
+    if (!persisted.items?.some((item) => item.kind === "UserMessage"))
       throw new Error("live session has no persisted user turn");
-    if (!persisted.entries.some((entry) => entry.type === "assistant")) {
+    if (!persisted.items.some((item) => item.kind === "AgentMessage" && !item.variant)) {
       throw new Error("live session has no persisted assistant turn");
     }
 
@@ -284,14 +283,13 @@ async function checkDatabase(config: PostdeployConfig): Promise<void> {
   if (!databaseUrl) throw new Error("postdeploy smoke requires DATABASE_URL");
   const pg = (await import("pg")).default;
   const client = new pg.Client({
-    connectionString: databaseUrl,
+    ...pgConnectionOptions(
+      databaseUrl,
+      resolvePgCaTrust({ cert: config.databaseCaCert, certFile: config.databaseCaCertFile }).ssl?.ca,
+    ),
     connectionTimeoutMillis: 30_000,
     query_timeout: 30_000,
     statement_timeout: 30_000,
-    ...resolvePgCaTrust({
-      ...(config.databaseCaCert ? { cert: config.databaseCaCert } : {}),
-      ...(config.databaseCaCertFile ? { certFile: config.databaseCaCertFile } : {}),
-    }),
   });
   await client.connect();
   try {

@@ -1,4 +1,4 @@
-export const SERVICE_NAMES = ["core", "web-ui", "admin", "portal", "auth"] as const;
+export const SERVICE_NAMES = ["core", "web-ui", "portal", "auth", "egress-proxy"] as const;
 export type ServiceName = (typeof SERVICE_NAMES)[number];
 
 export const isServiceName = (s: string): s is ServiceName => (SERVICE_NAMES as readonly string[]).includes(s);
@@ -12,7 +12,6 @@ export const isVirtualService = (s: string): s is VirtualServiceName =>
 export const isDeclaredService = (s: string): s is DeclaredServiceName => isServiceName(s) || isVirtualService(s);
 
 export function serviceHost(name: string): string {
-  if (name === "admin") return "web-ui";
   if (name === "auth") return "portal";
   if (name === "slack") return "core";
   return name;
@@ -27,8 +26,7 @@ export function hostedServiceEnv(
   host: string,
 ): Record<string, string> {
   if (host === "core" || serviceHost(host) !== host) return { ...env[host as DeclaredServiceName] };
-  const out: Record<string, string> =
-    host === "web-ui" ? { ADMIN_ENABLED: services.includes("admin") ? "1" : "0" } : {};
+  const out: Record<string, string> = {};
   for (const service of services.filter((name) => serviceHost(name) === host)) {
     for (const [name, value] of Object.entries(env[service] ?? {})) {
       if (name === "PORT") continue;
@@ -71,7 +69,6 @@ export interface ServiceCtx {
   orgId: string;
   deployAppPrefix: string;
   publicUrl: string;
-  hasPortal: boolean;
   hasAuth: boolean;
   authAllowedEmailDomain?: string;
   brand?: BrandEnv;
@@ -86,13 +83,14 @@ interface FlyServiceSpec {
   stackKeys: string[];
   deployFlags: string[];
   flycast?: boolean;
+  publicIngress?: boolean;
 }
 
 export interface ServiceDef {
   name: ServiceName;
   readiness: RegExp;
   order: number;
-  dev: {
+  dev?: {
     cwd: string;
     entry: string[];
     portEnv?: "PORT";
@@ -105,6 +103,7 @@ export interface ServiceDef {
     hostPortOffset?: number;
   };
   fly?: FlyServiceSpec;
+  tcpIngress?: { healthCheck: string[] };
 }
 
 export interface BrandEnv {
@@ -117,13 +116,7 @@ export const brandEnvOf = (c: { botName?: string; orgName?: string }): BrandEnv 
     ? { ...(c.botName ? { botName: c.botName } : {}), ...(c.orgName ? { orgName: c.orgName } : {}) }
     : undefined;
 
-export function orgEnv(
-  service: string,
-  orgId: string,
-  publicUrl: string,
-  hasPortal: boolean,
-  brand?: BrandEnv,
-): Record<string, string> {
+export function orgEnv(service: string, orgId: string, publicUrl: string, brand?: BrandEnv): Record<string, string> {
   const base = publicUrl.replace(/\/$/, "");
   const identity: Record<string, string> = service === "core" ? { ORG_ID: orgId } : { CORE_ORG_ID: orgId };
   const webUiUrl = base;
@@ -136,10 +129,9 @@ export function orgEnv(
       ...(brand?.orgName ? { ORG_BRAND_ORG_NAME: brand.orgName } : {}),
     };
   }
-  if (service === "web-ui") return { ...identity, WEB_UI_PUBLIC_URL: webUiUrl, ADMIN_BASE_PATH: "/admin" };
+  if (service === "web-ui") return { ...identity, WEB_UI_PUBLIC_URL: webUiUrl };
   if (service === "portal")
     return { ...identity, PORTAL_PUBLIC_URL: base, ...(brand?.botName ? { AUTH_BRAND_NAME: brand.botName } : {}) };
-  if (service === "admin" && hasPortal) return { ...identity, ADMIN_BASE_PATH: "/admin" };
   if (service === "auth") return { ...identity, ...(brand?.botName ? { AUTH_BRAND_NAME: brand.botName } : {}) };
   return identity;
 }
@@ -208,7 +200,7 @@ const brokerEnv = (service: string, s: ServiceCtx): Record<string, string> =>
 
 const pluginWiring = (service: string, s: ServiceCtx): Record<string, string> => ({
   CORE_API_URL: s.coreUrl,
-  ...orgEnv(service, s.orgId, s.publicUrl, s.hasPortal, s.brand),
+  ...orgEnv(service, s.orgId, s.publicUrl, s.brand),
   ...brokerEnv(service, s),
 });
 
@@ -221,7 +213,7 @@ const CATALOG: Record<ServiceName, ServiceDef> = {
     docker: { image: "core", internalPort: 8080, portEnv: "PORT", hostPortOffset: 0 },
     fly: {
       managed: (s) => ({
-        ...orgEnv("core", s.orgId, s.publicUrl, s.hasPortal, s.brand),
+        ...orgEnv("core", s.orgId, s.publicUrl, s.brand),
         ...brokerEnv("core", s),
         FLY_DEPLOY_APP_PREFIX: s.deployAppPrefix,
       }),
@@ -255,18 +247,6 @@ const CATALOG: Record<ServiceName, ServiceDef> = {
       flycast: true,
     },
   },
-  admin: {
-    name: "admin",
-    readiness: /\[admin-plugin\] http/,
-    order: 30,
-    dev: { cwd: "plugins/admin", entry: ["src/index.ts"], portEnv: "PORT", portSlotOffset: 32 },
-    docker: { image: "admin", internalPort: 8080, portEnv: "PORT", hostPortOffset: 3 },
-    fly: {
-      managed: (s) => pluginWiring("admin", s),
-      stackKeys: ["ADMIN_BASE_PATH"],
-      deployFlags: ["--ha=false"],
-    },
-  },
   portal: {
     name: "portal",
     readiness: /public front door on/,
@@ -277,7 +257,6 @@ const CATALOG: Record<ServiceName, ServiceDef> = {
       managed: (s) => ({
         ...pluginWiring("portal", s),
         WEB_UI_UPSTREAM: `http://${s.appPrefix}-web-ui.flycast`,
-        ADMIN_UPSTREAM: `http://${s.appPrefix}-web-ui.flycast/admin`,
       }),
       stackKeys: [
         "PORTAL_PUBLIC_URL",
@@ -319,6 +298,26 @@ const CATALOG: Record<ServiceName, ServiceDef> = {
       ],
       deployFlags: ["--ha=false", "--flycast", "--no-public-ips"],
       flycast: true,
+    },
+  },
+  "egress-proxy": {
+    name: "egress-proxy",
+    readiness: /starting main dispatch loop/,
+    order: 50,
+    docker: { image: "egress-proxy", internalPort: 48080, portEnv: "PORT", hostPortOffset: 4 },
+    fly: {
+      managed: (s) => pluginWiring("egress-proxy", s),
+      stackKeys: [],
+      deployFlags: ["--ha=false"],
+      publicIngress: true,
+    },
+    tcpIngress: {
+      healthCheck: [
+        "CMD",
+        "node",
+        "-e",
+        "require('net').connect(48081,'127.0.0.1').on('connect',()=>require('http').get({socketPath:'/tmp/envoy-admin.sock',path:'/ready'},r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))).on('error',()=>process.exit(1))",
+      ],
     },
   },
 };

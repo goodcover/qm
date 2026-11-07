@@ -60,7 +60,7 @@ hooks bind a guest-local resolver file over `/etc/resolv.conf`, directing DNS to
 the dedicated gateway at `172.16.31.250`. The image requires `ALL` additional guest
 OS capabilities. Gateway infrastructure and enrollment credentials stay in ops.
 
-Build an archive locally, using **this checkout's** `aws/microvm-agent/Dockerfile`
+Build an archive locally, using **this checkout's** `cli/templates/aws/microvm-agent/Dockerfile`
 and `agent.mjs`, plus the Goodcover wrapper:
 
 ```sh
@@ -82,6 +82,11 @@ builder in ops remains the record of that release. New sandbox work belongs here
 
 ## Application builds and production versions
 
+`app-origin/`, `plain-oauth/` and `plain-tool-catalog/` record how the 0.1.11-era
+images were derived from older pins. Their behavior now lives in this source tree,
+and current releases build every service from source, so their patches and
+Dockerfiles are no longer a build path.
+
 `deployed-baseline.json` records the production pins at fork setup, including
 QM package 0.1.11, its source commit, and MicroVM version 4.0. It is historical;
 `ops.py images` reads the authoritative current pins from ops.
@@ -100,12 +105,33 @@ create a second connection with production bot credentials for local QA. The
 0.1.12 source update accepts the existing 0.1.11 installation without migration
 or token re-entry. Ops owns the release's immutable image pins and rollout record.
 
+## Divergences from upstream
+
+- **Deployed apps on the QM origin.** Dan authorized removing the deployed-app
+  browser sandbox on 2026-09-17; see `app-origin/README.md`. Apps proxied through
+  `/d/`, the admin deployment proxy and `/deployments/` run on the QM origin without
+  a sandbox CSP, and can make authenticated same-origin requests as the viewer.
+  Upstream's documentation of sandboxed proxied HTML, including `docs/porter.md`,
+  does not apply to this fork.
+- **No age-based credential sweep.** Upstream deletes command credential directories
+  in `/tmp` after two hours. Goodcover removed that sweep because it could delete the
+  credentials of a command still running. A directory left behind by a crash remains
+  until that computer is replaced.
+- **Private MCP hosts.** Upstream refuses MCP endpoints that resolve to private
+  network addresses. Goodcover's SigNoz MCP server runs in the cluster at
+  `signoz-mcp.signoz.svc.cluster.local`, so core's `MCP_PRIVATE_HOSTS` lists that
+  host. MCP calls to a listed host skip the address check entirely, so they may
+  reach whatever address the host resolves to. The list holds exact host names,
+  with no wildcards. It lives only in the core ConfigMap, so the
+  admin UI cannot widen it, and OAuth discovery still refuses private addresses.
+
 ## Historical deployed baseline: Claude Code alongside Codex
 
 The instructions in this section describe the pre-0.1.15 deployed baseline.
-They are not configuration instructions for this source candidate. The 0.1.15
-candidate retires native Codex and OpenCode; use the [Pi subscription migration
-guide](UPGRADE-0.1.15.md) when preparing a separately authorized rollout.
+They are not configuration instructions for the current source. Production now
+runs 0.1.15-gc.1 on Pi; see [UPGRADE-0.1.15.md](UPGRADE-0.1.15.md). The 0.1.16
+source removes the Claude Code harness and the harness picker entirely; see
+[UPGRADE-0.1.16.md](UPGRADE-0.1.16.md).
 
 The deployed core already includes the Claude Code harness. Adding a token to
 Keychain does not automatically approve the harness or connect the credential
@@ -137,9 +163,11 @@ it when expired or revoked. The entry's ID is safe to keep in ops configuration.
 
 ## Upstream updates and CI
 
-The current 0.1.15 source candidate adopts Pi while retaining ChatGPT subscription
-access. Use [the candidate upgrade guide](UPGRADE-0.1.15.md) for its configuration,
-migration, and rollback requirements. The version notes below are historical.
+Production runs 0.1.15-gc.1, which adopted Pi while retaining ChatGPT subscription
+access ([UPGRADE-0.1.15.md](UPGRADE-0.1.15.md)). The 0.1.16 source candidate is not
+deployed. Use [its upgrade guide](UPGRADE-0.1.16.md) for its configuration, its
+three-hop database migration and recovery requirements. The version notes below are
+historical.
 
 The historical 0.1.13 source merge retained Goodcover's Codex 0.156.1 and Claude Agent SDK
 0.3.280, Plain OAuth and MCP catalog support, model reasoning capabilities,
@@ -154,7 +182,7 @@ The source build uses upstream Pi security.4 and patched HTTP, URI, IP parsing,
 glob expansion, and Mermaid dependencies so production dependency audits pass.
 The core image retains its build-time security audit.
 
-The historical GPT-6.1 Sol addition upgraded Codex to 0.159.2 for its native model catalog.
+The historical GPT-6.1 Sol addition upgraded the native Codex harness, since removed, to 0.159.2 for its model catalog.
 The organization and personal defaults remain unchanged. Axios is pinned by the
 lockfile at 1.20.0 so Slack dependencies pass the production security audit.
 

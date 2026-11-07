@@ -26,6 +26,15 @@ Check `connections` before work that depends on an app. If the app is in the cat
 - For other apps in Slack conversations, mint a link with `authorize` (step 3 below) and say you'll pick the task back up when they reply.
 - If the app isn't in the catalog, say so in one sentence and don't show the picker. Look for the provider's official API or MCP server yourself. If it uses API keys, send a secure keychain drop link instead of asking for the key in chat.
 
+## Reconnect or disconnect an app
+
+Each account in `connections` lists `missingScopes`: permissions the app's configuration now requests that this connection never got. Providers like X can't upgrade a token in place, so only a fresh consent fixes it.
+
+- When a tool fails with 403 or an insufficient-scope error and that account's `missingScopes` is non-empty, say so in one sentence and offer to reconnect instead of retrying.
+- In web chat, show `::connect-apps{toolkit="twitter"}`. For a connected app it offers Reconnect and Disconnect, and removes the replaced account itself after a verified reconnect.
+- Elsewhere, `authorize` a new link (step 3 below). Once the new account ID is listed in `connections`, remove the old one with `apps("disconnect", {accountId})`, never before.
+- When asked to remove or reset a connection, call `apps("disconnect", {accountId})` on a turn the user started. It only removes their own connections and can't be undone.
+
 ## Backend API
 
 Use the authenticated QM API from the computer through `execute` with an explicit `sandbox_id`. The Composio project key stays in QM's backend. Do not request it from the keychain, install the Composio SDK, use old SDK scripts, or call Composio directly. Existing execute approval and command policies still apply.
@@ -56,11 +65,28 @@ async function apps(path, body) {
 Large pulls (a month of email, a full channel history) fail when one call asks for too much: an oversized page either times out (`cause: "timeout"`) or is rejected by the provider (`providerStatus: 413`). Page conservatively instead:
 
 - List first, fetch second: request IDs or metadata only (for Gmail, `ids_only` or `include_payload: false`), then fetch bodies in batches of about 25 for just the messages you need.
-- On a `502`, read the JSON body (`cause`, `providerStatus`, `message`); with Python, catch `urllib.error.HTTPError` and read `e.read()`. Back off and shrink the page rather than repeating the same request.
+- On a `502`, read the JSON body (`cause`, `providerStatus`, `message`); with curl, use `--fail-with-body` or skip `-f` so the body survives. Back off and shrink the page rather than repeating the same request.
 - For long pulls, write progress (page token, fetched IDs) to a file so the job can resume, and run it in the background.
 
 The API checks active account ownership and toolkit on every execution. Personal connections are available only in authorized contexts. Shared conversations require explicit sharing; unattended work needs its existing owner-keychain authorization. A denial is not permission to switch credentials, accounts, identities, or access paths.
 
 Do not call Composio's callback completion API from the computer. Callback identity verification belongs to the signed-in browser and trusted QM backend. If verification setup is missing, ask the operator to fix it.
 
-Automatic file transfer is unsupported. A local filename does not upload bytes. When Composio is unavailable, use direct OAuth only if independently configured and authorized; do not use it to bypass a denial.
+Tools don't transfer files: a local filename passed as an argument uploads nothing. The one exception is X images, below. When Composio is unavailable, use direct OAuth only if independently configured and authorized; do not use it to bypass a denial.
+
+### Gmail
+
+- Create drafts as HTML (`is_html: true`) with plain `<p>` paragraphs and no styling. Plain-text drafts have reached recipients hard-wrapped at about 70 characters.
+- Only the SENT label (`in:sent`) shows what was sent. Draft timestamps are creation times, not send times.
+- If the user states a fact about their own mail that conflicts with your read, re-check before contradicting them, and say exactly what you misread.
+
+### Images for X posts
+
+X's post tool attaches media by ID but can't upload it. Upload the image from the computer first, then post with the returned ID:
+
+```js
+const data = (await import("node:fs")).readFileSync("chart.png").toString("base64");
+const { mediaId } = await apps("twitter/media", { accountId: account.id, data });
+```
+
+Pass `mediaId` in the post tool's media IDs argument (discover its exact name with `tools`). Only the caller's own active X connection works. It accepts one PNG, JPEG or WebP image of up to 5 MB per call; for several images, upload each and pass all IDs. GIFs and video aren't supported. Uploading posts nothing and is safe to retry; unattached media expires within a day. A `403` from X (`providerStatus`) usually means the connection lacks media permission, so offer to reconnect X.

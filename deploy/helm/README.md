@@ -1,8 +1,8 @@
 # QM Helm chart
 
-This chart runs core, web-ui (including `/admin`), portal (including `/idp` auth),
-and the optional egress proxy. `services.auth` and `services.admin` configure
-embedded modules, not separate Deployments or Services.
+This chart runs core, web-ui (including the admin settings at `/settings`), portal
+(including `/idp` auth), and the optional egress proxy. `services.auth` configures
+an embedded module, not a separate Deployment or Service.
 
 ## Images
 
@@ -87,7 +87,6 @@ services:
   core:
     replicas: 2
     env:
-      SESSION_STORE: postgres
       SNAPSHOT_STORE: s3
       TRANSFER_STORE: s3
       S3_BUCKET: qm-example-data
@@ -115,14 +114,12 @@ Core keeps durable state in two places: Postgres (`DATABASE_URL`) and an object
 store for file bytes. Choose one of two layouts.
 
 **Shared storage (recommended, supports multiple replicas).** Set `DATABASE_URL`
-with `SESSION_STORE=postgres`, `SNAPSHOT_STORE=s3`, `TRANSFER_STORE=s3`, `S3_BUCKET`
+with `SNAPSHOT_STORE=s3`, `TRANSFER_STORE=s3`, `S3_BUCKET`
 and `S3_REGION` (optionally `S3_PREFIX`) on core, use a remote `SANDBOX_BACKEND`,
 and leave `services.core.persistence` disabled. Sessions and runs then live in
 Postgres, and uploaded artifacts, session shares, published-app source archives and
 sandbox file transfers go to the bucket, so replicas share that state and pods can
-be replaced with rolling updates. Without `SESSION_STORE=postgres`, sessions and
-runs stay in process memory even when `DATABASE_URL` is set; an explicit
-`RUN_STORE=memory` also keeps runs there. S3
+be replaced with rolling updates. Core refuses to start without `DATABASE_URL`. S3
 credentials come from the standard AWS chain, such as a pod IAM role bound through
 `serviceAccount.create=true` with `serviceAccount.annotations`, or
 `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` in the runtime Secret. Any S3-compatible

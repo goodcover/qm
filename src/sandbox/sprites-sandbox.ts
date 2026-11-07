@@ -1,11 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { setTimeout as wait } from "node:timers/promises";
 import type { Readable } from "node:stream";
 import { APIError, SpritesClient, type Checkpoint, type SpriteCheck, type StreamMessage } from "@fly/sprites";
-import { createMemoryMap, type DurableMap } from "../persistence/durable-map.ts";
-import { createMemoryAdvisoryLock, type AdvisoryLock } from "../persistence/advisory-lock.ts";
-import type { WorkspaceStore } from "../workspace/workspace-store.ts";
-import { jitteredBackoffMs, retryAfterMs, withAbort, withTimeout } from "../util/async.ts";
+import type { DurableMap } from "../persistence/durable-map.ts";
+import type { AdvisoryLock } from "../persistence/advisory-lock.ts";
+import { retryAfterMs, retryOperation, withTimeout } from "../util/async.ts";
 import { swallow, errMessage } from "../util/errors.ts";
 import { shq } from "../util/shell.ts";
 import { createExecProcessSessions, processSessionDir, type ExecProcessIo } from "./exec-process-session.ts";
@@ -67,6 +65,11 @@ function parsePressure(ioFull10Raw: string, ioFull60Raw: string, load1Raw: strin
   };
 }
 
+function withoutSdkUrl(message: string): string {
+  const url = message.lastIndexOf(" (url: ");
+  return url < 0 ? message : message.slice(0, url);
+}
+
 export function spritesErrorDetail(e: unknown): string {
   if (!(e instanceof APIError)) return errMessage(e);
   const parts = [e.message];
@@ -77,25 +80,16 @@ export function spritesErrorDetail(e: unknown): string {
   return parts.join("; ");
 }
 
-export async function retrySpritesControl<T>(operation: () => Promise<T>, timeoutMs = 60_000): Promise<T> {
-  const signal = AbortSignal.timeout(timeoutMs);
-  for (let attempt = 1; ; attempt++) {
-    try {
-      return await withAbort(operation, signal);
-    } catch (error) {
-      signal.throwIfAborted();
-      if (!(error instanceof APIError) || ![429, 500, 502, 503, 504].includes(error.statusCode ?? 0) || attempt >= 4)
-        throw error;
-      const seconds = error.getRetryAfterSeconds();
-      const delay = seconds === undefined ? undefined : retryAfterMs(new Headers({ "retry-after": String(seconds) }));
-      try {
-        await wait(delay ?? jitteredBackoffMs(attempt), undefined, { signal });
-      } catch (error) {
-        signal.throwIfAborted();
-        throw error;
-      }
-    }
-  }
+export function retrySpritesControl<T>(operation: () => Promise<T>, timeoutMs = 60_000): Promise<T> {
+  return retryOperation(operation, "idempotent", {
+    timeoutMs,
+    statusOf: (error) => (error instanceof APIError ? error.statusCode : undefined),
+    networkError: (error) => error instanceof Error && error.message.startsWith("Network error: "),
+    retryAfterMsOf: (error) => {
+      const seconds = error instanceof APIError ? error.getRetryAfterSeconds() : undefined;
+      return seconds === undefined ? undefined : retryAfterMs(new Headers({ "retry-after": String(seconds) }));
+    },
+  });
 }
 
 const isMissing = (e: unknown): boolean => e instanceof APIError && e.statusCode === 404;
@@ -126,8 +120,8 @@ export interface SpritesSandboxOptions extends BlobStagingOptions {
   memoryMb?: number;
   checkpointIntervalMs?: number;
   snapshots?: HomeSnapshotStore;
-  initializationStore?: DurableMap<{ pending: boolean }>;
-  advisoryLock?: AdvisoryLock;
+  initializationStore: DurableMap<{ pending: boolean }>;
+  advisoryLock: AdvisoryLock;
   extraTools?: string[];
   credentialPaths?: CredentialPathSpec[];
   connectorSdk?: () => Promise<ConnectorSdkBundle>;
@@ -141,13 +135,13 @@ interface RawExec {
   stderr: Buffer;
 }
 
-export function createSpritesSandbox(workspace: WorkspaceStore, opts: SpritesSandboxOptions = {}): Sandbox {
+export function createSpritesSandbox(opts: SpritesSandboxOptions): Sandbox {
   if (!opts.token) throw new Error("SANDBOX_BACKEND=sprites requires SPRITES_TOKEN");
   const client = new SpritesClient(opts.token, opts.baseUrl ? { baseURL: opts.baseUrl } : {});
   const sprite = (name: string) => client.sprite(name);
   const prefix = opts.namePrefix ?? "qm";
-  const initializationStore = opts.initializationStore ?? createMemoryMap<{ pending: boolean }>();
-  const advisoryLock = opts.advisoryLock ?? createMemoryAdvisoryLock();
+  const initializationStore = opts.initializationStore;
+  const advisoryLock = opts.advisoryLock;
   const withLifecycle = <T>(name: string, fn: () => Promise<T>): Promise<T> =>
     advisoryLock.withLock(`sprites-lifecycle:${name}`, fn);
   const requireInitialized = async (name: string): Promise<void> => {
@@ -194,13 +188,7 @@ export function createSpritesSandbox(workspace: WorkspaceStore, opts: SpritesSan
         const phase = submissionStarted ? "script submission started; execution unknown" : "script not submitted";
         reject(new Error(`sprites exec: WebSocket error (${phase}): ${detail}`));
       };
-      cmd.on("error", (e) => {
-        const detail =
-          /^(?:WebSocket error: )?(TypeError|ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|connection reset by peer|Received network error or non-101 status code|WebSocket closed before open)\b/.exec(
-            errMessage(e),
-          )?.[1] ?? "unknown transport error";
-        fail(detail);
-      });
+      cmd.on("error", (e) => fail(withoutSdkUrl(e.message)));
       cmd.once("exit", (code) => {
         if (code < 0) fail("connection closed without an exit status");
         else resolve(code);
@@ -439,7 +427,6 @@ export function createSpritesSandbox(workspace: WorkspaceStore, opts: SpritesSan
   };
 
   const base = createExecSandboxBase({
-    workspace,
     label: "sprites",
     prefix,
     homeDir: HOME_DIR,
@@ -468,11 +455,7 @@ export function createSpritesSandbox(workspace: WorkspaceStore, opts: SpritesSan
           return { coldStart: false };
         }
         await initializationStore.put(name, { pending: true });
-        try {
-          onStatus?.("Preparing the sandbox…");
-        } catch (error) {
-          void error;
-        }
+        onStatus?.("Preparing the sandbox…");
         const scope = base.scopeFor(name);
         try {
           if (!exists) await attempt(`create ${name}`, () => client.createSprite(name, { waitForCapacity: true }));
@@ -637,12 +620,13 @@ export function createSpritesSandbox(workspace: WorkspaceStore, opts: SpritesSan
       };
       let guestResponsive = false;
       let pressure: ExecPressure | undefined;
+      let probeError: string | undefined;
       try {
         const probe = await execRaw(name, "true", GUEST_PROBE_TIMEOUT_SEC);
         guestResponsive = probe.code === 0;
         pressure = probe.pressure;
       } catch (e) {
-        void e;
+        probeError = errMessage(e);
       }
       return {
         machine,
@@ -650,6 +634,7 @@ export function createSpritesSandbox(workspace: WorkspaceStore, opts: SpritesSan
         guestResponsive,
         recovery,
         ...(pressure ? { pressure } : {}),
+        ...(probeError ? { probeError } : {}),
       };
     },
 

@@ -7,7 +7,6 @@ import {
   authAccountId,
   authTokens,
   chatgptAuthFromValue,
-  loadCodexAuthFile,
   type JsonObject,
 } from "./chatgpt-auth-file.ts";
 import { refreshChatGPTTokens } from "./subscription-oauth.ts";
@@ -96,19 +95,6 @@ function refreshingAuth(
   };
 }
 
-export function fileCompanyChatGPTAuth(path: string): CompanyChatGPTAuth {
-  return {
-    description: `auth file ${path}`,
-    async accessToken() {
-      const auth = loadCodexAuthFile(path);
-      const expiresAt = accessExpiresAt(auth);
-      if (expiresAt !== undefined && expiresAt <= Date.now())
-        throw new Error(`the ChatGPT login in ${path} has expired; run the Codex CLI to refresh it`);
-      return authTokens(auth)?.access;
-    },
-  };
-}
-
 function authFromFiles(files: CredentialFile[]): { path: string; auth: JsonObject } | null {
   for (const file of files) {
     const normalized = file.path.replace(/^\.\//, "");
@@ -150,7 +136,7 @@ export function keychainCompanyChatGPTAuth(
         cached = {
           revision,
           found: bundle ? authFromFiles(bundle.files) : null,
-          ...(bundle ? { bundle: { ...bundle, kind: "file" as const } } : {}),
+          ...(bundle ? { bundle: { ...bundle, kind: "file" as const, writeback: true } } : {}),
         };
       }
       const { found, bundle } = cached;

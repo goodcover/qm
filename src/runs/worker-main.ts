@@ -2,17 +2,24 @@ import "./instrument.ts";
 import { loadConfig } from "../config.ts";
 import { buildApp, stopWithBackstop } from "../wiring.ts";
 import { shutdownOnUncaught } from "../util/process-guard.ts";
-import { migrateRegisteredPgSchemas } from "../persistence/pg-pool.ts";
+import { useOwnerDatabase } from "../tenants/owner-pool.ts";
+import { createPgPool, migrateRegisteredPgSchemas } from "../persistence/pg-pool.ts";
+import { watchTenants } from "../tenants/work-tenant.ts";
+import { reportFailureAs } from "../util/errors.ts";
 
 const config = loadConfig();
+useOwnerDatabase(config.databaseOwnerUrl);
 const built = buildApp(config);
 await migrateRegisteredPgSchemas(config.databaseUrl);
-await built.sandboxResources.initialize();
-await built.config.hydrate?.();
-await built.identity.hydrate();
+if (config.databaseUrl)
+  await watchTenants(createPgPool(config.databaseUrl), reportFailureAs("tenant watch", undefined));
+await built.tenancy.refreshSettings();
+built.tenancy.keepSettingsFresh();
+if (config.backgroundWorkEnabled) await built.ownSharedState();
+await built.loadTenants();
 const { runtime } = built;
 runtime.start();
-console.log(`[qm:worker] draining runs (org=${config.orgId}, runStore=${config.runStore}, workers=${config.workers})`);
+console.log(`[qm:worker] draining runs (org=${config.orgId}, workers=${config.workers})`);
 
 let shuttingDown = false;
 function shutdown(signal: string): void {

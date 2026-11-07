@@ -2,32 +2,35 @@ import type { MemoryEmbedder } from "./model/embeddings.ts";
 import { nonDeploymentCredential, withDeploymentCredentials } from "./credentials/deployment-credentials.ts";
 import { resolveEmbeddingModel } from "./model/pi-models.ts";
 import { createPostgresTeamStore, type TeamStore } from "./teams/teams.ts";
-import { brokerCredentialAuthHeader } from "./api/credential-broker.ts";
 import type { DecisionBackend } from "./decisions/decisions.ts";
-import { createDecisionHooks, routeTurnRuntime, turnStartState } from "./decisions/hooks.ts";
+import { createDecisionHooks, createReplyCheck, routeTurnRuntime, turnStartState } from "./decisions/hooks.ts";
 import { createDecisionBackend } from "./decisions/providers.ts";
 import { createPostgresDecisionStore, type DecisionStore } from "./decisions/store.ts";
 import type { SlackSessionStatusState } from "./slack/session-status.ts";
-import { availableRuntimeError } from "./api/runtime-config.ts";
-import { createApprovalStore } from "./core/approval-store.ts";
+import { availableRuntimeError, requestedRuntimeError, type RuntimeDeps } from "./api/runtime-config.ts";
+import { createApprovalStore } from "./slack/approval-store.ts";
+import { createRenderDeployProvider, type StoredRenderDeploy } from "./deploy/render-deploy-provider.ts";
+import { createRenderDeployArtifacts, type StoredRenderDeployCredential } from "./deploy/render-deploy-artifacts.ts";
+import { createRenderAppStorage, type StoredRenderAppStorage } from "./deploy/render-app-storage.ts";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import {
+  createRenderSandbox,
+  type StoredRenderCleanup,
+  type StoredRenderSandbox,
+  type StoredRenderScratch,
+} from "./sandbox/render-sandbox.ts";
+import { createSdkRenderClient } from "./sandbox/render-client.ts";
+import { createRenderBase, type StoredRenderBase } from "./sandbox/render-base.ts";
 import { createKeychainApprovals, type KeychainApprovals } from "./credentials/keychain-approval.ts";
-import { flushErrorReporting, startTiming } from "../plugins/chassis/src/error-reporting.ts";
-import type { TimingStatus } from "../plugins/chassis/src/timing.ts";
+import { flushErrorReporting, tracePhase } from "../plugins/chassis/src/error-reporting.ts";
 import { createProductAnalytics } from "./util/product-analytics.ts";
-import { resolveTurnOrigin } from "./core/turn-origin.ts";
 import { createAdmittedWork } from "./util/admitted-work.ts";
 import { runSessionSmoke } from "./deployment/postdeploy-smoke.ts";
-import {
-  createBackgroundOwnershipStore,
-  type BackgroundOwnershipControl,
-  type BackgroundOwnership,
-} from "./runs/background-ownership.ts";
 import { loadConnectorSdk } from "./sandbox/connector-sdk.ts";
 import { createFlyTunnelManager, parseFlyWireguardPeers } from "./deploy/fly-tunnel-manager.ts";
 import type { FlyPeerClaim } from "./deploy/fly-peer-claims.ts";
-import { createMemoryEventBus } from "./util/event-bus.ts";
 import { createPostgresNotifyBus } from "./persistence/postgres-notify-bus.ts";
-import { emitRunText, type RunStreamEvent } from "./runs/run-stream-events.ts";
+import { emitRunReasoning, emitRunText, reasoningKey, type RunStreamEvent } from "./runs/run-stream-events.ts";
 import { createPostgresResourceSearch } from "./search/resource-search.ts";
 import { createSessionMailbox, type SessionMessage } from "./sessions/session-mailbox.ts";
 import type { TaskAckState } from "./slack/task-ack.ts";
@@ -36,16 +39,19 @@ import { createGmailPushClient } from "./loops/gmail-push.ts";
 import { createGatewayCatalog } from "./model/gateway-catalog.ts";
 import { createSuggestedActivityService, type SuggestedActivityProfile } from "./suggestions/activities.ts";
 import { createMemoryTidyService, withMemoryTidy, type MemoryTidyProfile } from "./memory/tidy.ts";
-import { createRuntimeService } from "./harness/runtime-control.ts";
+import { createRuntimeService } from "./agent/runtime-control.ts";
 import {
   createSessionSyscalls,
-  deliverSubagentMail,
-  sessionTreeRoot,
-  sessionTreeRunCount,
+  type SessionSyscallsFactory,
   sessionTreeWorking,
-  stoppableAncestors,
-  SUBAGENT_TREE_RUN_CAP,
+  stoppableRoot,
 } from "./sessions/session-syscalls.ts";
+import {
+  returnSubagentRun,
+  settleTreeWakes,
+  sweepUnreadMailWakes,
+  wakeForUnreadMail,
+} from "./sessions/subagent-mail.ts";
 import { createMemoryEmbedder } from "./model/embeddings.ts";
 import { createSemanticMemory } from "./memory/semantic-memory.ts";
 import { createPostgresBrokerSessions, type BrokerSessionStore } from "./auth/broker-sessions.ts";
@@ -58,7 +64,6 @@ import {
   type SandboxResources,
 } from "./sandbox/sandbox-resources.ts";
 import { createModelVerifier, type ModelVerifier } from "./model/model-verification.ts";
-import type { probeModel } from "./harness/pi-harness.ts";
 import { createAwsRoleBroker, type AwsRoleBroker } from "./auth/aws-role-broker.ts";
 import type { SessionShare, SessionShareStore } from "./sessions/session-share.ts";
 import { createModelOverlayStore, type ModelOverlayStore } from "./model/model-overlay-store.ts";
@@ -68,13 +73,21 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { join, resolve } from "node:path";
 import {
   baseModelProviders,
-  configuredModelForHarness,
-  enabledSandboxBackends,
-  harnessCarriedModelAuth,
+  companySubscriptionAuth,
+  configuredModel,
+  orgId,
   providerKeysPresent,
   type Config,
 } from "./config.ts";
 import type { ServerDeps } from "./api/deps.ts";
+import { createTenantLoader, registerTenants, withInstallTenant } from "./tenants/context.ts";
+import {
+  enabledSandboxBackends,
+  MODAL_TENANT_ENV,
+  SPRITES_TENANT_ENV,
+  tenantSandboxSettings,
+  type SandboxSettings,
+} from "./sandbox/sandbox-settings.ts";
 import {
   actorAssertionActive,
   createIdentityService,
@@ -89,32 +102,8 @@ import {
 import type { SlackAccountLink, ComposioReturn } from "./api/routes/composio.ts";
 import { installPrincipalLinks } from "./directory/person.ts";
 import type { ExternalMember } from "./identity/external-members.ts";
-import { createResendMailer } from "./admin/invite-email.ts";
-import {
-  createMemoryConfigStore,
-  type ScopedConfigStore,
-  type PersistedSoul,
-  type PersistedSoulRevision,
-  type PersistedCommandPolicy,
-  type PersistedSecurityPosture,
-  type PersistedSharingPosture,
-  type PersistedApprovalGrantModes,
-  type PersistedEgressPolicy,
-  type PersistedScopedFlag,
-  type PersistedBaseModel,
-  type PersistedApprovedHarnesses,
-  type PersistedInternalMemberOverrides,
-  type PersistedWebuiModels,
-  type PersistedPeopleDirectoryUrl,
-  type PersistedAckEmoji,
-  type PersistedPinnedSkills,
-  type PersistedSlackEmojiCatalog,
-  type PersistedBranding,
-  type PersistedBrowseMaxSteps,
-  type PersistedBrowseModel,
-  type PersistedAutoFlaggerConfig,
-  type PersistedDeploymentIdentity,
-} from "./resolution/config-store.ts";
+import { tenantMailer } from "./tenants/tenant-mailer.ts";
+import { configStoreMaps, createConfigStore, type ScopedConfigStore } from "./resolution/config-store.ts";
 import { createResolutionService } from "./resolution/resolution-service.ts";
 import { createAclStore, type AclStore } from "./acl/acl-store.ts";
 import { createPostgresGrantStore } from "./acl/postgres-grant-store.ts";
@@ -123,71 +112,70 @@ import { createSkillPackStore, type SkillPack } from "./skills/skill-pack-store.
 import { createSkillBundleStore, type SkillBundle, type SkillBundleStore } from "./skills/skill-bundle-store.ts";
 import { createGitFetcher, resolvePackAuth, type SkillPackFetcher } from "./skills/pack-fetcher.ts";
 import { installSeedSkills } from "./skills/seed.ts";
-import { createMemoryMap, createPostgresMapFactory, type DurableMap } from "./persistence/durable-map.ts";
+import { createPostgresMapFactory, type DurableMap } from "./persistence/durable-map.ts";
 import type { PersistedUiState, UiStateStore } from "./surfaces/ui-state.ts";
-import { installSharedCanvas } from "./surfaces/ui-canvas.ts";
 import { slackUserClientFactory } from "./loops/sources/slack.ts";
 import { configurePgCaTrust, configurePgPooling } from "./persistence/pg-pool.ts";
-import { createPostgresLeaderLease, createNoopLeaderLease, type LeaderLease } from "./persistence/leader-lease.ts";
-import {
-  createMemoryAdvisoryLock,
-  createPostgresAdvisoryLock,
-  type AdvisoryLock,
-} from "./persistence/advisory-lock.ts";
+import { createPostgresLeaderLease, type LeaderLease } from "./persistence/leader-lease.ts";
+import { createPostgresAdvisoryLock, type AdvisoryLock } from "./persistence/advisory-lock.ts";
 import type {
   CommandApprovalGrant,
-  Cron,
-  Loop,
-  LoopItem,
-  LoopOutput,
-  Monitor,
-  ShipGrant,
   PendingApprovalRecord,
   ScopeId,
   Session,
-  SurfaceContextRequest,
-  Webhook,
+  TurnRequest,
+  TurnResult,
 } from "./types.ts";
+import type { Cron, Monitor, Webhook } from "./triggers/types.ts";
+import type { Loop, LoopItem, LoopOutput, ShipGrant } from "./loops/types.ts";
+import type { SurfaceContextRequest } from "./reach/reach.ts";
 import { personalScope, scopeId } from "./types.ts";
-import { createAuditLog, type AuditLog } from "./audit/audit-log.ts";
+import type { AuditLog } from "./audit/audit-log.ts";
 import { createPostgresAuditLog } from "./admin/postgres-audit-log.ts";
 import { createPostgresAppPageViewLog, type AppPageViewLog } from "./deploy/page-views.ts";
-import { createRateLimiter, type RateLimiter } from "./ratelimit/rate-limiter.ts";
-import { createPostgresRateLimiter } from "./ratelimit/postgres-rate-limiter.ts";
-import { createBudgetTracker, estimateCostUsd } from "./ratelimit/budget.ts";
-import type { SecurityScreenProbe } from "./security/security-screener.ts";
+import type { BudgetTracker } from "./ratelimit/budget.ts";
 import { createPostgresBudgetTracker } from "./ratelimit/postgres-budget.ts";
 import { createCronStore, DROP_RUN_AS_MIGRATION, type CronStore } from "./cron/cron-store.ts";
-import { LEGACY_HARNESS_MIGRATION } from "./model/legacy-harness-migration.ts";
-import { createMemoryCronFireStore, createPostgresCronFireStore } from "./cron/fire-store.ts";
+import { RETIRED_ORIGIN_SWEEP_MIGRATION } from "./surfaces/origin-migration.ts";
+import { DROP_RECIPIENT_CONSENT_MIGRATION } from "./triggers/trigger-store.ts";
+import { createPostgresCronFireStore } from "./cron/fire-store.ts";
 import { createLoopStore } from "./loops/loop-store.ts";
 import { createLoopItemLedger } from "./loops/item-ledger.ts";
-import {
-  createMemoryLedgerEventBus,
-  createPostgresLedgerEventBus,
-  type LedgerEventBus,
-} from "./loops/ledger-events.ts";
+import { createPostgresLedgerEventBus, type LedgerEventBus } from "./loops/ledger-events.ts";
 import { createInboxSourceRefresh } from "./loops/inbox-source-refresh.ts";
 import { createInboxRealtime } from "./loops/inbox-realtime.ts";
 import { createLoopOutputStore } from "./loops/output-store.ts";
 import { createShipGrantStore } from "./loops/ship-grant-store.ts";
 import { createLoopFireService, type LoopFireService } from "./loops/loop-fire.ts";
 import type { LoopServiceDeps } from "./api/routes/loops.ts";
-import { createDeliveryStore, type DeliveryStore } from "./delivery/delivery-store.ts";
+import type { DeliveryStore } from "./delivery/delivery-store.ts";
 import { createPostgresDeliveryStore } from "./delivery/postgres-delivery-store.ts";
 import { wireRunResultDeliveries } from "./delivery/run-result-delivery.ts";
 import { adminSessionUrl } from "./util/admin-links.ts";
+import { uuidSchema } from "./util/ids.ts";
 import { withWebTranscriptDeliveries } from "./delivery/web-transcript-delivery.ts";
-import { createDirectoryStore, type DirectoryStore } from "./directory/directory-store.ts";
+import { WEBHOOK_CLAIM_MS, webhookSender } from "./delivery/webhook-delivery.ts";
+import { createDeliveryRelay } from "./delivery/relay.ts";
+import type { DirectoryStore } from "./directory/directory-store.ts";
 import { createPostgresDirectoryStore } from "./directory/postgres-directory-store.ts";
-import {
-  createMemoryEnvironmentStore,
-  createPostgresEnvironmentStore,
-  type EnvironmentStore,
-} from "./environments/environment-store.ts";
+import { createPostgresEnvironmentStore, type EnvironmentStore } from "./environments/environment-store.ts";
 import { createIdempotencyStore, type IdempotencyRecord } from "./idempotency/idempotency-store.ts";
 import { createScheduler, type Scheduler } from "./cron/scheduler.ts";
+import { forEachTenant, inTenantOf, listTenants, type TenantRow } from "./tenants/claim.ts";
+import { withoutTenant, withTenant } from "./tenants/context.ts";
 import { createPgBossCronQueue } from "./cron/job-queue.ts";
+import { ownerPgPool } from "./tenants/owner-pool.ts";
+import { createTenancy, type Tenancy } from "./tenants/tenancy.ts";
+import { configureTenantSettings } from "./tenants/settings.ts";
+import { configureTenantCaches } from "./api/tenant-ingress.ts";
+import { perTenantInstance } from "./tenants/tenant-instances.ts";
+import {
+  tenantBlobTransfer,
+  tenantByteStore,
+  tenantFileUploads,
+  tenantStorage,
+  type StorageTarget,
+} from "./tenants/tenant-storage.ts";
 import { createWebhookStore, type WebhookHistory } from "./webhooks/webhook-store.ts";
 import { createWebhookReceiver, type WebhookReceiver } from "./webhooks/webhook-receiver.ts";
 import { createDeployStore, deployTouchDebounceMs, type Deployment } from "./deploy/deploy-store.ts";
@@ -217,8 +205,7 @@ import {
   type ManagesArtifactHome,
 } from "./resolution/scope-membership.ts";
 import type { DeployGitArchive } from "./deploy/deploy-git-store.ts";
-import { createLocalWorkspaceStore, type WorkspaceStore } from "./workspace/workspace-store.ts";
-import { createMemoryService, type MemoryService } from "./memory/memory-service.ts";
+import type { MemoryService } from "./memory/memory-service.ts";
 import { createConfiguredMemoryService } from "./memory/provider-factory.ts";
 import { createPostgresMemoryService } from "./memory/postgres-memory-service.ts";
 import { createMcpServerStore, type McpServer, type McpServerStore } from "./mcp/mcp-server-store.ts";
@@ -233,7 +220,7 @@ import {
   createS3DurableByteStore,
   type DurableByteStore,
 } from "./files/durable-byte-store.ts";
-import { createMemoryFileArtifactStore, type FileArtifactStore } from "./files/file-artifact-store.ts";
+import type { FileArtifactStore } from "./files/file-artifact-store.ts";
 import { createPostgresFileArtifactStore } from "./files/postgres-file-artifact-store.ts";
 import { createAwsSandbox, type StoredMicrovm } from "./sandbox/aws-sandbox.ts";
 import { createLocalSandbox } from "./sandbox/local-sandbox.ts";
@@ -255,11 +242,17 @@ import {
   type StoredManagedAgentsSandbox,
 } from "./sandbox/managed-agents-sandbox.ts";
 import { createSdkManagedAgentsClient } from "./sandbox/managed-agents-client.ts";
+import { s3Client } from "./persistence/s3.ts";
 import { createS3SnapshotStore } from "./sandbox/home-snapshot.ts";
 import { createModalSandbox, type StoredModalSandbox } from "./sandbox/modal-sandbox.ts";
 import { createSdkModalClient } from "./sandbox/modal-client.ts";
 import { createPorterSandbox } from "./sandbox/porter-sandbox.ts";
-import { createSandboxRouter, type SandboxBackendName } from "./sandbox/sandbox-routing.ts";
+import {
+  createSandboxRouter,
+  liveBackends,
+  tenantSandboxBackends,
+  type SandboxBackendName,
+} from "./sandbox/sandbox-routing.ts";
 import {
   upgradeLegacySandboxes,
   legacySandboxBackendForScope,
@@ -273,6 +266,7 @@ import {
   createLayeredSecretSource,
 } from "./credentials/secret-source.ts";
 import {
+  credentialRequestHeaders,
   createKeychain,
   type ConnectorTokenStore,
   type OAuthToken,
@@ -289,7 +283,6 @@ import {
   type DropResolution,
 } from "./triggers/keychain-ask.ts";
 import { createSecretDropStore, type SecretDropStore, type SecretDropRecord } from "./credentials/secret-drop.ts";
-import { createConnectorStatusCache, type ConnectorStatusRecord } from "./credentials/connector-status.ts";
 import {
   createFeatureFlagStore,
   externalAppSharingAllowed,
@@ -301,41 +294,37 @@ import {
   createConnectorClientResolver,
   deriveConnectorKey,
   type SecretKey,
-  type StoredConnectorClient,
 } from "./connectors/connector-client-store.ts";
 import {
   createBrowserSessionStore,
   type BrowserSessionStore,
   type StoredBrowserSession,
 } from "./connectors/browser-session-store.ts";
-import { createCredentialUsageSink, type CredentialUsageSink } from "./admin/credential-usage-sink.ts";
+import type { CredentialUsageSink } from "./admin/credential-usage-sink.ts";
 import { createPostgresCredentialUsageSink } from "./admin/postgres-credential-usage-sink.ts";
-import { createEgressAuditSink, type EgressAuditSink } from "./admin/egress-audit-sink.ts";
+import type { EgressAuditSink } from "./admin/egress-audit-sink.ts";
 import { createPostgresEgressAuditSink } from "./admin/postgres-egress-audit-sink.ts";
 import { createConsentLinkStore, type ConsentLinkStore, type ConsentLinkRecord } from "./connectors/consent-link.ts";
 import { createOAuthFlowStore, type OAuthFlowStore } from "./connectors/oauth-flow-store.ts";
-import { createModelGateway, type ModelGateway } from "./model/model-gateway.ts";
-import { createModelCredentialStore, type ModelCredentialStore } from "./model/model-credential-store.ts";
+import {
+  createCustomProviderStore,
+  createModelCredentialStore,
+  type CustomProviderStore,
+  type ModelCredentialStore,
+} from "./model/model-credential-store.ts";
 import { refreshChatGPTTokens, refreshClaudeTokens } from "./model/subscription-oauth.ts";
 import { createUserModelCredentialStore, type UserModelCredentialStore } from "./model/user-model-credential-store.ts";
 import { type ModelGatewayTransportConfig, setProviderBaseUrls } from "./model/provider-endpoints.ts";
 import { setCustomProviders } from "./model/custom-providers.ts";
-import { createCustomProviderStore, type CustomProviderStore } from "./model/custom-provider-store.ts";
-import { createMemorySessionStore } from "./sessions/memory-session-store.ts";
 import { createPostgresSessionStore } from "./sessions/postgres-session-store.ts";
-import type { SessionStore } from "./sessions/session-store.ts";
-import { createMockHarness } from "./harness/mock-harness.ts";
-import {
-  fileCompanyChatGPTAuth,
-  keychainCompanyChatGPTAuth,
-  type CompanyChatGPTAuth,
-} from "./model/company-chatgpt-auth.ts";
-import { keychainHarnessAuthEnv } from "./credentials/harness-auth-env.ts";
-import { createClaudeHarness, claudeHarnessConfigOptions } from "./harness/claude-harness.ts";
-import { createPiHarness, piHarnessConfigOptions, type ProviderKeys } from "./harness/pi-harness.ts";
-import { createHarnessRouter, resolveRuntimeChoiceDurable } from "./harness/harness-router.ts";
+import { createPostgresToolOutputStore } from "./sessions/tool-output.ts";
+import { LLM_CAPTURE_RETENTION_MS, type SessionStore } from "./sessions/session-store.ts";
+import { keychainCompanyChatGPTAuth, type CompanyChatGPTAuth } from "./model/company-chatgpt-auth.ts";
+import { keychainEnvCredential } from "./credentials/keychain-env-credential.ts";
+import { createAgent, agentConfigOptions } from "./agent/agent-run.ts";
+import { withResolvedRuntime, resolveRuntimeChoice } from "./agent/runtime-choice.ts";
 import { selectableModelCatalog } from "./model/model-catalog.ts";
-import type { Harness } from "./harness/harness.ts";
+import type { Agent, RuntimeChoice, SessionRoute } from "./agent/agent.ts";
 import { createSecurityScreenProxy, type SecurityScreener } from "./security/security-screener.ts";
 import { createMemoryStrategy } from "./memory/strategy.ts";
 import { createOrchestrator, egressClaimAllowingControlPlane, type OrchestratorDeps } from "./core/orchestrator.ts";
@@ -347,35 +336,31 @@ import {
   EGRESS_PROXY_AUD,
 } from "./auth/capability-token.ts";
 import { createControlService } from "./api/control-service.ts";
-import { createMemoryRunStore } from "./runs/memory-run-store.ts";
 import { createPostgresRunStore } from "./runs/postgres-run-store.ts";
-import { createMemoryRunSignalStore, type RunSignalStore } from "./runs/run-signal-store.ts";
+import type { RunSignalStore } from "./runs/run-signal-store.ts";
 import { createPostgresRunSignalStore } from "./runs/postgres-run-signal-store.ts";
 import { isTerminal, type Run, type RunStore } from "./runs/run-store.ts";
-import { createRunPreemption, createWorker, type Worker } from "./runs/worker.ts";
+import { createRunPreemption, createWorker, SHUTDOWN_RELEASE_MS } from "./runs/worker.ts";
 import {
   createNoopInstanceRegistry,
   createPostgresInstanceRegistry,
   type InstanceRegistry,
 } from "./runs/instance-registry.ts";
-import { createDrainController, type DrainController } from "./runs/drain.ts";
+import { createDrainController, type BackgroundServices, type DrainController } from "./runs/drain.ts";
 import { createReaper, REAPER_LEASE_KEY, type Reaper } from "./runs/reaper.ts";
 import { createSweeper as createUntrackedSweeper, type Sweeper } from "./util/sweeper.ts";
-import {
-  createMemoryProcessRegistry,
-  createPostgresProcessRegistry,
-  type ProcessRegistry,
-} from "./processes/process-registry.ts";
+import { createPostgresProcessRegistry, type ProcessRegistry } from "./processes/process-registry.ts";
 import { createProcessReaper, createReaperKillHook, type ProcessReaper } from "./processes/process-reaper.ts";
+import { createJobComputerSweep } from "./processes/job-computers.ts";
 import { createMonitorStore, type MonitorStore } from "./monitors/monitor-store.ts";
 import { createMonitorPoller, type MonitorPoller } from "./monitors/monitor-poller.ts";
 import { createSkillSyncEngine, type SkillSyncEngine } from "./skills/skill-sync-engine.ts";
 import { supportsProcessSessions, type SandboxHandle } from "./sandbox/sandbox.ts";
 import { finishProcessCredentials } from "./credentials/execute-files.ts";
 import { createTurnStream } from "./runs/turn-stream.ts";
-import { createMemorySessionStateBus, type SessionStateBus } from "./runs/session-state-bus.ts";
+import type { SessionStateBus } from "./runs/session-state-bus.ts";
 import { createPostgresSessionStateBus } from "./runs/postgres-session-state-bus.ts";
-import { createMemoryRunActivityStore, type RunActivityStore } from "./runs/run-activity-store.ts";
+import type { RunActivityStore } from "./runs/run-activity-store.ts";
 import { createPostgresRunActivityStore } from "./runs/postgres-run-activity-store.ts";
 import { createApp, type App } from "./api/app.ts";
 import { startSession } from "./api/start-session.ts";
@@ -385,43 +370,27 @@ import { createSlackCoreClient, type SlackCoreClient } from "./api/slack-core-cl
 import { createSurfaceContextPuller } from "./api/surface-context-puller.ts";
 import { createEngagedRegistry } from "./wake/engaged-registry.ts";
 import { createWakeSweep, type WakeSweep } from "./wake/sweep.ts";
+import { createPostgresSurfaceCache, type SurfaceCache } from "./surface-cache/surface-cache.ts";
+import { createPostgresChannelPolicyStore, type ChannelPolicyStore } from "./surface-cache/channel-policy-store.ts";
 import {
-  createMemorySurfaceCache,
-  createPostgresSurfaceCache,
-  type SurfaceCache,
-} from "./surface-cache/surface-cache.ts";
-import {
-  createMemoryChannelPolicyStore,
-  createPostgresChannelPolicyStore,
-  type ChannelPolicyStore,
-} from "./surface-cache/channel-policy-store.ts";
-import {
-  createMemoryAmbientJudgmentStore,
   createPostgresAmbientJudgmentStore,
   type AmbientJudgmentStore,
 } from "./surface-cache/ambient-judgment-store.ts";
-import {
-  createMemoryAckEmojiPickStore,
-  createPostgresAckEmojiPickStore,
-  type AckEmojiPickStore,
-} from "./surface-cache/ack-emoji-pick-store.ts";
+import { createPostgresAckEmojiPickStore, type AckEmojiPickStore } from "./surface-cache/ack-emoji-pick-store.ts";
 import {
   auxiliaryModelFor,
   CODEX_SUBSCRIPTION_PROVIDER,
   codexSubscriptionModelId,
-  auxiliaryModelForProvider,
-  defaultModelForHarness,
-  modelProviderAvailabilityFor,
+  defaultModel,
   resolveModel,
-  type HarnessId,
-  modelSupportedByHarness,
+  modelSupported,
 } from "./model/pi-models.ts";
-import { createAdminService, bootAdminGrantSeed, type AdminService } from "./admin/admin-service.ts";
-import { createAdminGrantStore, createMapAdminGrantPersistence, type AdminGrant } from "./admin/admin-grant-store.ts";
+import { createAdminService, parseAdminGrants, type AdminService } from "./admin/admin-service.ts";
+import { createAdminGrantStore } from "./admin/admin-grant-store.ts";
 import { createPostgresAdminGrantStore } from "./admin/postgres-admin-grant-store.ts";
 import { createProjectStore, type Project, type ProjectStore } from "./projects/project-store.ts";
-import { withErrorReporting, createErrorLog, type ErrorLog } from "./admin/error-log.ts";
-import { createMemoryReplayDedupe, createPostgresReplayDedupe, type ReplayDedupe } from "./auth/replay-dedupe.ts";
+import { withErrorReporting, type ErrorLog } from "./admin/error-log.ts";
+import { createPostgresReplayDedupe, type ReplayDedupe } from "./auth/replay-dedupe.ts";
 import {
   emptyDeploymentLayer,
   loadDeploymentLayer,
@@ -436,19 +405,20 @@ import {
   type StoredDeploymentLayer,
 } from "./deployment/deployment-layer-store.ts";
 import { createPostgresErrorLog } from "./admin/postgres-error-log.ts";
-import { createMetricsSink, type MetricsSink } from "./admin/metrics-sink.ts";
-import { createPostgresMetricsSink } from "./admin/postgres-metrics-sink.ts";
 import { errMessage, reportFailureAs, swallowAs } from "./util/errors.ts";
 import { sleep, withTimeout } from "./util/async.ts";
+import { privateHostsFetch } from "./util/network.ts";
 import { createSlackInstallationStore, type SlackInstallationStore } from "./surfaces/slack-installation.ts";
+import { createSurfaceRegistry } from "./surfaces/registry.ts";
+import { createSlackSurface } from "./surfaces/slack/adapter.ts";
+import { createPartnerChatSurface } from "./surfaces/partner-chat/adapter.ts";
+import { createPartnerChatInbound } from "./surfaces/partner-chat/inbound.ts";
+import { PARTNER_CHAT_CLAIM_MS, partnerChatSender } from "./surfaces/partner-chat/outbound.ts";
+import { createPartnerChatNotices, partnerChatRunNotice } from "./surfaces/partner-chat/notices.ts";
+import { type probeModel, type ProviderKeys } from "./model/model-runtime.ts";
 
 export interface Runtime {
-  start(): void;
-  startBackground(): void;
-  stopBackgroundClaims(): Promise<void>;
-  setBackgroundAdmission(canClaim: () => boolean, active: () => boolean): void;
-  stopBackground(): Promise<void>;
-  backgroundDrained(): Promise<void>;
+  start(services?: BackgroundServices): void;
   stop(): Promise<void>;
   releaseInFlightRuns(): Promise<void>;
 }
@@ -461,11 +431,13 @@ export function stopWithBackstop(
 ): void {
   const hardExit = setTimeout(() => {
     console.error(`[${label}] drain overran; releasing in-flight leases before forced exit`);
-    void Promise.race([runtime.releaseInFlightRuns(), sleep(3_000, { unref: true })]).finally(async () => {
-      await flushErrorReporting();
-      process.exit();
-    });
-  }, shutdownDrainMs + 5_000);
+    void Promise.race([runtime.releaseInFlightRuns(), sleep(SHUTDOWN_RELEASE_MS, { unref: true })]).finally(
+      async () => {
+        await flushErrorReporting();
+        process.exit();
+      },
+    );
+  }, shutdownDrainMs + SHUTDOWN_RELEASE_MS);
   hardExit.unref();
   void runtime.stop().then(
     async () => {
@@ -477,29 +449,35 @@ export function stopWithBackstop(
     (e: unknown) => {
       console.error(`[${label}] graceful stop failed: ${errMessage(e)}`);
       clearTimeout(hardExit);
-      void Promise.race([runtime.releaseInFlightRuns(), sleep(3_000, { unref: true })]).finally(async () => {
-        await flushErrorReporting();
-        process.exit(1);
-      });
+      void Promise.race([runtime.releaseInFlightRuns(), sleep(SHUTDOWN_RELEASE_MS, { unref: true })]).finally(
+        async () => {
+          await flushErrorReporting();
+          process.exit(1);
+        },
+      );
     },
   );
 }
 
 export interface BuiltApp {
   checkReadiness: (signal: AbortSignal) => Promise<void>;
-  backgroundOwnership?: BackgroundOwnershipControl;
+  forEachTenant: (fn: () => Promise<unknown>) => Promise<void>;
+  listTenants: () => Promise<TenantRow[]>;
+  drain: DrainController;
+  ownSharedState: () => Promise<void>;
   suggestedActivities?: ReturnType<typeof createSuggestedActivityService>;
   app: App;
-  screenSecurity?: SecurityScreenProbe;
   deploymentLayer: DeploymentLayerRuntime;
   brokeredTools: readonly BrokeredLayerTool[];
   deploymentLayerStore: DeploymentLayerStore;
   deploymentLayerReady: Promise<unknown>;
   deploymentLayerRefresh: Sweeper;
+  loadTenants: () => Promise<void>;
   sessions: SessionStore;
   runs: RunStore;
   signals: RunSignalStore;
   sessionStateBus: SessionStateBus;
+  sessionSyscalls: SessionSyscallsFactory;
   ledgerEventBus: LedgerEventBus;
   surfaceCache: SurfaceCache;
   runtime: Runtime;
@@ -509,10 +487,10 @@ export interface BuiltApp {
   resolveClient: OAuthClientResolver;
   consentLinks: ConsentLinkStore;
   oauthFlows: OAuthFlowStore;
+  tenancy: Tenancy;
   secretDrops: SecretDropStore;
-  browserModelGateway?: ModelGatewayTransportConfig;
+  modelGatewayTransport?: ModelGatewayTransportConfig;
   resolveBrowserCompanyKeys: (includeSubscription?: boolean) => Promise<ProviderKeys>;
-  modelGateway: ModelGateway;
   modelCredentials: ModelCredentialStore;
   userModelCredentials: UserModelCredentialStore;
   modelRegistry: ModelOverlayStore;
@@ -530,11 +508,11 @@ export interface BuiltApp {
   scheduler: Scheduler;
   loops: LoopServiceDeps;
   webhookReceiver: WebhookReceiver;
+  partnerChatEvents?: ServerDeps["partnerChatEvents"];
   loopIngress: LoopIngressService;
   admin: AdminService;
-  rateLimiter: RateLimiter;
+  budget: BudgetTracker | undefined;
   errors: ErrorLog;
-  metrics: MetricsSink;
   crons: CronStore;
   credentialUsage: CredentialUsageSink;
   egressAudit: EgressAuditSink;
@@ -548,7 +526,6 @@ export interface BuiltApp {
   keychainApprovals?: KeychainApprovals;
   fireAskResolution?: (ask: KeychainAsk, grant?: KeychainGrant) => Promise<unknown>;
   fireDropResolution?: (drop: DropResolution) => Promise<unknown>;
-  workspace: WorkspaceStore;
   memory: MemoryService;
   sandbox: Sandbox;
   advisoryLock: AdvisoryLock;
@@ -559,7 +536,7 @@ export interface BuiltApp {
   featureFlags: FeatureFlagStore;
   teams?: TeamStore;
   decisions?: DecisionStore;
-  replayDedupe?: ReplayDedupe;
+  replayDedupe: ReplayDedupe;
   brokerSessions?: BrokerSessionStore;
   directory: DirectoryStore;
   projects: ProjectStore;
@@ -589,25 +566,21 @@ export function buildApp(
     credentialBrokers?: Record<string, AwsRoleBroker>;
     modelCredentialFetch?: typeof fetch;
     modelVerificationProbe?: typeof probeModel;
+    agent?: Agent;
+    canClaimRuns?: () => boolean;
   } = {},
 ): BuiltApp {
-  let backgroundAdmission = () => !config.backgroundDeploymentId;
-  let backgroundActive = () => false;
-  const admittedWork = createAdmittedWork({
-    canStart: () => !config.backgroundDeploymentId || backgroundAdmission(),
-  });
-  let inlineShutdown = new AbortController();
+  const admittedWork = createAdmittedWork();
+  let turnWaitShutdown = new AbortController();
   const createSweeper: typeof createUntrackedSweeper = (work, interval, options) =>
     createUntrackedSweeper(() => admittedWork.run(work), interval, options);
-  if (config.databaseUrl && !config.connectorSecretKey) {
-    throw new Error("CONNECTOR_SECRET_KEY is required with durable storage");
-  }
+  const databaseUrl = config.databaseUrl;
+  if (!databaseUrl) throw new Error("DATABASE_URL is required: QM keeps all state in Postgres");
+  if (!config.connectorSecretKey) throw new Error("CONNECTOR_SECRET_KEY is required");
   configurePgPooling({
-    ...(config.databaseUrl ? { databaseUrl: config.databaseUrl } : {}),
+    databaseUrl,
     ...(config.databasePoolUrl ? { poolUrl: config.databasePoolUrl } : {}),
     ...(config.databasePoolCaCert ? { caCert: config.databasePoolCaCert } : {}),
-    ...(config.databasePoolMax !== undefined ? { queryMax: config.databasePoolMax } : {}),
-    ...(config.databaseDirectPoolMax !== undefined ? { sessionMax: config.databaseDirectPoolMax } : {}),
   });
   configurePgCaTrust({
     ...(config.databaseCaCert ? { cert: config.databaseCaCert } : {}),
@@ -629,21 +602,24 @@ export function buildApp(
     canUseSandboxScope?: CanManageScope;
     managesArtifactHome?: ManagesArtifactHome;
   } = {};
-  const acl = createAclStore(config.databaseUrl ? createPostgresGrantStore(config.databaseUrl) : undefined, {
+  const acl = createAclStore(createPostgresGrantStore(databaseUrl), {
     manages: (principalId, scopeId, authoredBy) =>
       membership.managesArtifactHome!(scopeId, authoredBy ?? "", principalId),
     resolveFiles: (refs) => files.resolveByIds(refs),
   });
-  const pgArtifactMap = config.databaseUrl ? createPostgresMapFactory(config.databaseUrl) : null;
+  const pgArtifactMap = createPostgresMapFactory(databaseUrl);
   const artifactMap = <T>(table: string, indexedFields?: readonly Extract<keyof T, string>[]): DurableMap<T> =>
-    pgArtifactMap ? pgArtifactMap.map<T>(table, indexedFields) : createMemoryMap<T>();
+    pgArtifactMap.map<T>(table, indexedFields);
   setProviderBaseUrls(config.providerBaseUrls);
   const unknownGatewayModels = Object.keys(config.modelGateway?.models ?? {}).filter((id) => !resolveModel(id));
   if (unknownGatewayModels.length) {
     throw new Error(`MODEL_GATEWAY_MODELS contains unsupported models: ${unknownGatewayModels.join(", ")}`);
   }
   const gatewayCatalog = config.modelGateway
-    ? createGatewayCatalog(config.modelGateway, overrides.modelCredentialFetch)
+    ? createGatewayCatalog(
+        { ...config.modelGateway, actorKey: config.capabilitySecret },
+        overrides.modelCredentialFetch,
+      )
     : undefined;
   const gatewayTransport = gatewayCatalog?.transport;
   const directProviderAvailability = providerKeysPresent(config);
@@ -664,71 +640,36 @@ export function buildApp(
       return {
         ...direct,
         ...(directProviderAvailability.codexOAuth ? { codexOAuth: true } : {}),
+        ...(config.claudeAuthCredential ? { anthropic: true } : {}),
         modelIds: new Set(Object.keys(gatewayTransport?.models ?? {})),
       };
     },
   };
-  const advisoryLock: AdvisoryLock = pgArtifactMap
-    ? createPostgresAdvisoryLock(pgArtifactMap.pool)
-    : createMemoryAdvisoryLock();
+  const advisoryLock: AdvisoryLock = createPostgresAdvisoryLock(pgArtifactMap.pool);
   const principalLinks = createPrincipalLinkService(artifactMap<PrincipalLink>("principal_links"), advisoryLock);
   installPrincipalLinks(principalLinks);
   const identity = createIdentityService(artifactMap<DeactivationRecord>("deactivated_principals"), {
-    isOverridden: (id) => configStore.getInternalMemberOverrides().includes(id.trim().toLowerCase()),
     directorySyncProtected: config.emailAuthPrincipals,
     externalMembers: artifactMap<ExternalMember>("external_members"),
     principalLinks,
   });
-  void identity.hydrate().catch(reportFailureAs("startup: hydrate identity", undefined));
-  const leaderLease: LeaderLease = pgArtifactMap
-    ? createPostgresLeaderLease(pgArtifactMap.pool)
-    : createNoopLeaderLease();
-  const configStore = createMemoryConfigStore(config.orgId, {
-    connectorClients: artifactMap<StoredConnectorClient>("connector_clients"),
-    souls: artifactMap<PersistedSoul>("soul_configs"),
-    soulHistory: artifactMap<PersistedSoulRevision>("soul_history"),
-    commandPolicies: artifactMap<PersistedCommandPolicy>("command_policies"),
-    securityPostures: artifactMap<PersistedSecurityPosture>("security_postures"),
-    sharingPostures: artifactMap<PersistedSharingPosture>("sharing_postures"),
-    approvalGrantModes: artifactMap<PersistedApprovalGrantModes>("approval_grant_modes"),
-    egressPolicies: artifactMap<PersistedEgressPolicy>("egress_policies"),
-    unfulfilledInsights: artifactMap<PersistedScopedFlag>("unfulfilled_insights_flag"),
-    externalSlackParticipants: artifactMap<PersistedScopedFlag>("external_slack_participants_flag"),
-    channelHeaderPin: artifactMap<PersistedScopedFlag>("channel_header_pin_flag"),
-    baseModels: artifactMap<PersistedBaseModel>("base_model_configs"),
-    approvedHarnesses: artifactMap<PersistedApprovedHarnesses>("approved_harness_configs"),
-    internalMemberOverrides: artifactMap<PersistedInternalMemberOverrides>("internal_member_overrides"),
-    orgAmbient: artifactMap<PersistedScopedFlag>("org_ambient_flag"),
-    interactiveFastMode: artifactMap<PersistedScopedFlag>("interactive_fast_mode_flag"),
-    individualModelAuth: artifactMap<PersistedScopedFlag>("individual_model_auth_flag"),
-    webuiModels: artifactMap<PersistedWebuiModels>("webui_model_configs"),
-    peopleDirectoryUrls: artifactMap<PersistedPeopleDirectoryUrl>("people_directory_urls"),
-    ackEmoji: artifactMap<PersistedAckEmoji>("ack_emoji"),
-    pinnedSkills: artifactMap<PersistedPinnedSkills>("pinned_skills"),
-    slackEmojiCatalog: artifactMap<PersistedSlackEmojiCatalog>("slack_emoji_catalog"),
-    branding: artifactMap<PersistedBranding>("branding_configs"),
-    browseMaxSteps: artifactMap<PersistedBrowseMaxSteps>("browse_max_steps_configs"),
-    browseModels: artifactMap<PersistedBrowseModel>("browse_model_configs"),
-    autoFlaggerConfigs: artifactMap<PersistedAutoFlaggerConfig>("auto_flagger_configs"),
-    deploymentIdentity: artifactMap<PersistedDeploymentIdentity>("deployment_identity"),
+  const leaderLease: LeaderLease = createPostgresLeaderLease(pgArtifactMap.pool);
+  const configStore = createConfigStore(config.orgId, {
+    ...configStoreMaps(artifactMap),
     defaultSecurityPosture: config.securityPosture,
     defaultSharingPosture: config.sharingPosture,
     ...(config.connectorSecretKey ? { connectorSecretKey: config.connectorSecretKey } : {}),
   });
-  void configStore.hydrate?.().catch(reportFailureAs("startup: hydrate configuration", undefined));
   const skills: SkillStore = createSkillStore({
-    backing: artifactMap<Skill>("skills"),
+    backing: artifactMap<Skill>("skills", ["scopeId"]),
     advisoryLock,
     ...(config.skillSigningSecret ? { signingSecret: config.skillSigningSecret } : {}),
   });
   const skillPacks = createSkillPackStore({ backing: artifactMap<SkillPack>("skill_packs") });
   const skillBundles = createSkillBundleStore({ backing: artifactMap<SkillBundle>("skill_bundles") });
   const featureFlags = createFeatureFlagStore(artifactMap<FeatureFlagRecord>("feature_flags"));
-  const teams = config.databaseUrl
-    ? createPostgresTeamStore(config.databaseUrl, featureFlags, scopeId("org", config.orgId))
-    : undefined;
-  const decisions = config.databaseUrl ? createPostgresDecisionStore(config.databaseUrl) : undefined;
-  const connectorStatusCache = createConnectorStatusCache(artifactMap<ConnectorStatusRecord>("connector_status"));
+  const teams = createPostgresTeamStore(databaseUrl, featureFlags, () => scopeId("org", orgId()));
+  const decisions = createPostgresDecisionStore(databaseUrl);
   const slackInstallation = createSlackInstallationStore(
     config.orgId,
     artifactMap("slack_installation"),
@@ -740,14 +681,14 @@ export function buildApp(
   const layerSkillsDir = config.deploymentLayerDir ? resolve(deploymentLayer.dir, "skills") : undefined;
   const brokeredTools = deploymentLayer.brokeredTools;
   const orgScope = scopeId("org", config.orgId);
-  const auditLog = config.databaseUrl ? createPostgresAuditLog(config.databaseUrl) : createAuditLog();
+  const auditLog = createPostgresAuditLog(databaseUrl);
+  let ownsSharedState = false;
   const deploymentLayerStore = createDeploymentLayerStore({
     backing: artifactMap<StoredDeploymentLayer>("deployment_layer"),
     runtime: deploymentLayer,
     skills,
     skillBundles,
     scopeId: orgScope,
-    durable: pgArtifactMap !== null,
     advisoryLock,
     auditPersisted: (record) =>
       auditLog.recordOnce!(`deployment-layer:${orgScope}:${record.version}`, {
@@ -759,58 +700,59 @@ export function buildApp(
       }),
     ...(config.seedSkills && layerSkillsDir
       ? {
-          seedFallback: () =>
-            installSeedSkills(skills, {
+          seedFallback: async () => {
+            if (!ownsSharedState) return false;
+            await installSeedSkills(skills, {
               dir: layerSkillsDir,
               scopeId: orgScope,
               createdBy: LAYER_CREATED_BY,
               reviewer: LAYER_REVIEWER,
-            }),
+            });
+            return true;
+          },
         }
       : {}),
   });
-  const deploymentLayerReady = deploymentLayerStore.hydrate();
-  const deploymentLayerRefresh = createUntrackedSweeper(() => deploymentLayerStore.hydrate(), 30_000, {
-    label: "deployment layer refresh",
-  });
-  let skillsReady: Promise<void>;
-  if (config.seedSkills) {
-    const installCatalogs = async (): Promise<void> => {
-      await installSeedSkills(skills, { dir: config.skillsSeedDir, scopeId: orgScope, respectArchived: true });
-      for (const dir of config.pluginSkillDirs) {
-        if (layerSkillsDir && resolve(dir) === layerSkillsDir) continue;
-        await installSeedSkills(skills, {
-          dir,
-          scopeId: orgScope,
-          createdBy: "system:plugin-skills",
-          reviewer: "system:plugin-skills-reviewer",
-          respectArchived: true,
-        });
-      }
-    };
-    skillsReady = Promise.all([
-      installCatalogs().catch((e) => console.error("[seed] failed to install seed skills:", errMessage(e))),
-      deploymentLayerReady.catch((e) => console.error("[seed] deployment layer not ready:", errMessage(e))),
-    ]).then(() => undefined);
-  } else {
-    skillsReady = deploymentLayerReady.then(
-      () => undefined,
-      (e) => console.error("[seed] deployment layer not ready:", errMessage(e)),
-    );
-  }
-  const rateLimitOpts = { maxPerWindow: config.rateLimitPerWindow, windowMs: config.rateLimitWindowMs };
-  const rateLimiter = config.databaseUrl
-    ? createPostgresRateLimiter(config.databaseUrl, rateLimitOpts)
-    : createRateLimiter(rateLimitOpts);
+  const installTenant = pgArtifactMap.pool
+    .pool()
+    .then(() => ownerPgPool(pgArtifactMap.pool).q("SELECT qm_tenant_id()::text AS id"))
+    .then((rows) => String(rows[0]?.id));
+  const hydrateDeploymentLayer = () =>
+    installTenant.then((tenant) => withTenant(tenant, () => deploymentLayerStore.hydrate()));
+  const deploymentLayerReady = hydrateDeploymentLayer();
+  const deploymentLayerRefresh = createUntrackedSweeper(
+    () => withInstallTenant(() => deploymentLayerStore.hydrate()),
+    30_000,
+    {
+      label: "deployment layer refresh",
+    },
+  );
+  const installCatalogs = async (): Promise<void> => {
+    await installSeedSkills(skills, { dir: config.skillsSeedDir, scopeId: orgScope, respectArchived: true });
+    for (const dir of config.pluginSkillDirs) {
+      if (layerSkillsDir && resolve(dir) === layerSkillsDir) continue;
+      await installSeedSkills(skills, {
+        dir,
+        scopeId: orgScope,
+        createdBy: "system:plugin-skills",
+        reviewer: "system:plugin-skills-reviewer",
+        respectArchived: true,
+      });
+    }
+  };
+  let skillsReady = deploymentLayerReady.then(
+    () => undefined,
+    (e) => console.error("[seed] deployment layer not ready:", errMessage(e)),
+  );
   const budgetOpts = {
     ...(config.budgetUsdPerWindow !== undefined ? { limitUsd: config.budgetUsdPerWindow } : {}),
     ...(config.orgBudgetUsdPerWindow !== undefined ? { orgLimitUsd: config.orgBudgetUsdPerWindow } : {}),
     windowMs: config.budgetWindowMs,
   };
   const budget =
-    config.databaseUrl && (config.budgetUsdPerWindow !== undefined || config.orgBudgetUsdPerWindow !== undefined)
-      ? createPostgresBudgetTracker(config.databaseUrl, budgetOpts)
-      : createBudgetTracker(budgetOpts);
+    config.budgetUsdPerWindow !== undefined || config.orgBudgetUsdPerWindow !== undefined
+      ? createPostgresBudgetTracker(databaseUrl, budgetOpts)
+      : undefined;
   const resolution = createResolutionService(
     config.orgId,
     configStore,
@@ -818,62 +760,75 @@ export function buildApp(
     config.securityScreen === "off" && overrides.securityScreener ? "enforce" : config.securityScreen,
   );
 
-  const workspace = createLocalWorkspaceStore(config.dataDir);
+  const deploymentStorage = (bucket: string): StorageTarget => ({
+    bucket,
+    ...(config.s3Prefix ? { prefix: config.s3Prefix } : {}),
+  });
+  const s3 = config.s3Endpoint ? s3Client(config.s3Region, { endpoint: config.s3Endpoint }) : undefined;
+  const s3Override = s3 ? { _client: s3 } : {};
   const blobTransfer: BlobTransferStore =
     config.transferStore === "s3" && config.s3Bucket
-      ? createS3BlobTransferStore({
-          bucket: config.s3Bucket,
-          ...(config.s3Region ? { region: config.s3Region } : {}),
-          ...(config.s3Prefix ? { prefix: config.s3Prefix } : {}),
-        })
+      ? tenantBlobTransfer(
+          tenantStorage(deploymentStorage(config.s3Bucket), (target) =>
+            createS3BlobTransferStore({
+              ...s3Override,
+              ...target,
+              ...(config.s3Region ? { region: config.s3Region } : {}),
+            }),
+          ),
+        )
       : createLocalBlobTransferStore(join(config.dataDir, "transfer"));
   const fileBytes: DurableByteStore =
     config.snapshotStore === "s3" && config.s3Bucket
-      ? createS3DurableByteStore({
-          bucket: config.s3Bucket,
-          ...(config.s3Region ? { region: config.s3Region } : {}),
-          ...(config.s3Prefix ? { prefix: config.s3Prefix } : {}),
-        })
+      ? tenantByteStore(
+          tenantStorage(deploymentStorage(config.s3Bucket), (target) =>
+            createS3DurableByteStore({
+              ...s3Override,
+              ...target,
+              ...(config.s3Region ? { region: config.s3Region } : {}),
+            }),
+          ),
+        )
       : createLocalDurableByteStore(join(config.dataDir, "docstore"));
-  const files: FileArtifactStore = config.databaseUrl
-    ? createPostgresFileArtifactStore(config.databaseUrl, fileBytes)
-    : createMemoryFileArtifactStore(fileBytes);
+  const files: FileArtifactStore = createPostgresFileArtifactStore(databaseUrl, fileBytes);
+  const fileUploadStore = createPostgresFileUploadStore(databaseUrl);
   const fileUploads =
-    config.databaseUrl && config.snapshotStore === "s3" && config.s3Bucket
-      ? createDirectFileUploads({
-          bucket: config.s3Bucket,
-          ...(config.s3Region ? { region: config.s3Region } : {}),
-          ...(config.s3Prefix ? { prefix: config.s3Prefix } : {}),
-          store: createPostgresFileUploadStore(config.databaseUrl),
-          files,
-        })
+    config.snapshotStore === "s3" && config.s3Bucket
+      ? tenantFileUploads(
+          tenantStorage(deploymentStorage(config.s3Bucket), (target) =>
+            createDirectFileUploads({
+              ...(s3 ? { client: s3, presign: (command, expiresIn) => getSignedUrl(s3, command, { expiresIn }) } : {}),
+              ...target,
+              ...(config.s3Region ? { region: config.s3Region } : {}),
+              store: fileUploadStore,
+              files,
+            }),
+          ),
+        )
       : undefined;
-  const notebookMemory: MemoryService = config.databaseUrl
-    ? createPostgresMemoryService(config.databaseUrl)
-    : createMemoryService(workspace);
+  const notebookMemory: MemoryService = createPostgresMemoryService(databaseUrl);
   const semanticMemory = createSemanticMemory({
     notebook: notebookMemory,
-    databaseUrl: config.databaseUrl,
+    databaseUrl,
     embeddingModel: () => configStore.getEmbeddingModelDurable(),
     resolveEmbedder: (id) => resolveMemoryEmbedder(id),
     leaderLease,
     createSweeper,
   });
-  // Session storage is built further down; trace-derived providers only read it after the first turn.
   const memorySessions: { store?: SessionStore } = {};
   const baseMemory: MemoryService = withMemoryTidy(
     createConfiguredMemoryService({
       defaultMemory: semanticMemory.memory,
       config: config.memoryProviderConfig,
-      sessionEntries: (sessionId) => {
+      sessionItems: (sessionId) => {
         if (!memorySessions.store) throw new Error("session store is not ready");
-        return memorySessions.store.getEntries(sessionId, { limit: MEMORY_CAPTURE_ENTRY_WINDOW });
+        return memorySessions.store.getItems(sessionId, { limit: MEMORY_CAPTURE_ENTRY_WINDOW });
       },
     }),
     (scope) => memoryTidy.ensure(scope),
   );
   const mcpServers = createMcpServerStore(artifactMap<McpServer>("mcp_servers"));
-  const errors = withErrorReporting(config.databaseUrl ? createPostgresErrorLog(config.databaseUrl) : createErrorLog());
+  const errors = withErrorReporting(createPostgresErrorLog(databaseUrl));
   const sandboxOnError = (
     e: { category: string; code: string; message: string; scopeLabel?: string },
     error?: unknown,
@@ -888,13 +843,13 @@ export function buildApp(
       error,
     );
   const buildLocal = (): Sandbox =>
-    createLocalSandbox(workspace, {
+    createLocalSandbox({
       ...config.localSandbox,
       onError: sandboxOnError,
     });
-  const buildSprites = (): Sandbox => {
-    const { snapshotS3Bucket, ...sprites } = config.spritesSandbox;
-    return createSpritesSandbox(workspace, {
+  const buildSprites = (settings: SandboxSettings = config): Sandbox => {
+    const { snapshotS3Bucket, ...sprites } = settings.spritesSandbox;
+    return createSpritesSandbox({
       ...sprites,
       initializationStore: artifactMap<{ pending: boolean }>("sprites_initialization"),
       advisoryLock,
@@ -915,7 +870,7 @@ export function buildApp(
   const smolmachinesBodies = artifactMap<StoredSmolmachinesSandbox>("smolmachines_sandbox_bodies");
   const buildSmolmachines = (): Sandbox => {
     const { snapshotS3Bucket, snapshotIntervalSec, ...smol } = config.smolmachinesSandbox;
-    return createSmolmachinesSandbox(workspace, {
+    return createSmolmachinesSandbox({
       ...smol,
       ...(snapshotIntervalSec !== undefined ? { snapshotIntervalMs: snapshotIntervalSec * 1000 } : {}),
       blobTransfer,
@@ -936,6 +891,24 @@ export function buildApp(
   const e2bBodies = artifactMap<StoredE2bSandbox>("e2b_sandbox_bodies");
   const modalBodies = artifactMap<StoredModalSandbox>("modal_sandbox_bodies");
   const awsBodies = artifactMap<StoredMicrovm>("aws_sandbox_bodies");
+  const renderBodies = artifactMap<StoredRenderSandbox>("render_sandbox_bodies");
+  const renderScratch = artifactMap<StoredRenderScratch>("render_scratch_bodies");
+  const renderCleanup = artifactMap<StoredRenderCleanup>("render_sandbox_cleanup");
+  const renderClient =
+    config.renderSandbox.apiKey && config.renderSandbox.workspaceId && config.renderSandbox.image
+      ? createSdkRenderClient({ apiKey: config.renderSandbox.apiKey, workspaceId: config.renderSandbox.workspaceId })
+      : undefined;
+  const renderBase =
+    renderClient && config.renderSandbox.image
+      ? createRenderBase({
+          client: renderClient,
+          store: artifactMap<StoredRenderBase>("render_sandbox_bases"),
+          image: config.renderSandbox.image,
+          hold: (work) => leaderLease.hold(`render:sandbox-base:${config.renderSandbox.image}`, work),
+          onError: sandboxOnError,
+        })
+      : undefined;
+  let renderBasePreparing: AbortController | undefined;
   const e2bClient = (use: "computers" | "apps"): E2bClient => {
     const e2b = config.e2bSandbox;
     if (!e2b.apiKey)
@@ -952,7 +925,7 @@ export function buildApp(
   };
   const buildE2b = (): Sandbox => {
     const e2b = config.e2bSandbox;
-    return createE2bSandbox(workspace, {
+    return createE2bSandbox({
       advisoryLock,
       client: e2bClient("computers"),
       ...(e2b.namePrefix ? { namePrefix: e2b.namePrefix } : {}),
@@ -981,21 +954,19 @@ export function buildApp(
   const buildManagedAgents = (): Sandbox => {
     const managedAgents = config.managedAgentsSandbox;
     if (!managedAgents.apiToken) throw new Error("SANDBOX_BACKEND=do-managed-agents requires DO_AGENTS_API_TOKEN");
-    return createManagedAgentsSandbox(workspace, {
+    return createManagedAgentsSandbox({
       client: createSdkManagedAgentsClient({
         apiToken: managedAgents.apiToken,
         ...(managedAgents.apiBaseUrl ? { apiBaseUrl: managedAgents.apiBaseUrl } : {}),
         ...(managedAgents.template ? { template: managedAgents.template } : {}),
         ...(managedAgents.sizeSlug ? { sizeSlug: managedAgents.sizeSlug } : {}),
         ...(managedAgents.idleTimeoutSec ? { idleTimeoutSec: managedAgents.idleTimeoutSec } : {}),
-        ...(managedAgents.egressProxyUrl ? { egressProxyUrl: managedAgents.egressProxyUrl } : {}),
       }),
       ...(managedAgents.namePrefix ? { namePrefix: managedAgents.namePrefix } : {}),
       ...(managedAgents.defaultTimeoutSec ? { defaultTimeoutSec: managedAgents.defaultTimeoutSec } : {}),
       ...(managedAgents.snapshotIntervalSec !== undefined
         ? { snapshotIntervalMs: managedAgents.snapshotIntervalSec * 1000 }
         : {}),
-      ...(managedAgents.egressProxyUrl ? { egressProxyUrl: managedAgents.egressProxyUrl } : {}),
       extraTools: [...(managedAgents.template ? QM_TEMPLATE_TOOLS : []), ...deploymentLayer.advertisedTools],
       credentialPaths: deploymentLayer.credentialPaths,
       layerToolFiles: () => deploymentLayer.installFiles,
@@ -1012,11 +983,11 @@ export function buildApp(
       onError: sandboxOnError,
     });
   };
-  const buildModal = (): Sandbox => {
-    const modal = config.modalSandbox;
+  const buildModal = (settings: SandboxSettings = config): Sandbox => {
+    const modal = settings.modalSandbox;
     if (!modal.tokenId || !modal.tokenSecret)
       throw new Error("SANDBOX_BACKEND=modal requires MODAL_TOKEN_ID and MODAL_TOKEN_SECRET");
-    return createModalSandbox(workspace, {
+    return createModalSandbox({
       advisoryLock,
       client: createSdkModalClient({
         tokenId: modal.tokenId,
@@ -1034,8 +1005,6 @@ export function buildApp(
       }),
       ...(modal.namePrefix ? { namePrefix: modal.namePrefix } : {}),
       ...(modal.defaultTimeoutSec ? { defaultTimeoutSec: modal.defaultTimeoutSec } : {}),
-      ...(modal.snapshotIntervalSec !== undefined ? { snapshotIntervalMs: modal.snapshotIntervalSec * 1000 } : {}),
-      nativeSnapshotsEnabled: modal.nativeSnapshotsEnabled ?? false,
       ...(modal.nativeSnapshotIntervalSec !== undefined
         ? { nativeSnapshotIntervalMs: modal.nativeSnapshotIntervalSec * 1000 }
         : {}),
@@ -1058,7 +1027,7 @@ export function buildApp(
     });
   };
   const buildAgent37 = (): Sandbox =>
-    createAgent37Sandbox(workspace, {
+    createAgent37Sandbox({
       ...config.agent37Sandbox,
       advisoryLock,
       blobTransfer,
@@ -1093,10 +1062,8 @@ export function buildApp(
       )
       .digest("hex")
       .slice(0, 32);
-    return createSuperserveSandbox(workspace, {
-      configEpoch:
-        ss.configGeneration ??
-        (pgArtifactMap ? createConfigEpochResolver(superserveEpochs, generationKey, advisoryLock) : 0),
+    return createSuperserveSandbox({
+      configEpoch: ss.configGeneration ?? createConfigEpochResolver(superserveEpochs, generationKey, advisoryLock),
       client: createSdkSuperserveClient({
         apiKey: ss.apiKey,
         ...(ss.baseUrl ? { baseUrl: ss.baseUrl } : {}),
@@ -1125,7 +1092,7 @@ export function buildApp(
   };
   const buildAws = (): Sandbox => {
     if (!config.awsSandbox.s3Bucket) throw new Error("SANDBOX_BACKEND=aws requires AWS_SANDBOX_S3_BUCKET");
-    return createAwsSandbox(workspace, {
+    return createAwsSandbox({
       ...config.awsSandbox,
       s3Bucket: config.awsSandbox.s3Bucket,
       advisoryLock,
@@ -1140,7 +1107,7 @@ export function buildApp(
     });
   };
   const buildPorter = (): Sandbox =>
-    createPorterSandbox(workspace, {
+    createPorterSandbox({
       ...config.porterSandbox,
       advisoryLock,
       blobTransfer,
@@ -1151,6 +1118,29 @@ export function buildApp(
       ...(config.apiBaseUrl ? { apiBaseUrl: config.apiBaseUrl } : {}),
       onError: sandboxOnError,
     });
+  const buildRender = (): Sandbox => {
+    const render = config.renderSandbox;
+    if (!renderClient || !renderBase) {
+      throw new Error("SANDBOX_BACKEND=render requires RENDER_API_KEY, RENDER_WORKSPACE_ID, and RENDER_SANDBOX_IMAGE");
+    }
+    return createRenderSandbox({
+      client: renderClient,
+      base: renderBase,
+      ...(render.defaultTimeoutSec !== undefined ? { defaultTimeoutSec: render.defaultTimeoutSec } : {}),
+      store: renderBodies,
+      scratchStore: renderScratch,
+      cleanupStore: renderCleanup,
+      advisoryLock,
+      extraTools: deploymentLayer.advertisedTools,
+      credentialPaths: deploymentLayer.credentialPaths,
+      layerToolFiles: () => deploymentLayer.installFiles,
+      blobTransfer,
+      ...(config.signingSecret ? { signingSecret: config.signingSecret } : {}),
+      ...(config.capabilitySecret ? { capabilitySecret: config.capabilitySecret } : {}),
+      ...(config.apiBaseUrl ? { apiBaseUrl: config.apiBaseUrl } : {}),
+      onError: sandboxOnError,
+    });
+  };
   const buildBackend: Record<Config["sandboxBackend"], () => Sandbox> = {
     local: buildLocal,
     sprites: buildSprites,
@@ -1160,16 +1150,24 @@ export function buildApp(
     aws: buildAws,
     porter: buildPorter,
     agent37: buildAgent37,
+    render: buildRender,
     superserve: buildSuperserve,
     "do-managed-agents": buildManagedAgents,
   };
   const enabledBackends = new Set(enabledSandboxBackends(config));
-  const sandboxBackends: Partial<Record<SandboxBackendName, Sandbox>> = {
+  const deploymentBackends: Partial<Record<SandboxBackendName, Sandbox>> = {
     [config.sandboxBackend]: buildBackend[config.sandboxBackend](),
   };
   for (const name of Object.keys(buildBackend) as Array<Config["sandboxBackend"]>) {
-    if (name !== config.sandboxBackend && enabledBackends.has(name)) sandboxBackends[name] = buildBackend[name]();
+    if (name !== config.sandboxBackend && enabledBackends.has(name)) deploymentBackends[name] = buildBackend[name]();
   }
+  const tenantBackends = perTenantInstance([...SPRITES_TENANT_ENV, ...MODAL_TENANT_ENV], (env) =>
+    tenantSandboxBackends(deploymentBackends, tenantSandboxSettings(config, env), env, {
+      sprites: buildSprites,
+      modal: buildModal,
+    }),
+  );
+  const sandboxBackends = liveBackends(() => tenantBackends() ?? deploymentBackends);
   const sandboxRecords = artifactMap<SandboxResource>("sandbox_resources");
   const sandboxDefaults = artifactMap<SandboxDefault>("sandbox_defaults");
   const sandboxResources = createSandboxResources({
@@ -1263,7 +1261,7 @@ export function buildApp(
     ...deriveConnectorKey(keychainKeyMaterial ?? randomBytes(32), "keychain"),
     ...(legacyCredentialKey ? { fallbacks: [legacyCredentialKey] } : {}),
   };
-  pgArtifactMap?.pool.registerMigration({
+  pgArtifactMap.pool.registerMigration({
     id: "durable-map/keychain_credentials/0002-delete-auto-captured-logins",
     statements: [
       "CREATE TABLE IF NOT EXISTS keychain_credentials (id TEXT PRIMARY KEY, json JSONB NOT NULL)",
@@ -1280,8 +1278,6 @@ export function buildApp(
     lock: advisoryLock,
     refreshConnector: (() => {
       const base = makeRefresh({ resolveClient });
-      // AI subscription logins ride the same connector-refresh machinery:
-      // the keychain calls this single-flight when a token is stale.
       return async (host: string, token: OAuthToken, ctx?: { accountType?: string; clientRef?: string }) => {
         if (token.refreshToken && host === "auth.openai.com") {
           const fresh = await refreshChatGPTTokens(token.refreshToken);
@@ -1308,9 +1304,6 @@ export function buildApp(
     ...(fresh.accountId ? { accountId: fresh.accountId } : {}),
     ...(fresh.expiresAt !== undefined ? { expiresAt: fresh.expiresAt } : {}),
   });
-  // Per-user AI accounts live in the keychain itself (unified custody):
-  // same encryption, ownership, admin visibility, and removal flows as
-  // every other personal credential.
   const userModelCredentials = createUserModelCredentialStore({ keychain: credentialStore });
   const keychain: Keychain | undefined = keychainKeyMaterial ? credentialStore : undefined;
   const serviceCreds = withDeploymentCredentials(
@@ -1333,6 +1326,7 @@ export function buildApp(
   const mcpToolService = createMcpToolService({
     servers: mcpServers,
     audit: auditLog,
+    ...(config.mcpPrivateHosts ? { fetch: privateHostsFetch(config.mcpPrivateHosts) } : {}),
     ...(keychain ? { userTokens: keychain } : {}),
     ...(config.publicWebUrl
       ? {
@@ -1341,30 +1335,36 @@ export function buildApp(
         }
       : {}),
   });
-  const mcpTools = () => mcpToolService.toolDefs();
   const browserSessionStore: BrowserSessionStore | undefined = keychainKeyMaterial
     ? createBrowserSessionStore({ sessions: artifactMap<StoredBrowserSession>("browser_sessions"), key: credentialKey })
     : undefined;
   const connectorTokens = withOperatorTokenFallback(credentialStore, config.egressServiceHosts ?? [], secretSource);
   const consentLinks: ConsentLinkStore = createConsentLinkStore(artifactMap<ConsentLinkRecord>("consent_links"));
   const oauthFlows: OAuthFlowStore = createOAuthFlowStore(artifactMap<OAuthState>("oauth_flows"));
+  const tenancy = createTenancy(pgArtifactMap.pool, ownerPgPool(pgArtifactMap.pool));
+  configureTenantSettings(tenancy.settings);
+  configureTenantCaches(() => tenantLoader.load());
   const secretDrops: SecretDropStore = createSecretDropStore(artifactMap<SecretDropRecord>("secret_drops"));
-  const modelGateway = createModelGateway();
 
-  const requireDbUrl = (kind: string): string => {
-    if (!config.databaseUrl) throw new Error(`${kind}=postgres requires DATABASE_URL`);
-    return config.databaseUrl;
-  };
-  const sessions: SessionStore =
-    config.sessionStore === "postgres"
-      ? createPostgresSessionStore(requireDbUrl("SESSION_STORE"))
-      : createMemorySessionStore();
+  const sessions: SessionStore = createPostgresSessionStore(databaseUrl);
   memorySessions.store = sessions;
-  const runStoreKind = config.runStore;
-  const runSignals: RunSignalStore =
-    runStoreKind === "postgres"
-      ? createPostgresRunSignalStore(requireDbUrl("RUN_STORE"))
-      : createMemoryRunSignalStore();
+  const toolOutput = createPostgresToolOutputStore({
+    pool: pgArtifactMap.pool,
+    bytesFor: (prefix) =>
+      config.snapshotStore === "s3" && config.s3Bucket
+        ? tenantByteStore(
+            tenantStorage(deploymentStorage(config.s3Bucket), (target) =>
+              createS3DurableByteStore({
+                ...s3Override,
+                bucket: target.bucket,
+                ...(config.s3Region ? { region: config.s3Region } : {}),
+                prefix: `${target.prefix ?? ""}${prefix}`,
+              }),
+            ),
+          )
+        : createLocalDurableByteStore(join(config.dataDir, prefix)),
+  });
+  const runSignals: RunSignalStore = createPostgresRunSignalStore(databaseUrl);
   const writeModelRegistry = <T>(fn: () => Promise<T>): Promise<T> =>
     advisoryLock.withLock("model-registry", async () => {
       await refreshModels();
@@ -1386,6 +1386,11 @@ export function buildApp(
   const refreshCustomProviders = async () => {
     setCustomProviders(await customProviders.enabled());
   };
+  const tenantLoader = createTenantLoader([
+    () => configStore.hydrate?.() ?? Promise.resolve(),
+    refreshCustomProviders,
+    () => identity.refresh(),
+  ]);
   const refreshModels = async () => {
     await gatewayCatalog?.refresh();
     await refreshCustomProviders();
@@ -1412,8 +1417,6 @@ export function buildApp(
             try {
               return [p.id, await customProviders.resolveKey(p.id)] as const;
             } catch (e) {
-              // A corrupt/undecryptable custom key must degrade that one
-              // provider, never the whole turn (built-ins included).
               console.error(`[model] custom provider ${p.id}: key unreadable: ${errMessage(e)}`);
               return [p.id, null] as const;
             }
@@ -1435,75 +1438,78 @@ export function buildApp(
       credentialId: config.codexAuthCredential,
       lock: advisoryLock,
     });
-  else if (config.codexAuthFile) companyChatGPTAuth = fileCompanyChatGPTAuth(config.codexAuthFile);
   const resolveCompanySubscriptionKeys = async (): Promise<ProviderKeys> => {
     if (!companyChatGPTAuth) return {};
     try {
       const token = await companyChatGPTAuth.accessToken();
+      if (!token)
+        console.error(
+          `[model] company ChatGPT auth (${companyChatGPTAuth.description}) yielded no token (missing, removed, or not a ChatGPT login file)`,
+        );
       return token ? { [CODEX_SUBSCRIPTION_PROVIDER]: token } : {};
     } catch (e) {
       console.error(`[model] company ChatGPT auth (${companyChatGPTAuth.description}) unreadable: ${errMessage(e)}`);
       return {};
     }
   };
-  const resolvePiProviderKeys = async (): Promise<ProviderKeys> => ({
-    ...(await resolveModelProviderKeys()),
-    ...(await resolveCompanySubscriptionKeys()),
-  });
+  const companyClaudeAuthEnv =
+    config.claudeAuthCredential && keychain
+      ? keychainEnvCredential(keychain, config.claudeAuthCredential, [
+          "CLAUDE_CODE_OAUTH_TOKEN",
+          "ANTHROPIC_AUTH_TOKEN",
+        ])
+      : undefined;
+  const resolveCompanyClaudeKeys = async (): Promise<ProviderKeys> => {
+    if (!companyClaudeAuthEnv) return {};
+    const env = await companyClaudeAuthEnv();
+    const token = env.CLAUDE_CODE_OAUTH_TOKEN || env.ANTHROPIC_AUTH_TOKEN;
+    if (!token)
+      console.error(
+        `[model] company Claude subscription credential ${config.claudeAuthCredential} yielded no token (missing, expired, or not an env credential)`,
+      );
+    return token ? { anthropic: token } : {};
+  };
+  const resolveCompanyProviderKeys = async (): Promise<ProviderKeys> => {
+    const [claude, metered, chatgpt] = await Promise.all([
+      resolveCompanyClaudeKeys(),
+      resolveModelProviderKeys(),
+      resolveCompanySubscriptionKeys(),
+    ]);
+    const keys = { ...metered, ...claude, ...chatgpt };
+    return companyClaudeAuthEnv && !claude.anthropic ? { ...keys, anthropic: undefined } : keys;
+  };
   const resolveBrowserCompanyKeys = async (includeSubscription = true): Promise<ProviderKeys> =>
-    includeSubscription ? resolvePiProviderKeys() : resolveModelProviderKeys();
+    includeSubscription ? resolveCompanyProviderKeys() : resolveModelProviderKeys();
   const companyModelId = (id: string): string => {
     return resolveModel(id)?.provider === "openai" ? codexSubscriptionModelId(id) : id;
   };
-  const runtimeOrgScope = scopeId("org", config.orgId);
+  const runtimeOrgScope = () => scopeId("org", orgId());
   const orgBaseModelId = (): string | undefined =>
-    configStore.getRuntimeSelection(runtimeOrgScope)?.modelId ?? configStore.getBaseModel(runtimeOrgScope) ?? undefined;
-  const defaultForHarness = (harness: string) =>
-    defaultModelForHarness(
-      harness,
-      configuredModelForHarness(config, harness),
+    configStore.getRuntimeSelection(runtimeOrgScope())?.modelId ??
+    configStore.getBaseModel(runtimeOrgScope()) ??
+    undefined;
+  const deploymentDefaultModel = () =>
+    defaultModel(
+      configuredModel(config),
       baseModelProviders(config) ??
-        (harness === "pi" && gatewayTransport
+        (gatewayTransport
           ? { ...directProviderAvailability, modelIds: new Set(Object.keys(gatewayTransport.models)) }
           : undefined),
     );
-  const adapters = new Map<HarnessId, Harness>([
-    [
-      "pi",
-      createPiHarness({
-        ...piHarnessConfigOptions(config),
-        modelGateway: gatewayTransport,
-        resolveBaseModelId: () => orgBaseModelId() ?? defaultForHarness("pi"),
-        resolveFallbackRuntime: () => configStore.getPurposeRuntime("fallback"),
-        resolveProviderKeys: resolvePiProviderKeys,
-        ...(directProviderAvailability.codexOAuth ? { companyModelId } : {}),
-        signals: runSignals,
-        mcpTools,
-      }),
-    ],
-    [
-      "claude",
-      createClaudeHarness({
-        ...claudeHarnessConfigOptions(config),
-        ...(config.claudeAuthCredential && keychain
-          ? {
-              authEnv: keychainHarnessAuthEnv(keychain, config.claudeAuthCredential, [
-                "CLAUDE_CODE_OAUTH_TOKEN",
-                "ANTHROPIC_AUTH_TOKEN",
-              ]),
-            }
-          : {}),
-        signals: runSignals,
-        mcpTools,
-      }),
-    ],
-    ["mock", createMockHarness()],
-  ]);
-  const fallbackHarness = config.harness as HarnessId;
+  const baseAgent =
+    overrides.agent ??
+    createAgent({
+      ...agentConfigOptions(config),
+      modelGateway: gatewayTransport,
+      resolveBaseModelId: () => orgBaseModelId() ?? deploymentDefaultModel(),
+      resolveFallbackRuntime: () => configStore.getPurposeRuntime("fallback"),
+      resolveProviderKeys: resolveCompanyProviderKeys,
+      ...(directProviderAvailability.codexOAuth ? { companyModelId } : {}),
+      signals: runSignals,
+    });
   const fallback = {
-    harnessId: fallbackHarness,
     get modelId() {
-      return defaultForHarness(fallbackHarness);
+      return deploymentDefaultModel();
     },
   };
   const decide = createDecisionHooks(
@@ -1511,71 +1517,68 @@ export function buildApp(
     overrides.decisionBackend ??
       createDecisionBackend({
         providers: async (ids) => (await decisions?.providers(ids)) ?? [],
-        ...(config.modelGateway?.apiKey
-          ? {
-              gateway: {
-                url: config.modelGateway.url,
-                apiKey: config.modelGateway.apiKey,
-                ...(config.modelGateway.apiKeyHeader ? { apiKeyHeader: config.modelGateway.apiKeyHeader } : {}),
-              },
-            }
-          : {}),
+        ...(config.modelGateway ? { gateway: config.modelGateway } : {}),
         credential: async (slug) => {
           const rec = keychain
-            ? nonDeploymentCredential(await serviceCreds.getServiceCredentialSecret(scopeId("org", config.orgId), slug))
+            ? nonDeploymentCredential(await serviceCreds.getServiceCredentialSecret(scopeId("org", orgId()), slug))
             : null;
-          return rec ? { host: rec.host, enabled: rec.enabled, header: brokerCredentialAuthHeader(rec) } : null;
+          return rec ? { host: rec.host, enabled: rec.enabled, headers: credentialRequestHeaders(rec) } : null;
         },
       }),
     auditLog,
   );
-  const judgeModelId = (): string => config.judgeModelId ?? auxiliaryModelFor(orgBaseModelId() ?? fallback.modelId);
+  const utilityModelId = (): string => auxiliaryModelFor(orgBaseModelId() ?? fallback.modelId);
+  const judgeModelId = (): string => config.judgeModelId ?? utilityModelId();
   const hydrateModelCatalog = async (): Promise<unknown> => {
     await refreshModels();
     if (!(await modelCredentials.availability()).openrouter) return undefined;
     return selectableModelCatalog(overrides.modelCredentialFetch);
   };
-  const harness = createHarnessRouter(adapters, adapters.get(fallbackHarness)!, async (input, routedBy) => {
-    await refreshModels();
-    const resolve = (requested: typeof input.runtime) =>
-      resolveRuntimeChoiceDurable(
-        configStore,
-        runtimeOrgScope,
-        input.scopeLabel,
-        fallback,
-        requested,
-        hydrateModelCatalog,
-        input.runtimePurpose,
+  const resolveRequestedRuntime = (route: SessionRoute, requested: SessionRoute["runtime"]) =>
+    resolveRuntimeChoice(
+      configStore,
+      runtimeOrgScope(),
+      route.scopeLabel ?? runtimeOrgScope(),
+      fallback,
+      requested,
+      hydrateModelCatalog,
+      route.runtimePurpose,
+    );
+  const resolveSessionRuntime = async (route: SessionRoute): Promise<RuntimeChoice> => {
+    if (!route.runtimePinned || !route.runtime?.modelId) return resolveRequestedRuntime(route, route.runtime);
+    if (!modelSupported(route.runtime.modelId)) throw new Error(`Unsupported model: ${route.runtime.modelId}`);
+    return { ...route.runtime, modelId: route.runtime.modelId };
+  };
+  const agent = withResolvedRuntime(
+    baseAgent,
+    async (input, routedBy) => {
+      const decision = await tracePhase("turn.decision", () =>
+        decide("turn_start", turnStartState(input), {
+          ...(input.runtimeActorId ? { actorId: input.runtimeActorId } : {}),
+          scopeLabel: input.scopeLabel,
+          sessionId: input.session.id,
+          ...(input.runId ? { runId: input.runId } : {}),
+          ...(input.cancel ? { cancel: input.cancel } : {}),
+        }),
       );
-    const decision = await decide("turn_start", turnStartState(input), {
-      ...(input.runtimeActorId ? { actorId: input.runtimeActorId } : {}),
-      scopeLabel: input.scopeLabel,
-      sessionId: input.session.id,
-      ...(input.runId ? { runId: input.runId } : {}),
-      ...(input.cancel ? { cancel: input.cancel } : {}),
-    });
-    const routed = await routeTurnRuntime(decision, resolve, async () => {
-      if (input.runtimePinned && input.runtime?.harnessId && input.runtime.modelId) {
-        if (!modelSupportedByHarness(input.runtime.modelId, input.runtime.harnessId))
-          throw new Error(`Unsupported model: ${input.runtime.modelId}`);
-        return { ...input.runtime, harnessId: input.runtime.harnessId, modelId: input.runtime.modelId };
-      }
-      return resolve(input.runtime);
-    });
-    if (routed.routedBy) routedBy(routed.routedBy);
-    return routed.choice;
-  });
+      const routed = await routeTurnRuntime(
+        decision,
+        (requested) => resolveRequestedRuntime(input, requested),
+        () => resolveSessionRuntime(input),
+      );
+      if (routed.routedBy) routedBy(routed.routedBy);
+      return routed.choice;
+    },
+    resolveSessionRuntime,
+  );
 
   if (config.securityScreen === "off" || config.securityScreenClassifier !== "model") {
-    delete harness.models.screenSecurity;
+    delete agent.screenSecurity;
   }
 
   const leaseTtlMs = config.leaseTtlMs;
   const maxAttempts = config.maxAttempts;
-  const runStore =
-    runStoreKind === "postgres"
-      ? createPostgresRunStore(requireDbUrl("RUN_STORE"), { maxClaims: config.maxClaims })
-      : createMemoryRunStore({ maxClaims: config.maxClaims });
+  const runStore = createPostgresRunStore(databaseUrl, { maxClaims: config.maxClaims });
   const blockingApprovalSessions = async (sessionIds: readonly string[]): Promise<Set<string>> => {
     if (!sessionIds.length) return new Set();
     const wanted = new Set(sessionIds);
@@ -1588,9 +1591,9 @@ export function buildApp(
     );
   };
   const workingAncestors = async (session: Session) => {
-    const candidates = await stoppableAncestors(sessions, session);
-    const awaiting = await blockingApprovalSessions(candidates.map((ancestor) => ancestor.id));
-    const ancestors = candidates.filter((ancestor) => !awaiting.has(ancestor.id));
+    const root = await stoppableRoot(sessions, session);
+    const awaiting = await blockingApprovalSessions(root ? [root.id] : []);
+    const ancestors = root && !awaiting.has(root.id) ? [root] : [];
     return Promise.all(
       ancestors.map(async (ancestor) => ({
         session: ancestor,
@@ -1601,49 +1604,37 @@ export function buildApp(
   const runs: RunStore = {
     ...runStore.runs,
     async enqueue(input) {
-      const enqueue = async () => {
-        const known = await sessions.getByThread(input.sessionId);
-        if (
-          known &&
-          (known.parentSessionId || (await sessions.childrenOf(known.id)).length > 0) &&
-          !(input.dedupKey && (await runStore.runs.getByDedupKey(input.dedupKey))) &&
-          (await sessionTreeRunCount(sessions, runStore.runs, await sessionTreeRoot(sessions, known))) >=
-            SUBAGENT_TREE_RUN_CAP
-        )
-          throw new Error(`all ${SUBAGENT_TREE_RUN_CAP} session run slots are in use`);
-        const participants = known ? await sessions.participantsOf(known.id) : [];
-        const ancestors = known?.parentSessionId ? await workingAncestors(known) : [];
-        const result = await runStore.runs.enqueue(input);
-        if (result.deduped) return result;
+      const known = await sessions.getByThread(input.sessionId);
+      const participants = known ? await sessions.participantsOf(known.id) : [];
+      const ancestors = known?.parentSessionId ? await workingAncestors(known) : [];
+      const result = await runStore.runs.enqueue(input);
+      if (result.deduped) return result;
+      sessionStateBus.emit({
+        threadRef: input.sessionId,
+        ...(known ? { sessionId: known.id } : {}),
+        state: "working",
+        at: result.run.createdAt,
+        participants: participants.length ? participants : [input.request.actor.id],
+      });
+      for (const ancestor of ancestors)
         sessionStateBus.emit({
-          threadRef: input.sessionId,
-          ...(known ? { sessionId: known.id } : {}),
+          threadRef: ancestor.session.threadRef,
+          sessionId: ancestor.session.id,
           state: "working",
           at: result.run.createdAt,
-          participants: participants.length ? participants : [input.request.actor.id],
+          participants: ancestor.participants,
         });
-        for (const ancestor of ancestors)
-          sessionStateBus.emit({
-            threadRef: ancestor.session.threadRef,
-            sessionId: ancestor.session.id,
-            state: "working",
-            at: result.run.createdAt,
-            participants: ancestor.participants,
-          });
-        return result;
-      };
-      return advisoryLock.withLock("session-run-admission", enqueue);
+      return result;
     },
   };
-  const swarmStoreKind = config.databaseUrl ? "postgres" : "memory";
   const swarms =
-    config.swarmsEnabled !== false && config.sessionStore === swarmStoreKind && runStoreKind === swarmStoreKind
+    config.swarmsEnabled !== false
       ? createSwarmService({
           defaults: config.swarmDefaults,
           store: createSwarmStore(artifactMap<SwarmStorage>("swarms", ["pending"]), {
             runs,
             sessions,
-            ...(pgArtifactMap && runStoreKind === "postgres" ? { pg: pgArtifactMap.pool } : {}),
+            pg: pgArtifactMap.pool,
           }),
           sessions,
           runs,
@@ -1662,43 +1653,24 @@ export function buildApp(
           },
         })
       : undefined;
-  const productAnalytics = createProductAnalytics(config.orgId, config.productAnalytics);
-  runs.onTerminal((run) => {
-    void productAnalytics.responseFinished(run);
-    const startedAt = run.startedAt ?? run.finishedAt ?? Date.now();
-    const finishTiming = startTiming("queue.task", "run", startedAt);
-    let status: TimingStatus = "internal_error";
-    if (run.result?.stopped) status = "cancelled";
-    else if (run.status === "done") status = "ok";
-    finishTiming?.({
-      status,
-      endMs: run.finishedAt ?? Date.now(),
-      data: { surface: run.request.surface, origin: resolveTurnOrigin(run.request).kind },
-      measurements: { queue_wait: startedAt - run.createdAt },
-    });
-  });
-  const ledger = runStore.ledger;
+  const productAnalytics = createProductAnalytics(orgId, config.productAnalytics);
+  runs.onTerminal((run) => void productAnalytics.responseFinished(run));
 
   let processes: ProcessRegistry | undefined;
   if (supportsProcessSessions(sandbox)) {
-    processes = config.databaseUrl ? createPostgresProcessRegistry(config.databaseUrl) : createMemoryProcessRegistry();
+    processes = createPostgresProcessRegistry(databaseUrl);
   }
 
-  const appPageViews =
-    config.databaseUrl && config.awsDeploy.appsDomain ? createPostgresAppPageViewLog(config.databaseUrl) : undefined;
-  const brokerSessions = config.databaseUrl ? createPostgresBrokerSessions(config.databaseUrl) : undefined;
-  const replayDedupe = config.databaseUrl ? createPostgresReplayDedupe(config.databaseUrl) : createMemoryReplayDedupe();
-  const metrics = config.databaseUrl ? createPostgresMetricsSink(config.databaseUrl) : createMetricsSink();
-  const credentialUsage = config.databaseUrl
-    ? createPostgresCredentialUsageSink(config.databaseUrl)
-    : createCredentialUsageSink();
-  const egressAudit = config.databaseUrl ? createPostgresEgressAuditSink(config.databaseUrl) : createEgressAuditSink();
-  const runStreamEvents = config.databaseUrl
-    ? createPostgresNotifyBus<RunStreamEvent>(config.databaseUrl, "run_stream", "run-stream")
-    : createMemoryEventBus<RunStreamEvent>("run-stream");
+  const appPageViews = config.awsDeploy.appsDomain ? createPostgresAppPageViewLog(databaseUrl) : undefined;
+  const brokerSessions = createPostgresBrokerSessions(databaseUrl);
+  const replayDedupe = createPostgresReplayDedupe(databaseUrl);
+  const credentialUsage = createPostgresCredentialUsageSink(databaseUrl);
+  const egressAudit = createPostgresEgressAuditSink(databaseUrl);
+  const runStreamEvents = createPostgresNotifyBus<RunStreamEvent>(databaseUrl, "run_stream", "run-stream");
   const refreshRunStream = (runId: string): void => runStreamEvents.emit({ runId, kind: "refresh" });
   const turnStream = createTurnStream({
     onDelta: (runId, text, offset, startOffset) => emitRunText(runStreamEvents, runId, text, offset, startOffset),
+    onReasoning: (runId, block, text, offset) => emitRunReasoning(runStreamEvents, runId, block, text, offset),
     onChange: refreshRunStream,
   });
   const stopStreamSync = runStreamEvents.subscribe((event) => {
@@ -1707,18 +1679,15 @@ export function buildApp(
     const startOffset = turnStream.startOffset(event.runId);
     const offset = Math.max(event.offset, startOffset);
     if (text) emitRunText(runStreamEvents, event.runId, text.slice(offset - startOffset), offset, startOffset);
+    for (const block of turnStream.reasoning(event.runId)) {
+      const sent = event.reasoning?.[reasoningKey(block)] ?? 0;
+      if (block.text.length > sent) emitRunReasoning(runStreamEvents, event.runId, block, block.text.slice(sent), sent);
+    }
   });
   runs.onTerminal((run) => refreshRunStream(run.id));
-  const sessionStateBus: SessionStateBus = config.databaseUrl
-    ? createPostgresSessionStateBus(config.databaseUrl)
-    : createMemorySessionStateBus();
-  const ledgerEventBus: LedgerEventBus = config.databaseUrl
-    ? createPostgresLedgerEventBus(config.databaseUrl)
-    : createMemoryLedgerEventBus();
-  const activityStore: RunActivityStore =
-    runStoreKind === "postgres"
-      ? createPostgresRunActivityStore(requireDbUrl("RUN_STORE"))
-      : createMemoryRunActivityStore();
+  const sessionStateBus: SessionStateBus = createPostgresSessionStateBus(databaseUrl);
+  const ledgerEventBus: LedgerEventBus = createPostgresLedgerEventBus(databaseUrl);
+  const activityStore: RunActivityStore = createPostgresRunActivityStore(databaseUrl);
   const runActivity: RunActivityStore = {
     ...activityStore,
     async append(runId, entry) {
@@ -1728,7 +1697,7 @@ export function buildApp(
   };
   const deployStore = createDeployStore({
     deployments: artifactMap<Deployment>("deployments"),
-    ...(pgArtifactMap ? { pg: pgArtifactMap.pool } : {}),
+    pg: pgArtifactMap.pool,
     touchDebounceMs: deployTouchDebounceMs(config.deployIdleTtlMs),
     git: {
       repoRoot: config.deployGitDir,
@@ -1736,6 +1705,7 @@ export function buildApp(
       ...(config.snapshotStore === "s3" && config.s3Bucket
         ? {
             archiveBytes: createS3DurableByteStore({
+              ...s3Override,
               bucket: config.s3Bucket,
               ...(config.s3Region ? { region: config.s3Region } : {}),
               prefix: `${config.s3Prefix ?? ""}deploy-git/`,
@@ -1744,6 +1714,51 @@ export function buildApp(
         : {}),
     },
   });
+  const renderDeployBodies = artifactMap<StoredRenderDeploy>("render_deploy_bodies");
+  const renderArtifacts =
+    config.deployProvider === "render"
+      ? createRenderDeployArtifacts({
+          baseUrl: config.apiBaseUrl ?? "",
+          signingSecret: config.signingSecret ?? "",
+          store: artifactMap<StoredRenderDeployCredential>("render_deploy_credentials"),
+          deployStore,
+        })
+      : undefined;
+  const buildRenderDeploy = (): DeployProvider => {
+    const render = config.renderDeploy;
+    if (
+      !config.s3Bucket ||
+      !config.s3Endpoint ||
+      !render.source ||
+      !render.environmentId ||
+      !renderArtifacts ||
+      !config.connectorSecretKey
+    )
+      throw new Error(
+        "Render app deployment requires the QM database, storage, Git source, environment, and credential keys",
+      );
+    const storage = createRenderAppStorage({
+      apiKey: render.apiKey,
+      workspaceId: render.workspaceId,
+      environmentId: render.environmentId,
+      minioServiceId: render.minioServiceId,
+      endpoint: config.s3Endpoint,
+      bucket: config.s3Bucket,
+      prefix: config.s3Prefix,
+      region: config.s3Region,
+      store: artifactMap<StoredRenderAppStorage>("render_app_storage"),
+      keyMaterial: config.connectorSecretKey,
+    });
+    return createRenderDeployProvider({
+      ...render,
+      source: render.source,
+      environmentId: render.environmentId,
+      store: renderDeployBodies,
+      artifacts: renderArtifacts,
+      advisoryLock,
+      resources: storage,
+    });
+  };
   const buildAwsDeploy = (): DeployProvider =>
     createAwsDeployProvider({
       ...config.awsDeploy,
@@ -1766,6 +1781,7 @@ export function buildApp(
       : undefined;
   const buildDeployProvider: Record<Config["deployProvider"], () => DeployProvider> = {
     aws: buildAwsDeploy,
+    render: buildRenderDeploy,
     docker: () => createDockerDeployProvider({ onError: sandboxOnError }),
     fly: () =>
       createFlyDeployProvider({
@@ -1793,35 +1809,34 @@ export function buildApp(
       });
     },
   };
-  if (
-    config.deployProvider === "fly" &&
-    (config.flyDeploy.dataVolumeSizeGb || config.flyDeploy.sharedAppName || config.flyDeploy.wireguardPeers) &&
-    !config.databaseUrl
-  ) {
-    throw new Error("Fly durable application storage requires DATABASE_URL for persistent rollback configuration");
-  }
   const deployProvider: DeployProvider = buildDeployProvider[config.deployProvider]();
   if (config.deployProvider === "aws" && !config.awsDeploy.dataBucket && !config.awsSandbox.s3Bucket) {
     console.warn(
       "[wiring] aws deploy: no data bucket resolved (AWS_DEPLOY_DATA_BUCKET unset, sandbox is not aws) — deployed apps have NO durable /data",
     );
   }
-  const adminGrantPersist = config.databaseUrl
-    ? createPostgresAdminGrantStore(config.databaseUrl)
-    : createMapAdminGrantPersistence(createMemoryMap<AdminGrant>());
-  const adminGrantStore = createAdminGrantStore(adminGrantPersist, {
-    seed: bootAdminGrantSeed(config.adminGrants, config.orgId, !!config.databaseUrl),
+  const adminGrantStore = createAdminGrantStore(createPostgresAdminGrantStore(databaseUrl), {
+    seed: parseAdminGrants(config.adminGrants, config.orgId) ?? [],
   });
   const admin = createAdminService(adminGrantStore, { trustedOidcAdminIssuer: config.trustedOidcAdminIssuer });
   const { strategy: memoryStrategy, memory } = createMemoryStrategy(config.memoryStrategy, {
-    harness: harness.models,
+    agent,
     memory: baseMemory,
     captureQuietMs: config.memoryCaptureQuietMs,
     ...(config.memoryCaptureMaxTurns !== undefined ? { captureMaxTurns: config.memoryCaptureMaxTurns } : {}),
     onCaptureError: (e, scope) =>
       errors.record({ category: "memory", code: "capture_failed", message: errMessage(e), scopeLabel: scope }, e),
   });
-  const directory = config.databaseUrl ? createPostgresDirectoryStore(config.databaseUrl) : createDirectoryStore();
+  const directory = createPostgresDirectoryStore(databaseUrl);
+  const vouchedInternalEmail = async (email: string): Promise<boolean> => {
+    await identity.refresh();
+    return (
+      identity.isInternal(identity.classify(email)) &&
+      (config.emailAuthPrincipals?.includes(email) === true ||
+        Boolean(config.emailAuthDomain && email.endsWith(`@${config.emailAuthDomain}`)) ||
+        (await directory.get(email))?.type === "internal")
+    );
+  };
   const projects = createProjectStore(artifactMap<Project>("projects"), {
     isActiveMember: (principalId) => identity.isInternal(identity.classify(principalId)),
     advisoryLock,
@@ -1829,7 +1844,10 @@ export function buildApp(
   const canReadScope = createCanReadScope({ managedGroups: projects, directory, identity, teams, sessions });
   const canWriteScope = createCanWriteScope({ managedGroups: projects, directory, identity, teams });
   const canManageScope = createCanManageScope({ managedGroups: projects, directory, identity, sessions });
-  const managesArtifactHome = createManagesArtifactHome({ managedGroups: projects, directory }, canManageScope);
+  const managesArtifactHome = createManagesArtifactHome(
+    { managedGroups: projects, directory, identity, teams },
+    canManageScope,
+  );
   const currentScopeMembers = createCurrentScopeMembers({ managedGroups: projects, directory, identity });
   const isCurrentSharedScopeMember = createIsCurrentSharedScopeMember({ managedGroups: projects, directory, identity });
   membership.canReadScope = canReadScope;
@@ -1840,10 +1858,7 @@ export function buildApp(
   membership.managesArtifactHome = managesArtifactHome;
   const deployGitSecret = config.signingSecret;
   const deployGitBase = config.apiBaseUrl;
-  const deliveries = withWebTranscriptDeliveries(
-    config.databaseUrl ? createPostgresDeliveryStore(config.databaseUrl) : createDeliveryStore(),
-    sessions,
-  );
+  const deliveries = withWebTranscriptDeliveries(createPostgresDeliveryStore(databaseUrl), sessions, runs);
   const deployService = createDeployService({
     deliveries,
     deployAppsDomain: config.awsDeploy.appsDomain,
@@ -1860,32 +1875,23 @@ export function buildApp(
     canReadScope,
     canWriteScope,
     externalSharingAllowed: (ownerScopeId) => externalAppSharingAllowed(featureFlags, ownerScopeId),
-    canManageEmail: async (email) => {
-      await identity.refresh();
-      return (
-        identity.isInternal(identity.classify(email)) &&
-        ((await directory.get(email))?.type === "internal" ||
-          config.emailAuthPrincipals?.includes(email) ||
-          Boolean(config.emailAuthDomain && email.endsWith(`@${config.emailAuthDomain}`)) ||
-          identity.externalMember(email) !== undefined)
-      );
-    },
+    canManageEmail: async (email) =>
+      (await vouchedInternalEmail(email)) ||
+      (identity.isInternal(identity.classify(email)) && identity.externalMember(email) !== undefined),
     managesArtifactHome,
     ...(deployGitSecret && deployGitBase
       ? {
           deploymentEnv: async (deployment: Deployment): Promise<Record<string, string>> => {
-            const env: Record<string, string> = {
-              VIEWER_IDENTITY_KEY: viewerIdentityKey(deployGitSecret, deployment.id),
-            };
-            const orgScope = scopeId("org", config.orgId);
+            const orgScope = scopeId("org", orgId());
             const credentials = await deploymentCredentialSlugs(
               await serviceCreds.listServiceCredentials(orgScope),
               orgScope,
               acl,
             );
-            if (credentials.length) {
-              env.AGENT_API_URL = deployGitBase;
-              env.AGENT_CREDENTIAL_TOKEN = await mintCapabilityToken(
+            return {
+              VIEWER_IDENTITY_KEY: viewerIdentityKey(deployGitSecret, deployment.id),
+              AGENT_API_URL: deployGitBase,
+              AGENT_CREDENTIAL_TOKEN: await mintCapabilityToken(
                 {
                   actorId: deployment.createdBy,
                   scopeId: personalScope(deployment.createdBy),
@@ -1896,17 +1902,14 @@ export function buildApp(
                 },
                 config.capabilitySecret ?? deployGitSecret,
                 config.capabilityTokenCompression,
-              );
-            }
-            return env;
+              ),
+            };
           },
         }
       : {}),
   });
-  const environments = config.databaseUrl
-    ? createPostgresEnvironmentStore(config.databaseUrl)
-    : createMemoryEnvironmentStore();
-  const monitors = createMonitorStore(artifactMap<Monitor>("monitors"));
+  const environments = createPostgresEnvironmentStore(databaseUrl);
+  const monitors = createMonitorStore(artifactMap<Monitor>("monitors", ["ownerScopeId"]));
   const loopStore = createLoopStore(artifactMap<Loop>("loops"));
   const loopItemsMap = artifactMap<LoopItem>("loop_items", ["loopId"]);
   const loopOwnerCache = new Map<string, string>();
@@ -1924,7 +1927,7 @@ export function buildApp(
     lock: advisoryLock,
     accepts: async (id) => {
       const loop = await loopStore.get(id);
-      return Boolean(loop && (loop.surface !== "inbox" || loop.state === "enabled"));
+      return Boolean(loop && loop.state !== "archived");
     },
   });
   const loopOutputs = createLoopOutputStore(artifactMap<LoopOutput>("loop_outputs", ["itemId"]), (output) =>
@@ -1932,8 +1935,8 @@ export function buildApp(
   );
   const loopGrants = createShipGrantStore(artifactMap<ShipGrant>("loop_ship_grants"));
   const cronChanged: { notify?: (id: string) => void } = {};
-  const cronFires = config.databaseUrl ? createPostgresCronFireStore(config.databaseUrl) : createMemoryCronFireStore();
-  const cronsBase = createCronStore(artifactMap<Cron>("crons"), {
+  const cronFires = createPostgresCronFireStore(databaseUrl);
+  const cronsBase = createCronStore(artifactMap<Cron>("crons", ["ownerScopeId"]), {
     staleRunningMs: config.runMaxAgeMs,
     fires: cronFires,
   });
@@ -1954,16 +1957,47 @@ export function buildApp(
       cronChanged.notify?.(id);
     },
   };
-  pgArtifactMap?.pool.registerMigration(DROP_RUN_AS_MIGRATION);
-  pgArtifactMap?.pool.registerMigration({
-    id: "durable-map/turn_wall_clock_configs/0002-drop",
+  for (const table of ["sprites_initialization", "sandbox_resource_rollout", "sandbox_routing"]) artifactMap(table);
+  pgArtifactMap.pool.registerMigration(DROP_RUN_AS_MIGRATION);
+  pgArtifactMap.pool.registerMigration(RETIRED_ORIGIN_SWEEP_MIGRATION);
+  pgArtifactMap.pool.registerMigration(DROP_RECIPIENT_CONSENT_MIGRATION);
+  pgArtifactMap.pool.registerMigration({
+    id: "durable-map/crons/0002-drop-fire-log",
     statements: [
-      "DROP TABLE IF EXISTS turn_wall_clock_configs",
-      "DELETE FROM durable_map_versions WHERE tbl = 'turn_wall_clock_configs'",
+      "CREATE TABLE IF NOT EXISTS crons (id TEXT PRIMARY KEY, json JSONB NOT NULL)",
+      "UPDATE crons SET json = json - 'fireLog' WHERE json ? 'fireLog'",
     ],
   });
-  pgArtifactMap?.pool.registerMigration(LEGACY_HARNESS_MIGRATION);
-  pgArtifactMap?.pool.registerMigration({
+  pgArtifactMap.pool.registerMigration({
+    id: "durable-map/retired-tables/0001-drop",
+    statements: [
+      "turn_wall_clock_configs",
+      "connector_status",
+      "pinned_skills",
+      "internal_member_overrides",
+      "brain_clients",
+      "break_glass_grants",
+      "browse_provider_configs",
+      "device_flow_cutover",
+      "device_flow_cutover_resets",
+      "inbox_state",
+      "provider_request_capture_flag",
+      "run_state_retention_configs",
+      "slack_agent_requests",
+    ].flatMap((table) => [`DROP TABLE IF EXISTS ${table}`, `DELETE FROM durable_map_versions WHERE tbl = '${table}'`]),
+  });
+  pgArtifactMap.pool.registerMigration({
+    id: "runtime/0002-drop-harness-choice",
+    statements: [
+      "DROP TABLE IF EXISTS approved_harness_configs",
+      "DELETE FROM durable_map_versions WHERE tbl = 'approved_harness_configs'",
+      `DO $$ BEGIN IF to_regclass('base_model_configs') IS NOT NULL THEN UPDATE base_model_configs SET json = (CASE WHEN json ? 'harnessId' AND NOT json ? 'orgRevision' THEN json || '{"orgRevision":0}'::jsonb ELSE json END) - 'harnessId' #- '{cronRuntime,harnessId}' #- '{subagentRuntime,harnessId}' #- '{fallbackRuntime,harnessId}' WHERE json ? 'harnessId' OR (json -> 'cronRuntime') ? 'harnessId' OR (json -> 'subagentRuntime') ? 'harnessId' OR (json -> 'fallbackRuntime') ? 'harnessId'; END IF; END $$`,
+      `DO $$ BEGIN IF to_regclass('auto_flagger_configs') IS NOT NULL THEN UPDATE auto_flagger_configs SET json = json - 'harnessId' WHERE json ? 'harnessId'; END IF; END $$`,
+      `DO $$ BEGIN IF to_regclass('crons') IS NOT NULL THEN UPDATE crons SET json = json #- '{runtime,harnessId}' WHERE (json -> 'runtime') ? 'harnessId'; END IF; END $$`,
+      `DO $$ BEGIN IF to_regclass('swarms') IS NOT NULL THEN UPDATE swarms SET json = json #- '{template,harness}' WHERE (json -> 'template') ? 'harness'; END IF; END $$`,
+    ],
+  });
+  pgArtifactMap.pool.registerMigration({
     id: "durable-map/suggested_activity_profiles/0001-nightly-on-use",
     statements: [
       "CREATE TABLE IF NOT EXISTS crons (id TEXT PRIMARY KEY, json JSONB NOT NULL)",
@@ -1972,8 +2006,11 @@ export function buildApp(
       `UPDATE crons c SET json = jsonb_set(c.json, '{enabled}', 'true') FROM suggested_activity_profiles p WHERE p.json ->> 'cronId' = c.id AND (p.json ->> 'autoPaused')::boolean`,
     ],
   });
-  const webhooks = createWebhookStore(artifactMap<Webhook>("webhooks"), artifactMap<WebhookHistory>("webhook_history"));
-  pgArtifactMap?.pool.registerMigration({
+  const webhooks = createWebhookStore(
+    artifactMap<Webhook>("webhooks", ["ownerScopeId"]),
+    artifactMap<WebhookHistory>("webhook_history"),
+  );
+  pgArtifactMap.pool.registerMigration({
     id: "durable-map/webhooks/0002-disable-rows-orphaned-by-webhook-removal",
     legacyId: "durable-map/webhooks/0002-disable-rows-orphaned-by-webhook-removal",
     statements: [
@@ -2030,12 +2067,24 @@ export function buildApp(
       conversation: { ...request.conversation, audience, publishMembers: audience },
     };
   };
-  const sessionMailbox = createSessionMailbox(artifactMap<SessionMessage>("session_mailbox", ["recipientId"]));
+  const runtimeDeps: RuntimeDeps = {
+    config: configStore,
+    get baseModelDefault() {
+      return fallback.modelId;
+    },
+    providerKeys: providerKeysPresent(config),
+    modelCredentials,
+    modelCredentialFetch: overrides.modelCredentialFetch,
+    refreshModels,
+  };
+  const sessionMailbox = createSessionMailbox(artifactMap<SessionMessage>("session_mailbox", ["recipientId", "wake"]));
+  const delegationEnabled = (actorId: string) => featureFlags.enabled("responsive_spine", scopeId("personal", actorId));
   const sessionSyscalls = createSessionSyscalls({
     mailbox: sessionMailbox,
+    delegationEnabled,
     enabled: async (actorId) =>
       (await featureFlags.enabled("persistent_subagents", scopeId("personal", actorId))) ||
-      (await featureFlags.enabled("responsive_spine", scopeId("personal", actorId))),
+      (await delegationEnabled(actorId)),
     sessions,
     runs,
     signals: runSignals,
@@ -2049,38 +2098,49 @@ export function buildApp(
       start: (actorId, input) => startSession(app, sessions, actorId, input),
     },
     async validateRuntime(input, scope) {
-      await resolveRuntimeChoiceDurable(
-        configStore,
-        runtimeOrgScope,
-        scope,
-        fallback,
-        {
-          ...(input.harness ? { harnessId: input.harness as HarnessId } : {}),
-          ...(input.model ? { modelId: input.model } : {}),
-          ...(input.thinkingLevel ? { effortLevel: input.thinkingLevel } : {}),
-          ...(typeof input.fastMode === "boolean" ? { fastMode: input.fastMode } : {}),
-        },
-        hydrateModelCatalog,
-        "subagent",
-      );
+      const requested = {
+        ...(input.model ? { modelId: input.model } : {}),
+        ...(input.thinkingLevel ? { effortLevel: input.thinkingLevel } : {}),
+        ...(typeof input.fastMode === "boolean" ? { fastMode: input.fastMode } : {}),
+      };
+      if (Object.keys(requested).length === 0) {
+        await resolveRuntimeChoice(
+          configStore,
+          runtimeOrgScope(),
+          scope,
+          fallback,
+          requested,
+          hydrateModelCatalog,
+          "subagent",
+        );
+        return;
+      }
+      const error = await requestedRuntimeError({ deps: runtimeDeps }, scope, requested, "subagent");
+      if (error) throw new Error(error);
+    },
+    async defaultModel(scope) {
+      return (await resolveRuntimeChoice(configStore, runtimeOrgScope(), scope, fallback, {}, hydrateModelCatalog))
+        .modelId;
     },
   });
   const uiState = artifactMap<PersistedUiState>("web_ui_state");
+  const surfaces = createSurfaceRegistry({
+    surfaces: [
+      createSlackSurface({ deliveries }),
+      ...(config.partnerChat
+        ? [
+            createPartnerChatSurface({
+              deliveries,
+              surfaceCache: { readMessages: (container, opts) => surfaceCache.readMessages(container, opts) },
+              ...(config.partnerChat.label ? { label: config.partnerChat.label } : {}),
+            }),
+          ]
+        : []),
+    ],
+  });
   const orchestratorDeps: OrchestratorDeps = {
-    installSharedCanvas: async (actorId, fileId, where) => {
-      const canvas = await installSharedCanvas(uiState, actorId, await app.openFileForViewer(fileId, actorId));
-      if (typeof canvas === "string") return canvas;
-      auditLog.record({
-        at: Date.now(),
-        principalId: actorId,
-        action: "ui.canvas.install",
-        resource: `file:${fileId}`,
-        scopeLabel: personalScope(actorId),
-        detail: `rev ${canvas.rev}`,
-      });
-      sessionStateBus.emit({ ...where, participants: [actorId], state: "ui", at: Date.now(), ui: { kind: "canvas" } });
-      return null;
-    },
+    advisoryLock,
+    admittedWork,
     sessionStateBus,
     externalSlackPolicies: config.externalSlackPolicies,
     sessionSyscalls,
@@ -2088,22 +2148,20 @@ export function buildApp(
     identity,
     resolution,
     config: configStore,
-    defaultHarness: fallbackHarness,
     defaultTurnWallClockMs: config.turnWallClockMs,
     userModelCredentials,
     ...(config.brandingDefault ? { brandingDefault: config.brandingDefault } : {}),
+    surfaces,
     sessions,
-    workspace,
     files,
+    toolOutput,
     sandbox,
     sandboxResources,
     swarms,
     connectorTokens,
-    modelGateway,
     auditLog,
-    rateLimiter,
     budget,
-    harness,
+    agent,
     memory,
     deploy: deployService,
     acl,
@@ -2113,7 +2171,6 @@ export function buildApp(
     execTimeoutMs: config.execTimeoutDefaultMs,
     execTimeoutCeilingMs: config.execTimeoutMaxMs,
     approvalSummaryTimeoutMs: config.approvalSummaryTimeoutMs,
-    turnLeaseWaitMs: config.turnLeaseWaitMs,
     securityScreenTimeoutMs: config.securityScreenTimeoutMs,
     ...(securityScreener ? { securityScreener } : {}),
     backgroundJobTtlMs: config.backgroundJobTtlMs,
@@ -2123,21 +2180,19 @@ export function buildApp(
     ...(config.capabilitySecret ? { capabilitySecret: config.capabilitySecret } : {}),
     capabilityTokenCompression: config.capabilityTokenCompression,
     ...(config.apiBaseUrl ? { apiBaseUrl: config.apiBaseUrl } : {}),
+    ...(gatewayTransport ? { sandboxModels: true } : {}),
     ...(config.publicWebUrl ? { publicWebUrl: config.publicWebUrl } : {}),
     ...(config.deployAppsDomain ? { deployAppsDomain: config.deployAppsDomain } : {}),
     ...(config.resendApiKey && config.emailFrom
-      ? { inviteMailer: createResendMailer(config.resendApiKey, config.emailFrom) }
+      ? { inviteMailer: tenantMailer(config.resendApiKey, config.emailFrom) }
       : {}),
     ...(config.publicUrl ? { webhookPublicUrl: config.publicUrl } : {}),
     memoryPolicy: { recall: config.memoryRecall, capture: config.memoryCapture },
     memoryStrategy,
     skills,
     skillBundles,
-    skillsReady,
-    advisoryLock,
+    skillsReady: () => skillsReady,
     errors,
-    metrics,
-    ledger,
     signals: runSignals,
     turnStream,
     runActivity,
@@ -2146,27 +2201,24 @@ export function buildApp(
     featureFlags,
     teams,
     credentialUsage,
-    connectorStatusCache,
     resolveConnectorClient: resolveClient,
     ...(keychain ? { keychain } : {}),
     serviceCreds,
     deliveries,
     approvals,
-    approvalGrants: artifactMap<CommandApprovalGrant>("approval_grants"),
+    approvalGrants: artifactMap<CommandApprovalGrant>("approval_grants", ["actorId"]),
     ...(processes ? { processes } : {}),
     monitors,
     crons,
     webhooks,
     resolveBaseModelId: () => orgBaseModelId() ?? fallback.modelId,
-    ...(config.scratchExecEnabled ? { scratchExec: true } : {}),
     directory,
     isCurrentSharedScopeMember,
     currentScopeMembers: createCurrentScopeMembers({ managedGroups: projects, directory, identity }, true),
     managedGroups: projects,
     projects,
-    ...(config.reachExecEnabled ? { reachExec: true } : {}),
     ...(config.surfaceDebugFooter ? { surfaceDebugFooter: true } : {}),
-    ...(config.eagerProvisionEnabled ? { eagerProvision: true } : {}),
+    ...(decisions ? { replyCheck: createReplyCheck(decisions, decide) } : {}),
     environments,
     brokeredTools,
     deploymentLayer,
@@ -2174,13 +2226,18 @@ export function buildApp(
   };
   const orchestrator = createOrchestrator(orchestratorDeps);
 
-  const uuidId = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   const recoveryAdminBase = config.publicWebUrl?.replace(/\/$/, "");
   const recoveryAdminUrlFor = recoveryAdminBase
     ? (sessionId: string): string | undefined =>
-        uuidId.test(sessionId) ? adminSessionUrl(recoveryAdminBase, sessionId) : undefined
+        uuidSchema.safeParse(sessionId).success ? adminSessionUrl(recoveryAdminBase, sessionId) : undefined
     : undefined;
-  const runResultRecovery = wireRunResultDeliveries(runs, deliveries, recoveryAdminUrlFor, sessions);
+  const runResultRecovery = wireRunResultDeliveries(
+    runs,
+    deliveries,
+    recoveryAdminUrlFor,
+    sessions,
+    partnerChatRunNotice,
+  );
   const idempotency = createIdempotencyStore(artifactMap<IdempotencyRecord>("idempotency"));
   const skillFetcher = createGitFetcher(
     keychain
@@ -2191,7 +2248,7 @@ export function buildApp(
               {
                 serviceCredential: async (slug) => {
                   const record = nonDeploymentCredential(
-                    await serviceCreds.getServiceCredentialSecret(scopeId("org", config.orgId), slug),
+                    await serviceCreds.getServiceCredentialSecret(scopeId("org", orgId()), slug),
                   );
                   return record && record.delivery !== "env" ? record : undefined;
                 },
@@ -2203,7 +2260,7 @@ export function buildApp(
         }
       : { allowLocalRepos: !config.production },
   );
-  const reaper: Reaper = createReaper(runs, sessions, {
+  const reaper: Reaper = createReaper(runs, {
     intervalMs: config.reaperIntervalMs,
     leaderLease,
     maxAgeMs: config.runMaxAgeMs,
@@ -2213,20 +2270,21 @@ export function buildApp(
   let reapInFlight = false;
   let lastReapAt = 0;
   const REAP_POKE_COOLDOWN_MS = 1_000;
-  const pokeReaper = (): void => {
-    if (reapInFlight || Date.now() - lastReapAt < REAP_POKE_COOLDOWN_MS) return;
-    reapInFlight = true;
-    void leaderLease
-      .hold(REAPER_LEASE_KEY, () => reaper.sweep())
-      .catch(swallowAs("wake: reaper poke", null))
-      .finally(() => {
-        reapInFlight = false;
-        lastReapAt = Date.now();
-      });
-  };
+  const pokeReaper = (): void =>
+    withoutTenant(() => {
+      if (reapInFlight || Date.now() - lastReapAt < REAP_POKE_COOLDOWN_MS) return;
+      reapInFlight = true;
+      void leaderLease
+        .hold(REAPER_LEASE_KEY, () => reaper.sweep())
+        .catch(swallowAs("wake: reaper poke", null))
+        .finally(() => {
+          reapInFlight = false;
+          lastReapAt = Date.now();
+        });
+    });
   const liveFallback = async (
     container: string,
-    opts?: { limit?: number },
+    opts?: { limit?: number; surface?: string },
   ): Promise<Array<{
     container: string;
     ts: string;
@@ -2236,7 +2294,7 @@ export function buildApp(
     createdAt: number;
   }> | null> => {
     const puller = orchestratorDeps.surfaceContext;
-    if (!puller) return null;
+    if (!puller || (opts?.surface ?? "slack") !== "slack") return null;
     const result = await puller.pull("slack", {
       conversationTarget: container,
       ...(opts?.limit !== undefined ? { count: opts.limit } : {}),
@@ -2251,52 +2309,41 @@ export function buildApp(
       createdAt: Date.now(),
     }));
   };
-  const surfaceCache: SurfaceCache = config.databaseUrl
-    ? createPostgresSurfaceCache(config.databaseUrl, { liveFallback })
-    : createMemorySurfaceCache({ liveFallback });
-  const channelPolicy: ChannelPolicyStore = config.databaseUrl
-    ? createPostgresChannelPolicyStore(config.databaseUrl)
-    : createMemoryChannelPolicyStore();
-  const ambientJudgments: AmbientJudgmentStore = config.databaseUrl
-    ? createPostgresAmbientJudgmentStore(config.databaseUrl)
-    : createMemoryAmbientJudgmentStore();
-  const ackEmojiPicks: AckEmojiPickStore = config.databaseUrl
-    ? createPostgresAckEmojiPickStore(config.databaseUrl)
-    : createMemoryAckEmojiPickStore();
+  const surfaceCache: SurfaceCache = createPostgresSurfaceCache(databaseUrl, { liveFallback });
+  const channelPolicy: ChannelPolicyStore = createPostgresChannelPolicyStore(databaseUrl);
+  const ambientJudgments: AmbientJudgmentStore = createPostgresAmbientJudgmentStore(databaseUrl);
+  const ackEmojiPicks: AckEmojiPickStore = createPostgresAckEmojiPickStore(databaseUrl);
   const providerKeys = directProviderAvailability;
-  const screenSecurity: SecurityScreenProbe | undefined = harness.models.screenSecurity
-    ? ({ payload, harnessId, modelId, systemPrompt, actorId, scopeLabel, signal }) =>
-        harness.models.screenSecurity!({
-          payload,
-          harnessId,
-          modelId,
-          systemPrompt,
-          signal,
-          recordModelCall: (rec) => {
-            modelGateway.recordCall({ at: Date.now(), scopeLabel, ...rec });
-            void budget?.record(actorId, estimateCostUsd(rec.inputTokens));
-          },
-        })
-    : undefined;
+  const subagentMail = {
+    sessions,
+    runs,
+    maxAttempts,
+    mailbox: sessionMailbox,
+    prepareRequest: prepareSessionRequest,
+    delegationEnabled,
+    deliveries,
+    signals: runSignals,
+    advisoryLock,
+  };
   const app = createApp({
+    settleTreeWakes: (root) => settleTreeWakes(subagentMail, root),
     teams,
     externalSlackPolicies: config.externalSlackPolicies,
     admittedWork,
-    shutdown: () => inlineShutdown.signal,
-    ...(pgArtifactMap ? { resourceSearch: createPostgresResourceSearch(pgArtifactMap.pool) } : {}),
+    shutdown: () => turnWaitShutdown.signal,
+    resourceSearch: createPostgresResourceSearch(pgArtifactMap.pool),
     swarms,
     identity,
     ...(config.publicWebUrl ? { publicWebUrl: config.publicWebUrl } : {}),
     sessions,
     orchestrator,
+    surfaces,
     runs,
-    leaseTtlMs,
     maxAttempts,
     turnStream,
     runStreamEvents,
     runActivity,
     signals: runSignals,
-    modelGateway,
     modelCredentials,
     userModelCredentials,
     modelRegistry,
@@ -2332,6 +2379,7 @@ export function buildApp(
     environments,
     deploy: deployService,
     deployAppsDomain: config.awsDeploy.appsDomain,
+    ...(renderArtifacts ? { deploymentGitPrincipals: renderArtifacts } : {}),
     deploymentLayer,
     ...(processes ? { processes } : {}),
     monitors,
@@ -2345,24 +2393,24 @@ export function buildApp(
     reaperPoke: pokeReaper,
     surfaceCache,
     channelPolicy,
-    ...(harness.models.judge
-      ? { ambientJudge: (s: string, pr: string, signal?: AbortSignal) => harness.models.judge!(s, pr, signal) }
+    ...(agent.judge
+      ? {
+          ambientJudge: (s: string, pr: string, signal?: AbortSignal) => agent.judge!(s, pr, signal, "ambient_judge"),
+        }
       : {}),
-    ...(screenSecurity ? { screenSecurity } : {}),
     ambientCursors: artifactMap<{ lastJudgedTs: string; lastJudgedAt?: number }>("ambient_cursors"),
     ambientJudgments,
     ackEmojiPicks,
     judgeModelId,
-    harnessId: config.harness,
     runtimeFallback: fallback,
     providerKeys,
-    modelProviders: modelProviderAvailabilityFor(config.harness, providerKeys),
+    modelProviders: providerKeys,
     runWaitMs: config.runWaitMs,
   });
   const inboxRealtime = createInboxRealtime({
     loops: loopStore,
     items: loopItems,
-    requestFire: (loopId) => void loopFire.fire(loopId, `loop:${loopId}:slack-event:${Date.now()}`).catch(() => {}),
+    enqueue: (loop, entries) => loopIngress.enqueueConversation(loop, entries),
   });
   const keychainApprovals = keychain
     ? createKeychainApprovals({
@@ -2393,13 +2441,12 @@ export function buildApp(
     blobTransfer,
     deliveries,
     errors,
-    metrics,
     runs,
     turnStream,
     ackPicks: ackEmojiPicks,
-    ackModelId: () => auxiliaryModelForProvider("anthropic"),
+    ackModelId: utilityModelId,
     ...(config.brandingDefault ? { brandingDefault: config.brandingDefault } : {}),
-    ...(harness.models.pickAckEmoji ? { pickAckEmoji: (t, c) => harness.models.pickAckEmoji!(t, c) } : {}),
+    ...(agent.pickAckEmoji ? { pickAckEmoji: (t, c) => agent.pickAckEmoji!(t, c) } : {}),
   });
   runs.onTerminal((run) => {
     void runs
@@ -2424,7 +2471,7 @@ export function buildApp(
       const settle = async (target: Session): Promise<boolean> => {
         if (await runs.activeForThread(target.threadRef)) return false;
         const waiting = (await blockingApprovalSessions([target.id])).has(target.id);
-        if (!waiting && (await sessionTreeWorking(sessions, runs, target))) return false;
+        if (!waiting && !target.parentSessionId && (await sessionTreeWorking(sessions, runs, target))) return false;
         const participants = await sessions.participantsOf(target.id);
         sessionStateBus.emit({
           threadRef: target.threadRef,
@@ -2436,45 +2483,53 @@ export function buildApp(
         return true;
       };
       if (!(await settle(session))) return;
-      for (const ancestor of await stoppableAncestors(sessions, session)) if (!(await settle(ancestor))) return;
+      const root = await stoppableRoot(sessions, session);
+      if (root) await settle(root);
     })().catch(swallowAs("session-state: terminal emit", undefined));
   });
   let lastSignalPrune = 0;
   const returnSessionRun = (run: Run) =>
-    advisoryLock
-      .withLock("session-tree-admission", async () => {
-        const settled = await deliverSubagentMail(
-          {
-            sessions,
-            runs,
-            maxAttempts,
-            mailbox: sessionMailbox,
-            prepareRequest: prepareSessionRequest,
-            delegationEnabled: (actorId) => featureFlags.enabled("responsive_spine", scopeId("personal", actorId)),
-            deliveries,
-            signals: runSignals,
-          },
-          run,
-        );
-        if (settled) await runs.markReturned(run.id);
-      })
-      .catch(async (error: unknown) => {
-        await runs.deferReturn(run.id, 60_000);
-        throw error;
-      });
+    advisoryLock.withLock("session-tree-admission", () => returnSubagentRun(subagentMail, run));
   runs.onTerminal((run) => {
     if (run.sessionId.startsWith("agent:main:subagent:"))
       void returnSessionRun(run).catch(swallowAs("sessions: return", undefined));
+    void wakeForUnreadMail(subagentMail, run).catch(swallowAs("sessions: unread mail wake", undefined));
   });
   const sweepSessionReturns = async () => {
     let afterId: string | undefined;
     for (;;) {
       const batch = await runs.pendingReturns(100, afterId);
-      if (!batch.length) return;
-      for (const run of batch) await returnSessionRun(run).catch(swallowAs("sessions: recover return", undefined));
+      if (!batch.length) return forEachTenant(pgArtifactMap.pool, () => sweepUnreadMailWakes(subagentMail));
+      for (const run of batch)
+        await inTenantOf(run.tenantId, () => returnSessionRun(run)).catch(
+          swallowAs("sessions: recover return", undefined),
+        );
       afterId = batch.at(-1)!.id;
     }
   };
+  const partnerChatNotices = config.partnerChat ? createPartnerChatNotices({ deliveries }) : null;
+  const partnerChatInbound =
+    partnerChatNotices && config.partnerChat
+      ? createPartnerChatInbound({
+          secret: config.partnerChat.secret,
+          app,
+          surfaceCache,
+          isInternalEmail: async (email) => email.includes("@") && (await vouchedInternalEmail(email)),
+          unansweredReply: partnerChatNotices.unanswered,
+        })
+      : null;
+  const partnerChatDelivery = config.partnerChat
+    ? createDeliveryRelay(deliveries, {
+        type: "partner-chat",
+        send: partnerChatSender({ url: config.partnerChat.url, secret: config.partnerChat.secret, app }),
+        claimMs: PARTNER_CHAT_CLAIM_MS,
+      })
+    : null;
+  const webhookDelivery = createDeliveryRelay(deliveries, {
+    type: "webhook",
+    send: webhookSender(config.signingSecret),
+    claimMs: WEBHOOK_CLAIM_MS,
+  });
   const approvalDeliverySweeper = createSweeper(
     () => advisoryLock.withLock("approval-deliveries", () => approvals.deliverPending()),
     30_000,
@@ -2484,27 +2539,23 @@ export function buildApp(
     },
   );
   const sessionReturnSweeper = createSweeper(
-    () =>
-      advisoryLock.tryWithLock
-        ? advisoryLock.tryWithLock("session-return-sweep", sweepSessionReturns)
-        : advisoryLock.withLock("session-return-sweep", sweepSessionReturns),
+    () => advisoryLock.tryWithLock("session-return-sweep", sweepSessionReturns),
     1_000,
     { label: "session-returns", immediate: true },
   );
   const runResultSweeper = createSweeper(
-    () =>
-      advisoryLock.tryWithLock
-        ? advisoryLock.tryWithLock("run-result-sweep", () => runResultRecovery.sweep())
-        : advisoryLock.withLock("run-result-sweep", () => runResultRecovery.sweep()),
+    () => advisoryLock.tryWithLock("run-result-sweep", () => runResultRecovery.sweep()),
     60_000,
     { label: "run-results" },
   );
   const orphanedSignalSweeper = createSweeper(
     async () => {
-      for (const runId of await runSignals.pendingRunIds()) {
-        const run = await runs.get(runId);
-        if (!run || isTerminal(run.status))
-          await app.replayOrphanedRunSignals(runId).catch(swallowAs("sessions: recover signal", undefined));
+      for (const { runId, tenantId } of await runSignals.pendingRuns()) {
+        await inTenantOf(tenantId, async () => {
+          const run = await runs.get(runId);
+          if (!run || isTerminal(run.status))
+            await app.replayOrphanedRunSignals(runId).catch(swallowAs("sessions: recover signal", undefined));
+        });
       }
       if (Date.now() - lastSignalPrune > 60 * 60_000) {
         lastSignalPrune = Date.now();
@@ -2546,7 +2597,15 @@ export function buildApp(
   );
   orchestratorDeps.channelPolicy = channelPolicy;
   orchestratorDeps.surfaceCache = surfaceCache;
-  orchestratorDeps.slackContextSource = config.slackContextSource ?? "live";
+  const resolveRecipient = (query: string) => app.resolveRecipient(query);
+  const runTriggered = async (req: TurnRequest): Promise<TurnResult> => {
+    const session = req.surfaceOrigin ? undefined : await sessions.getByThread(req.conversation.threadRef);
+    const bound = session?.surface === "slack" ? session.surfaceBinding : undefined;
+    if (!bound) return app.turn(req);
+    if (bound.audience === "internal") return app.turn({ ...req, surfaceOrigin: bound });
+    const { access: _access, ...internal } = bound;
+    return app.turn({ ...req, surfaceOrigin: { ...internal, audience: "internal" } });
+  };
   const askResolution = keychain
     ? (ask: KeychainAsk, grant?: KeychainGrant) =>
         fireAskResolution(
@@ -2554,10 +2613,11 @@ export function buildApp(
             deliveries,
             idempotency,
             identity,
-            run: (req) => app.turn(req),
+            run: runTriggered,
             directory,
             currentScopeMembers,
             sessions,
+            resolveRecipient,
             getCron: (id) => crons.get(id),
             getAsk: (id) => keychain.getAsk(id),
             getGrant: (id) => keychain.getGrant(id),
@@ -2568,7 +2628,7 @@ export function buildApp(
     : undefined;
   const dropResolution = keychain
     ? (drop: DropResolution) =>
-        fireDropResolution({ deliveries, idempotency, identity, run: (req) => app.turn(req), directory }, drop)
+        fireDropResolution({ deliveries, idempotency, identity, run: runTriggered, directory, resolveRecipient }, drop)
     : undefined;
   const loopFire: LoopFireService = createLoopFireService({
     admittedWork,
@@ -2580,14 +2640,16 @@ export function buildApp(
     items: loopItems,
     outputs: loopOutputs,
     grants: loopGrants,
+    files,
     trigger: {
       deliveries,
       idempotency,
       identity,
-      run: (req) => app.turn(req),
+      run: runTriggered,
       directory,
       currentScopeMembers,
       sessions,
+      resolveRecipient,
     },
   });
   const loopIngress = createLoopIngress({
@@ -2627,22 +2689,21 @@ export function buildApp(
   const scheduler = createScheduler({
     admittedWork,
     skipFire: async (cron) => (await memoryTidy.skipFire(cron)) ?? suggestedActivities.skipFire(cron),
+    runtimeError: (scope, runtime) => availableRuntimeError({ deps: runtimeDeps }, scope, runtime, "cron"),
     deleteCron: (id) => app.deleteCron(id),
-    requireQueueStart: Boolean(config.backgroundDeploymentId),
-    lock: advisoryLock,
+    advisoryLock,
     crons,
     deliveries,
     idempotency,
     identity,
-    run: (req) => app.turn(req),
+    run: runTriggered,
     leaderLease,
     directory,
     currentScopeMembers,
     sessions,
+    resolveRecipient,
     fireLoop: (loopId, fireKey, cronId) => loopFire.fire(loopId, fireKey, cronId),
-    ...(config.databaseUrl
-      ? { jobQueue: createPgBossCronQueue(config.databaseUrl, undefined, config.cronFireConcurrency) }
-      : {}),
+    jobQueue: createPgBossCronQueue(databaseUrl, undefined, config.cronFireConcurrency),
     sweepAsks: async (now) => {
       if (!ingressMaintenance)
         ingressMaintenance = admittedWork
@@ -2665,36 +2726,8 @@ export function buildApp(
   cronChanged.notify = (id) => scheduler.notifyChanged(id);
   orchestratorDeps.control = createControlService(app, scheduler, admin);
   orchestratorDeps.validateScheduledRuntime = (scope, choice, purpose) =>
-    availableRuntimeError(
-      {
-        deps: {
-          config: configStore,
-          harnessId: fallbackHarness,
-          baseModelDefault: fallback.modelId,
-          providerKeys: providerKeysPresent(config),
-          modelCredentials,
-          modelCredentialFetch: overrides.modelCredentialFetch,
-          refreshModels,
-        },
-      },
-      scope,
-      choice,
-      purpose,
-    );
-  orchestratorDeps.runtime = createRuntimeService(
-    {
-      config: configStore,
-      harnessId: fallbackHarness,
-      get baseModelDefault() {
-        return fallback.modelId;
-      },
-      providerKeys: providerKeysPresent(config),
-      modelCredentials,
-      modelCredentialFetch: overrides.modelCredentialFetch,
-      refreshModels,
-    },
-    app,
-  );
+    availableRuntimeError({ deps: runtimeDeps }, scope, choice, purpose);
+  orchestratorDeps.runtime = createRuntimeService(runtimeDeps, app);
   const finishCredentials = (handle: SandboxHandle, processId: string) =>
     finishProcessCredentials({ sandbox, processes: processes!, ...(keychain ? { keychain } : {}) }, handle, processId);
   const monitorPoller: MonitorPoller | null =
@@ -2707,10 +2740,11 @@ export function buildApp(
           deliveries,
           idempotency,
           identity,
-          run: (req) => app.turn(req),
+          run: runTriggered,
           directory,
           currentScopeMembers,
           sessions,
+          resolveRecipient,
           leaderLease,
           onProcessExit: finishCredentials,
           heartbeatMs: config.monitorHeartbeatMs,
@@ -2727,57 +2761,86 @@ export function buildApp(
     deliveries,
     idempotency,
     identity,
-    run: (req) => app.turn(req),
+    run: runTriggered,
     directory,
     currentScopeMembers,
+    resolveRecipient,
   });
-  const backgroundOwnership: BackgroundOwnershipControl | undefined = config.backgroundDeploymentId
-    ? {
-        store: createBackgroundOwnershipStore(artifactMap<BackgroundOwnership>("background_ownership")),
-        instanceId: randomUUID(),
-        deploymentId: config.backgroundDeploymentId,
-        active: () => backgroundActive(),
-      }
-    : undefined;
+  const deploymentKey = config.backgroundDeploymentId ?? config.buildSha;
   const instanceRegistry: InstanceRegistry =
-    pgArtifactMap && !backgroundOwnership && config.buildSha && config.backgroundWorkEnabled
+    pgArtifactMap && deploymentKey && config.backgroundWorkEnabled
       ? createPostgresInstanceRegistry(pgArtifactMap.pool, {
           instanceId: randomUUID(),
-          buildSha: config.buildSha,
+          deploymentKey,
           startedAt: Date.now(),
         })
       : createNoopInstanceRegistry();
   const drain: DrainController = createDrainController({ registry: instanceRegistry });
-  const canClaimRuns = () => backgroundAdmission() && drain.canClaim();
-  const workers: Worker[] = Array.from({ length: Math.max(1, config.workers) }, () =>
-    createWorker({
-      admittedWork,
-      runs,
-      orchestrator,
-      leaseTtlMs,
-      heartbeatIntervalMs: config.heartbeatIntervalMs,
-      errors,
-      pollMs: 250,
-      canClaim: canClaimRuns,
-    }),
-  );
-  const preemption = createRunPreemption({ runs, workers, canClaim: canClaimRuns });
+  const canClaimRuns = () => drain.canClaim() && (overrides.canClaimRuns?.() ?? true);
+  const worker = createWorker({
+    admittedWork,
+    runs,
+    orchestrator,
+    leaseTtlMs,
+    heartbeatIntervalMs: config.heartbeatIntervalMs,
+    errors,
+    slots: config.workers,
+    pollMs: 250,
+    canClaim: canClaimRuns,
+  });
+  const preemption = createRunPreemption({ runs, worker, canClaim: canClaimRuns });
   const preemptionSweeper = createSweeper(() => preemption.sweep(), 1_000, { label: "run-preemption" });
   const processReaper: ProcessReaper | null = processes
     ? createProcessReaper(processes, {
         intervalMs: config.processReaperIntervalMs,
         ...(supportsProcessSessions(sandbox)
-          ? { kill: createReaperKillHook(sandbox, { onExit: finishCredentials }) }
+          ? {
+              kill: createReaperKillHook(sandbox, { onExit: finishCredentials }),
+              afterSweep: createJobComputerSweep({
+                resources: sandboxResources,
+                sandbox,
+                processes: processes!,
+                finish: finishCredentials,
+                onError: (error, scopeId) =>
+                  errors.record(
+                    {
+                      category: "process_session",
+                      code: "job_computer_retire_failed",
+                      message: errMessage(error),
+                      scopeLabel: scopeId,
+                    },
+                    error,
+                  ),
+              }),
+            }
           : {}),
         leaderLease,
       })
     : null;
   const MONITOR_RETENTION_SWEEP_MS = 24 * 60 * 60_000;
+  const LLM_CAPTURE_SWEEP_MS = 5 * 60_000;
+  const LLM_CAPTURE_SWEEP_BUDGET_MS = 30_000;
   const spendSweeper = sessions.refreshSpendRollup
     ? createSweeper(() => leaderLease.hold("spend:refresh", () => sessions.refreshSpendRollup!()), 60_000, {
         label: "spend-refresh",
         immediate: true,
       })
+    : null;
+  const llmCaptureSweeper = sessions.purgeLlmCaptures
+    ? createSweeper(
+        () =>
+          leaderLease.hold("llm-capture:retention", async (lost) => {
+            let leaseLost = false;
+            void lost.then(() => (leaseLost = true));
+            const purged = await sessions.purgeLlmCaptures!(Date.now() - LLM_CAPTURE_RETENTION_MS, {
+              deadline: Date.now() + LLM_CAPTURE_SWEEP_BUDGET_MS,
+              stop: () => leaseLost,
+            });
+            if (purged) console.log(`[llm-capture] purged ${purged} prompt envelope(s) past retention`);
+          }),
+        LLM_CAPTURE_SWEEP_MS,
+        { label: "llm-capture-retention" },
+      )
     : null;
   const monitorRetentionSweeper = createSweeper(
     () => leaderLease.hold("monitor:retention:sweep", () => monitors.deleteDefunct(Date.now())),
@@ -2789,8 +2852,8 @@ export function buildApp(
   const composioReturns = artifactMap<ComposioReturn>("composio_returns");
   const composioReturnSweeper = createSweeper(
     async () => {
-      for (const [id, entry] of await composioReturns.entries())
-        if (entry.expiresAt <= Date.now()) await composioReturns.delete(id);
+      for (const { tenantId, id, value } of await composioReturns.acrossTenants())
+        if (value.expiresAt <= Date.now()) await withTenant(tenantId, () => composioReturns.delete(id));
     },
     30 * 60_000,
     { label: "Composio consent returns", immediate: true },
@@ -2811,8 +2874,7 @@ export function buildApp(
   const deepIdleMachineMs = config.deepIdleMachineMs;
   const devIdleMachineMs = config.devIdleMachineMs;
   const SANDBOX_MAINTENANCE_INTERVAL_MS = 5 * 60_000;
-  const deepIdleReapEnabled = Boolean(sandbox.reapDeepIdle && (deepIdleMachineMs > 0 || devIdleMachineMs > 0));
-  const deepIdleSweeper = deepIdleReapEnabled
+  const deepIdleSweeper = sandbox.reapDeepIdle
     ? createSweeper(
         () =>
           leaderLease.hold("sandbox:deep-idle-reaper", () =>
@@ -2831,17 +2893,8 @@ export function buildApp(
     if (backgroundRunning) return;
     backgroundRunning = true;
     admittedWork.resume();
-    drain.start();
     const generation = ++backgroundGeneration;
-    for (const worker of workers) {
-      const drained = worker.drained();
-      worker.start();
-      void drained
-        .then(() => {
-          if (backgroundRunning && generation === backgroundGeneration) worker.start();
-        })
-        .catch(swallowAs("wiring: worker resume failed", undefined));
-    }
+    worker.start();
     preemptionSweeper.start();
     const startPeriodic = () => {
       if (!backgroundRunning || generation !== backgroundGeneration) return;
@@ -2855,6 +2908,7 @@ export function buildApp(
         .catch(swallowAs("wiring: monitor resume failed", undefined));
       monitorRetentionSweeper.start();
       spendSweeper?.start();
+      llmCaptureSweeper?.start();
       semanticMemory.start();
       if (config.skillSyncPollMs > 0) skillSyncEngine.start(config.skillSyncPollMs);
       blobSweeper.start();
@@ -2869,6 +2923,8 @@ export function buildApp(
       sessionReturnSweeper.start();
       runResultSweeper.start();
       approvalDeliverySweeper.start();
+      partnerChatDelivery?.start();
+      webhookDelivery.start();
     };
     if (backgroundStopping)
       void backgroundClaimsStopping.then(startPeriodic).catch(swallowAs("wiring: periodic resume failed", undefined));
@@ -2882,10 +2938,12 @@ export function buildApp(
     const monitorStopping = monitorPoller?.stop();
     monitorDrained = monitorStopping ?? Promise.resolve();
     const stopping = [
+      webhookDelivery.stop(),
       reaper.stop(),
       processReaper?.stop(),
       monitorRetentionSweeper.stop(),
       spendSweeper?.stop(),
+      llmCaptureSweeper?.stop(),
       semanticMemory.stop(),
       skillSyncEngine.stop(),
       idleSweeper?.stop(),
@@ -2900,8 +2958,9 @@ export function buildApp(
       sessionReturnSweeper.stop(),
       runResultSweeper.stop(),
       approvalDeliverySweeper.stop(),
+      partnerChatDelivery?.stop(),
       preemptionSweeper.stop(),
-      ...workers.map((worker) => worker.stopClaims()),
+      worker.stopClaims(),
     ];
     backgroundClaimsStopping = Promise.all(stopping).then(() => {});
     const draining = Promise.all([previous, backgroundClaimsStopping, monitorStopping])
@@ -2912,47 +2971,43 @@ export function buildApp(
     backgroundStopping = draining;
     return draining;
   }
-  async function releaseInFlightRuns(): Promise<void> {
-    inlineShutdown.abort();
-    await Promise.all([
-      withTimeout(() => admittedWork.drained(), 3_000, "inline turn handback").catch(
-        swallowAs("wiring: inline turn handback failed", undefined),
+  let releasing: Promise<void> | null = null;
+  function releaseInFlightRuns(): Promise<void> {
+    turnWaitShutdown.abort();
+    releasing ??= Promise.all([
+      withTimeout(() => admittedWork.drained(), SHUTDOWN_RELEASE_MS, "synchronous turn wait release").catch(
+        swallowAs("wiring: synchronous turn wait release failed", undefined),
       ),
-      ...workers.map((w) => w.releaseInFlight()),
-    ]);
+      worker.releaseInFlight(),
+    ]).then(() => {});
+    return releasing;
   }
   const runtime: Runtime = {
-    start() {
-      if (inlineShutdown.signal.aborted) inlineShutdown = new AbortController();
+    start(services = { resume() {}, standDown: async () => {} }) {
+      if (turnWaitShutdown.signal.aborted) turnWaitShutdown = new AbortController();
+      releasing = null;
       flyTunnel?.monitor();
-      drain.start();
-      if (config.backgroundWorkEnabled && !config.backgroundDeploymentId) startBackground();
-    },
-    startBackground,
-    setBackgroundAdmission(canClaim, active) {
-      backgroundAdmission = canClaim;
-      backgroundActive = active;
-    },
-    async stopBackgroundClaims() {
-      void stopBackground().catch(swallowAs("wiring: background drain failed", undefined));
-      await Promise.all([backgroundClaimsStopping, ...workers.map((worker) => worker.stopClaims())]);
-    },
-    stopBackground,
-    async backgroundDrained() {
-      await backgroundStopping;
-      await Promise.all([admittedWork.drained(), ...workers.map((worker) => worker.drained())]);
+      renderBasePreparing = new AbortController();
+      void renderBase
+        ?.prepare(renderBasePreparing.signal)
+        .catch(reportFailureAs("render-base: prepare the golden snapshot", undefined));
+      if (!config.backgroundWorkEnabled) return;
+      startBackground();
+      drain.start(services);
     },
     releaseInFlightRuns,
     async stop() {
+      renderBasePreparing?.abort();
+      const draining = drain.stop();
       await stopBackground();
       await Promise.all([
         withTimeout(() => admittedWork.drained(), config.shutdownDrainMs, "admitted work drain").catch(
           swallowAs("wiring: admitted work drain failed", undefined),
         ),
-        ...workers.map((w) => w.stop(config.shutdownDrainMs)),
+        worker.stop(config.shutdownDrainMs),
       ]).catch(swallowAs("wiring: worker drain failed", undefined));
       await releaseInFlightRuns();
-      await drain.stop();
+      await draining;
       stopStreamSync();
       await Promise.all(
         [
@@ -2964,7 +3019,7 @@ export function buildApp(
           runStreamEvents.close?.(),
         ].map((closing) => closing?.catch(reportFailureAs("shutdown: close event stores", undefined))),
       );
-      await harness.turns.close?.();
+      await agent.close?.();
       await semanticMemory.close();
       await flyTunnel?.stop();
       await errors.flush();
@@ -2974,18 +3029,45 @@ export function buildApp(
   return {
     app,
     checkReadiness: async (signal) => {
-      await pgArtifactMap?.pool.q("SELECT 1", [], { signal });
+      await pgArtifactMap.pool.q("SELECT 1", [], { signal });
     },
-    ...(screenSecurity ? { screenSecurity } : {}),
     deploymentLayer,
     deploymentLayerStore,
     brokeredTools,
     deploymentLayerReady,
     deploymentLayerRefresh,
+    loadTenants: async () => {
+      const install = await installTenant;
+      const rows = await ownerPgPool(pgArtifactMap.pool).q("SELECT id::text AS id FROM tenants ORDER BY id");
+      const tenants = rows.map((row) => String(row.id));
+      registerTenants(install, tenants.length === 1 ? tenants[0] : undefined);
+      for (const tenant of tenants) {
+        const loading = withTenant(tenant, () => tenantLoader.load());
+        if (tenant === install || tenants.length === 1) await loading;
+        else await loading.catch(reportFailureAs("startup: load tenant caches", undefined));
+      }
+    },
+    forEachTenant: (fn) => forEachTenant(pgArtifactMap.pool, fn),
+    listTenants: () => listTenants(pgArtifactMap.pool),
+    ownSharedState: async () => {
+      ownsSharedState = true;
+      await hydrateDeploymentLayer().catch((error: unknown) => {
+        ownsSharedState = false;
+        throw error;
+      });
+      if (config.seedSkills)
+        skillsReady = Promise.all([
+          skillsReady,
+          withoutTenant(() => forEachTenant(pgArtifactMap.pool, installCatalogs)).catch((e) =>
+            console.error("[seed] failed to install seed skills:", errMessage(e)),
+          ),
+        ]).then(() => undefined);
+    },
     sessions,
     runs,
     signals: runSignals,
     sessionStateBus,
+    sessionSyscalls,
     ledgerEventBus,
     surfaceCache,
     runtime,
@@ -2995,10 +3077,11 @@ export function buildApp(
     resolveClient,
     consentLinks,
     oauthFlows,
+    tenancy,
     secretDrops,
-    browserModelGateway: gatewayTransport,
+    modelGatewayTransport: gatewayTransport,
+    budget,
     resolveBrowserCompanyKeys,
-    modelGateway,
     modelCredentials,
     userModelCredentials,
     modelRegistry,
@@ -3016,11 +3099,10 @@ export function buildApp(
     scheduler,
     loops,
     webhookReceiver,
+    ...(partnerChatInbound ? { partnerChatEvents: partnerChatInbound.handle } : {}),
     loopIngress,
     admin,
-    rateLimiter,
     errors,
-    metrics,
     crons,
     credentialUsage,
     egressAudit,
@@ -3028,7 +3110,6 @@ export function buildApp(
     principalLinks,
     slackAccounts: artifactMap<SlackAccountLink>("slack_accounts"),
     composioReturns,
-    workspace,
     memory,
     ...(keychain ? { keychain } : {}),
     serviceCreds,
@@ -3045,7 +3126,7 @@ export function buildApp(
     featureFlags,
     teams,
     ...(decisions ? { decisions } : {}),
-    ...(replayDedupe ? { replayDedupe } : {}),
+    replayDedupe,
     ...(brokerSessions ? { brokerSessions } : {}),
     directory,
     projects,
@@ -3058,15 +3139,14 @@ export function buildApp(
     ...(ambientJudgments ? { ambientJudgments } : {}),
     ...(ackEmojiPicks ? { ackEmojiPicks } : {}),
     channelPolicy,
-    ...(config.suggestedActivitiesEnabled && (config.backgroundWorkEnabled || config.backgroundDeploymentId)
-      ? { suggestedActivities }
-      : {}),
-    ...(backgroundOwnership ? { backgroundOwnership } : {}),
+    ...(config.suggestedActivitiesEnabled && config.backgroundWorkEnabled ? { suggestedActivities } : {}),
+    drain,
     uiState,
     sessionShares: artifactMap<SessionShare>("session_shares"),
     sessionShareBytes:
       config.snapshotStore === "s3" && config.s3Bucket
         ? createS3DurableByteStore({
+            ...s3Override,
             bucket: config.s3Bucket,
             ...(config.s3Region ? { region: config.s3Region } : {}),
             prefix: `${config.s3Prefix ?? ""}session-shares/`,
@@ -3083,34 +3163,36 @@ export function serverDeps(
   slackEnvironmentState: "absent" | "configured" | "partial" = "absent",
   slackEnvBotToken?: string,
 ): Omit<ServerDeps, "control"> {
-  const configuredModel = configuredModelForHarness(config, config.harness);
-  const carriedModelAuth = harnessCarriedModelAuth(config);
+  const deploymentModel = configuredModel(config);
+  const subscriptionAuth = companySubscriptionAuth(config);
   return {
     externalSlackPolicies: config.externalSlackPolicies,
-    browserModelGateway: built.browserModelGateway,
+    modelGatewayTransport: built.modelGatewayTransport,
     resolveBrowserCompanyKeys: built.resolveBrowserCompanyKeys,
     production: config.production,
     checkReadiness: built.checkReadiness,
-    ...(built.backgroundOwnership
+    ...(config.backgroundDeploymentId && config.backgroundWorkEnabled
       ? {
-          backgroundOwnership: built.backgroundOwnership,
           deploymentControlSecret: config.deploymentControlSecret,
-          deploymentLiveSmoke: () => runSessionSmoke(config, `http://127.0.0.1:${config.port}`),
+          deploymentLiveSmoke: {
+            deploymentId: config.backgroundDeploymentId,
+            superseded: () => !built.drain.canClaim(),
+            run: () => runSessionSmoke(config, `http://127.0.0.1:${config.port}`),
+          },
         }
       : {}),
     allowUnauthenticatedCore: config.allowUnauthenticatedCore,
-    ...(config.spendExportToken ? { spendExportToken: config.spendExportToken } : {}),
     ...(config.signingSecret ? { signingSecret: config.signingSecret } : {}),
+    ...(config.operatorSigningSecret ? { operatorSigningSecret: config.operatorSigningSecret } : {}),
     ...(config.capabilitySecret ? { capabilitySecret: config.capabilitySecret } : {}),
     capabilityTokenCompression: config.capabilityTokenCompression,
     ...(config.portalIdentitySecret ? { portalIdentitySecret: config.portalIdentitySecret } : {}),
     ...(config.requireSignedPortalIdentity ? { requireSignedPortalIdentity: true } : {}),
-    ...(built.replayDedupe ? { replayDedupe: built.replayDedupe } : {}),
+    replayDedupe: built.replayDedupe,
     ...(built.brokerSessions ? { brokerSessions: built.brokerSessions } : {}),
     config: built.config,
-    ...(built.screenSecurity ? { screenSecurity: built.screenSecurity } : {}),
-    ...(configuredModel ? { baseModelDefault: configuredModel } : {}),
-    modelProviders: modelProviderAvailabilityFor(config.harness, providerKeysPresent(config)),
+    ...(deploymentModel ? { baseModelDefault: deploymentModel } : {}),
+    modelProviders: providerKeysPresent(config),
     providerKeys: providerKeysPresent(config),
     modelCredentials: built.modelCredentials,
     userModelCredentials: built.userModelCredentials,
@@ -3122,8 +3204,7 @@ export function serverDeps(
     mcpServers: built.mcpServers,
     mcpToolService: built.mcpToolService,
     ...(config.brandingDefault ? { brandingDefault: config.brandingDefault } : {}),
-    ...(carriedModelAuth ? { harnessCarriedModelAuth: carriedModelAuth } : {}),
-    harnessId: config.harness,
+    ...(subscriptionAuth ? { companySubscriptionAuth: subscriptionAuth } : {}),
     connectorTokens: built.connectorTokens,
     slackInstallation: built.slackInstallation,
     slackEnvironmentState,
@@ -3132,6 +3213,7 @@ export function serverDeps(
     resolveClient: built.resolveClient,
     consentLinks: built.consentLinks,
     oauthFlows: built.oauthFlows,
+    tenancy: built.tenancy,
     secretDrops: built.secretDrops,
     ...(built.fireDropResolution ? { fireDropResolution: built.fireDropResolution } : {}),
     ...(config.apiBaseUrl ? { apiBaseUrl: config.apiBaseUrl } : {}),
@@ -3142,9 +3224,9 @@ export function serverDeps(
     ...(config.emailAuthDomain ? { emailAuthDomain: config.emailAuthDomain } : {}),
     ...(config.slack ? { slackAllowFrom: config.slack.allowFrom ?? [] } : {}),
     ...(config.resendApiKey && config.emailFrom
-      ? { inviteMailer: createResendMailer(config.resendApiKey, config.emailFrom) }
+      ? { inviteMailer: tenantMailer(config.resendApiKey, config.emailFrom) }
       : {}),
-    rateLimiter: built.rateLimiter,
+    budget: built.budget,
     acl: built.acl,
     credentialUsage: built.credentialUsage,
     featureFlags: built.featureFlags,
@@ -3154,7 +3236,6 @@ export function serverDeps(
     sessions: built.sessions,
     auditLog: built.auditLog,
     errors: built.errors,
-    metrics: built.metrics,
     crons: built.crons,
     loops: built.loops,
     deploymentLayer: built.deploymentLayerStore,
@@ -3167,6 +3248,7 @@ export function serverDeps(
     ...(built.appPageViews ? { appPageViews: built.appPageViews } : {}),
     scheduler: built.scheduler,
     webhookReceiver: built.webhookReceiver,
+    ...(built.partnerChatEvents ? { partnerChatEvents: built.partnerChatEvents } : {}),
     loopIngress: built.loopIngress,
     identity: built.identity,
     principalLinks: built.principalLinks,
@@ -3180,10 +3262,8 @@ export function serverDeps(
     runs: built.runs,
     signals: built.signals,
     sessionStateBus: built.sessionStateBus,
-    workspace: built.workspace,
     files: built.files,
     ...(built.fileUploads ? { fileUploads: built.fileUploads } : {}),
-    filesDirectUploadsEnabled: config.filesDirectUploadsEnabled,
     memory: built.memory,
     blobTransfer: built.blobTransfer,
     sandboxBackend: built.sandbox.profile.backend,
@@ -3210,6 +3290,7 @@ export function serverDeps(
             featureFlags: built.featureFlags,
             items: built.loops.items,
             errors: built.errors,
+            enqueue: (loop, entries) => built.loopIngress.enqueueConversation(loop, entries),
             tokens: built.keychain,
             directory: built.directory,
             ...(config.slack?.apiUrl ? { slackApiUrl: config.slack.apiUrl } : {}),

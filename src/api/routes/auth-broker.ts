@@ -1,3 +1,5 @@
+import { boundTenant } from "../../tenants/context.ts";
+import { tenantAllowedEmails, tenantSettings, tenantEnv } from "../../tenants/settings.ts";
 import { externalAppSharingAllowed } from "../../feature-flags.ts";
 import { createHash } from "node:crypto";
 import { verifySignedPayload } from "../../auth/signed-token.ts";
@@ -15,7 +17,7 @@ const MAX_HORIZON_MS = 24 * 60 * 60 * 1000;
 
 async function claimBrokerNonce(ctx: ApiCtx): Promise<void> {
   const { res, deps, body } = ctx;
-  if (!deps.replayDedupe?.durable) {
+  if (!deps.replayDedupe) {
     return sendJson(res, 503, {
       error: "not_configured",
       message:
@@ -61,23 +63,21 @@ async function emailAllowed(ctx: ApiCtx): Promise<void> {
   await deps.identity.refresh();
   if (deps.identity.deactivationSource(email) === "manual") return sendJson(res, 200, { allowed: false });
   const member = deps.identity.externalMember(email);
-  const configured =
-    deps.emailAuthPrincipals?.includes(email) ||
-    Boolean(deps.emailAuthDomain && email.endsWith(`@${deps.emailAuthDomain}`));
+  const tenantList = tenantAllowedEmails();
+  const configured = tenantList
+    ? tenantList.includes(email)
+    : deps.emailAuthPrincipals?.includes(email) ||
+      Boolean(deps.emailAuthDomain && email.endsWith(`@${deps.emailAuthDomain}`));
   const allowed =
     deps.identity.classify(email).type === "internal" && (member ? externalMemberActive(member) : configured);
   if (allowed) return sendJson(res, 200, { allowed: true, expiresAt: member?.expiresAt });
-  const grants = (await deps.acl?.list()) ?? [];
+  const grants = (await deps.acl?.find({ granteeScopeIds: [`personal:${email}`], kind: "deploy" })) ?? [];
   const deployments = await app.listDeployments();
   const granted = deployments.filter(
     (d) =>
       d.status !== "archived" &&
       grants.some(
-        (g) =>
-          g.ownerScopeId === d.ownerScopeId &&
-          g.ref === encodeRef(deployRef(d.id)) &&
-          g.granteeScopeId === `personal:${email}` &&
-          g.permission === "read",
+        (g) => g.ownerScopeId === d.ownerScopeId && g.ref === encodeRef(deployRef(d.id)) && g.permission === "read",
       ),
   );
   const allowedOwners = await Promise.all(
@@ -85,6 +85,23 @@ async function emailAllowed(ctx: ApiCtx): Promise<void> {
   );
   const appOnly = allowedOwners.some(Boolean);
   return sendJson(res, 200, appOnly ? { allowed: true, appOnly: true } : { allowed: false });
+}
+
+async function signInSettings(ctx: ApiCtx): Promise<void> {
+  const settings = await tenantSettings();
+  const allowedEmails = tenantAllowedEmails();
+  const clientSecret = tenantEnv("AUTH_CLIENT_SECRET");
+  const trustedOidc = tenantEnv("PORTAL_TRUSTED_OIDC");
+  const trustedClientSecret = tenantEnv("PORTAL_TRUSTED_OIDC_CLIENT_SECRET");
+  const publicUrl = tenantEnv("AWS_PUBLIC_ORIGIN_URL") ?? tenantEnv("PUBLIC_API_URL");
+  return sendJson(ctx.res, 200, {
+    ...(allowedEmails ? { allowedEmails } : {}),
+    ...(settings.oidcClient ? { oidcClient: settings.oidcClient } : {}),
+    ...(clientSecret ? { clientSecret } : {}),
+    ...(trustedOidc ? { trustedOidc } : {}),
+    ...(trustedClientSecret ? { trustedClientSecret } : {}),
+    ...(publicUrl ? { publicUrl } : {}),
+  });
 }
 
 async function brokerSession(ctx: ApiCtx): Promise<void> {
@@ -128,7 +145,7 @@ async function brokerSession(ctx: ApiCtx): Promise<void> {
 async function trustedAdmin(ctx: ApiCtx): Promise<void> {
   const { deps, res, body } = ctx;
   const secret = deps.portalIdentitySecret;
-  if (!secret || secret.length < 32 || secret === ctx.secret || !deps.admin || !deps.replayDedupe?.durable)
+  if (!secret || secret.length < 32 || secret === ctx.secret || !deps.admin || !deps.replayDedupe)
     return sendJson(res, 503, { error: "not_configured" });
   const assertion = isObj(body) && typeof body.assertion === "string" ? body.assertion : "";
   const claims = await verifySignedPayload(assertion, secret);
@@ -137,6 +154,7 @@ async function trustedAdmin(ctx: ApiCtx): Promise<void> {
     !isObj(claims) ||
     claims.purpose !== "trusted-entry-admin" ||
     claims.org !== orgScope() ||
+    claims.tenant !== boundTenant() ||
     typeof claims.issuer !== "string" ||
     typeof claims.subject !== "string" ||
     !claims.subject ||
@@ -173,7 +191,7 @@ async function trustedAdmin(ctx: ApiCtx): Promise<void> {
 
 async function redeemInvitation(ctx: ApiCtx): Promise<void> {
   const { deps, res, body } = ctx;
-  if (!deps.portalIdentitySecret || !deps.replayDedupe?.durable || !deps.identity || !deps.portalUrl)
+  if (!deps.portalIdentitySecret || !deps.replayDedupe || !deps.identity || !deps.portalUrl)
     return sendJson(res, 503, { error: "not_configured" });
   const token = isObj(body) && typeof body.token === "string" ? body.token : "";
   const claims = token.length <= 4096 ? await verifySignedPayload(token, deps.portalIdentitySecret) : null;
@@ -219,11 +237,12 @@ async function redeemInvitation(ctx: ApiCtx): Promise<void> {
 }
 
 export const authBrokerRoutes: ReadonlyArray<Route<ApiCtx>> = [
-  { method: "POST", path: "/v1/auth/invitations/redeem", auth: "source", handle: redeemInvitation },
-  { method: "POST", path: "/v1/auth/trusted/admin", auth: "source", handle: trustedAdmin },
-  { method: "POST", path: "/v1/auth/broker/sessions", auth: "source", handle: brokerSession },
-  { method: "POST", path: "/v1/auth/broker/sessions/use", auth: "source", handle: brokerSession },
-  { method: "POST", path: "/v1/auth/broker/sessions/revoke", auth: "source", handle: brokerSession },
-  { method: "POST", path: "/v1/auth/broker/claim", auth: "source", handle: claimBrokerNonce },
+  { method: "POST", path: "/v1/auth/invitations/redeem", actor: "system", auth: "source", handle: redeemInvitation },
+  { method: "POST", path: "/v1/auth/trusted/admin", actor: "system", auth: "source", handle: trustedAdmin },
+  { method: "POST", path: "/v1/auth/broker/sessions", actor: "system", auth: "source", handle: brokerSession },
+  { method: "POST", path: "/v1/auth/broker/sessions/use", actor: "system", auth: "source", handle: brokerSession },
+  { method: "POST", path: "/v1/auth/broker/sessions/revoke", actor: "person", auth: "source", handle: brokerSession },
+  { method: "POST", path: "/v1/auth/broker/claim", actor: "system", auth: "source", handle: claimBrokerNonce },
   { method: "GET", path: "/v1/auth/broker/email-allowed", auth: "source", handle: emailAllowed },
+  { method: "GET", path: "/v1/auth/broker/sign-in-settings", actor: "system", auth: "source", handle: signInSettings },
 ];

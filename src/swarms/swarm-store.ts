@@ -1,9 +1,12 @@
+import type { Claimed } from "../tenants/claim.ts";
+import type { GoalCreateInput } from "../agent/goal.ts";
 import { NonRetryableTurnError } from "../core/turn-error.ts";
 import { withPgTransaction, type PgPool } from "../persistence/pg-pool.ts";
 import type { RunStore, Run } from "../runs/run-store.ts";
 import type { SessionStore } from "../sessions/session-store.ts";
 import { assertSwarmRun, type SwarmRunFence } from "./swarm-fence.ts";
-import { jsonbStringify, type DurableMap } from "../persistence/durable-map.ts";
+import type { DurableMap } from "../persistence/durable-map.ts";
+import { jsonbStringify } from "../util/text.ts";
 
 import type { SwarmSettings } from "./swarm-settings.ts";
 import type { SandboxBackendName } from "../sandbox/sandbox-routing.ts";
@@ -44,8 +47,9 @@ export interface SwarmMessage {
   text: string;
   audience: string[];
   replyTo?: string;
+  goal?: GoalCreateInput;
   createdAt: number;
-  notifications: Record<string, { state: "pending" | "queued" | "failed"; runId?: string }>;
+  notifications: Record<string, { state: "pending" | "mailbox" | "queued" | "handed" | "failed"; runId?: string }>;
 }
 
 export interface Swarm {
@@ -67,6 +71,32 @@ export interface Swarm {
   pending: boolean;
 }
 
+export type SwarmControlState = "active" | "paused" | "stopped";
+
+const memberIndex = new WeakMap<SwarmMember[], Map<string, SwarmMember>>();
+
+export function memberById(swarm: Swarm, id: string): SwarmMember | undefined {
+  let index = memberIndex.get(swarm.members);
+  if (!index || index.size !== swarm.members.length) {
+    index = new Map(swarm.members.map((member) => [member.id, member]));
+    memberIndex.set(swarm.members, index);
+  }
+  return index.get(id);
+}
+
+export function controlState(swarm: Swarm, memberId: string): SwarmControlState {
+  let state: SwarmControlState = "active";
+  const seen = new Set<string>();
+  for (let id: string | undefined = memberId; id && !seen.has(id);) {
+    seen.add(id);
+    const member = memberById(swarm, id);
+    if (member?.control === "stopped") return "stopped";
+    if (member?.control === "paused") state = "paused";
+    id = member?.parentId;
+  }
+  return state;
+}
+
 export function swarmExpired(swarm: Swarm): boolean {
   return swarm.expiresAt !== undefined && Date.now() >= swarm.expiresAt;
 }
@@ -79,7 +109,7 @@ export interface SwarmStore {
   get(id: string): Promise<Swarm | null>;
   create(swarm: Swarm, fence?: SwarmRunFence): Promise<Swarm>;
   update(id: string, mutate: (swarm: Swarm) => void, fence?: SwarmRunFence): Promise<Swarm>;
-  pending(afterId?: string): Promise<Swarm[]>;
+  pending(afterId?: string): Promise<Array<Claimed<Swarm>>>;
 }
 
 export interface SwarmStorage extends Omit<Swarm, "members" | "messages"> {
@@ -110,7 +140,6 @@ export function createSwarmStore(
   backing: DurableMap<SwarmStorage>,
   authority?: { runs: Pick<RunStore, "get">; sessions: Pick<SessionStore, "get">; pg?: PgPool },
 ): SwarmStore {
-  if (!backing.update) throw new Error("swarm storage requires atomic updates");
   async function fencedWrite(
     id: string,
     mutate: (value: SwarmStorage | null) => SwarmStorage,
@@ -135,14 +164,14 @@ export function createSwarmStore(
         );
         if (!session.rowCount) throw new Error("capability session mismatch");
         await client.query(
-          "INSERT INTO durable_map_versions (tbl,v) VALUES ('swarms',1) ON CONFLICT (tbl) DO UPDATE SET v=durable_map_versions.v+1",
+          "INSERT INTO durable_map_versions (tbl,v) VALUES ('swarms',1) ON CONFLICT (tenant_id, tbl) DO UPDATE SET v=durable_map_versions.v+1",
         );
         const current = await client.query<{ json: SwarmStorage }>("SELECT json FROM swarms WHERE id=$1 FOR UPDATE", [
           id,
         ]);
         const next = mutate(current.rows[0]?.json ?? null);
         await client.query(
-          "INSERT INTO swarms (id,json) VALUES ($1,$2) ON CONFLICT (id) DO UPDATE SET json=EXCLUDED.json",
+          "INSERT INTO swarms (id,json) VALUES ($1,$2) ON CONFLICT (tenant_id, id) DO UPDATE SET json=EXCLUDED.json",
           [id, jsonbStringify(next)],
         );
         assertSwarmRun(fence, run);
@@ -154,7 +183,7 @@ export function createSwarmStore(
       throw new Error("capability session mismatch");
     const run = await authority.runs.get(fence.runId);
     assertSwarmRun(fence, run);
-    const updated = await backing.update!(id, (current) => {
+    const updated = await backing.update(id, (current) => {
       assertSwarmRun(fence, run);
       return mutate(current);
     });
@@ -184,22 +213,22 @@ export function createSwarmStore(
         next.pending =
           next.members.some((member) => member.state === "reserved" || member.cleanupPending) ||
           next.messages.some((message) =>
-            Object.values(message.notifications).some((item) => item.state === "pending"),
+            Object.entries(message.notifications).some(
+              ([id, item]) => item.state === "pending" && controlState(next, id) !== "paused",
+            ),
           );
         return encode(next);
       };
-      const updated = fence ? await fencedWrite(id, apply, fence) : await backing.update!(id, apply);
+      const updated = fence ? await fencedWrite(id, apply, fence) : await backing.update(id, apply);
       if (!updated) throw new Error("swarm not found");
       return decode(updated);
     },
     async pending(afterId) {
-      return (
-        await backing.select({
-          where: { field: "pending", anyOfFold: ["true"] },
-          limit: SWARM_LIMITS.sweepBatch,
-          afterId,
-        })
-      ).map(decode);
+      return (await backing.acrossTenants())
+        .filter(({ id, value }) => value.pending && (afterId === undefined || id > afterId))
+        .sort((left, right) => (left.id < right.id ? -1 : Number(left.id > right.id)))
+        .slice(0, SWARM_LIMITS.sweepBatch)
+        .map(({ tenantId, value }) => ({ ...decode(value), tenantId }));
     },
   };
 }

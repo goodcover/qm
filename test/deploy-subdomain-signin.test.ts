@@ -11,13 +11,18 @@ import { createInsecureTestServer } from "../src/api/server.ts";
 import { createDeployStore } from "../src/deploy/deploy-store.ts";
 import { createDeployService } from "../src/deploy/deploy-service.ts";
 import { createAclStore } from "../src/acl/acl-store.ts";
-import { createDirectoryStore } from "../src/directory/directory-store.ts";
 import { createIdentityService } from "../src/identity/identity-service.ts";
-import { createMemorySessionStore } from "../src/sessions/memory-session-store.ts";
 import { PORTAL_IDENTITY_HEADER } from "../src/auth/portal-identity.ts";
-import { portalSession } from "../src/deploy/viewer-session.ts";
+import { portalSession, type ViewerTenant } from "../src/deploy/viewer-session.ts";
 import { scopeId } from "../src/types.ts";
 import type { FeatureFlagStore } from "../src/feature-flags.ts";
+import { singleProcessDeps } from "./support/single-process.ts";
+import { createPostgresDirectoryStore } from "../src/directory/postgres-directory-store.ts";
+import { createPostgresSessionStore } from "../src/sessions/postgres-session-store.ts";
+import { testDatabaseUrl, testDeployBackings, testMap } from "./support/test-database.ts";
+import { createPostgresGrantStore } from "../src/acl/postgres-grant-store.ts";
+
+const UNTENANTED: ViewerTenant = { bound: undefined, legacy: true };
 
 let externalSharing = true;
 const externalSharingOn = { enabled: async () => externalSharing } as unknown as FeatureFlagStore;
@@ -45,34 +50,38 @@ function mintPortalSession(sub: string, expInSeconds = 3600, secret = SESSION_SE
 
 test("portalSession: verifies, and rejects tampering, expiry, wrong kind, wrong secret", () => {
   const good = mintPortalSession("alice@example.com");
-  assert.deepEqual(portalSession(`portal_session=${good}`, SESSION_SECRET), {
+  assert.deepEqual(portalSession(`portal_session=${good}`, SESSION_SECRET, UNTENANTED), {
     sub: "alice@example.com",
     appOnly: false,
   });
-  assert.deepEqual(portalSession(`other=1; portal_session=${good}; x=2`, SESSION_SECRET), {
+  assert.deepEqual(portalSession(`other=1; portal_session=${good}; x=2`, SESSION_SECRET, UNTENANTED), {
     sub: "alice@example.com",
     appOnly: false,
   });
-  assert.deepEqual(portalSession(`portal_session=${good}x`, SESSION_SECRET), null, "tampered signature");
+  assert.deepEqual(portalSession(`portal_session=${good}x`, SESSION_SECRET, UNTENANTED), null, "tampered signature");
   assert.deepEqual(
-    portalSession(`portal_session=junk; portal_session=${good}`, SESSION_SECRET),
+    portalSession(`portal_session=junk; portal_session=${good}`, SESSION_SECRET, UNTENANTED),
     { sub: "alice@example.com", appOnly: false },
     "an app's junk same-named cookie cannot shadow the real session",
   );
-  assert.deepEqual(portalSession(`portal_session=${good}`, "other-secret"), null, "wrong secret");
+  assert.deepEqual(portalSession(`portal_session=${good}`, "other-secret", UNTENANTED), null, "wrong secret");
   assert.deepEqual(
-    portalSession(`portal_session=${mintPortalSession("alice@example.com", -10)}`, SESSION_SECRET),
+    portalSession(`portal_session=${mintPortalSession("alice@example.com", -10)}`, SESSION_SECRET, UNTENANTED),
     null,
     "expired",
   );
-  assert.deepEqual(portalSession(undefined, SESSION_SECRET), null);
-  assert.deepEqual(portalSession("portal_session=", SESSION_SECRET), null);
+  assert.deepEqual(portalSession(undefined, SESSION_SECRET, UNTENANTED), null);
+  assert.deepEqual(portalSession("portal_session=", SESSION_SECRET, UNTENANTED), null);
   const key = createHmac("sha256", SESSION_SECRET).update("portal.session.v1").digest();
   const body = Buffer.from(
     JSON.stringify({ k: "impersonate", sub: "eve", exp: Math.floor(Date.now() / 1000) + 60 }),
   ).toString("base64url");
   const sig = createHmac("sha256", key).update(body).digest("base64url");
-  assert.deepEqual(portalSession(`portal_session=${body}.${sig}`, SESSION_SECRET), null, "non-session claims");
+  assert.deepEqual(
+    portalSession(`portal_session=${body}.${sig}`, SESSION_SECRET, UNTENANTED),
+    null,
+    "non-session claims",
+  );
 });
 
 test("forwarded app hosts fail closed before core routes when gateway configuration is absent", async () => {
@@ -171,8 +180,9 @@ test("subdomain ingress: portal sign-in admits the owner, denies strangers, boun
   upstream.listen(0);
   const upstreamPort = (upstream.address() as AddressInfo).port;
 
-  const deployStore = createDeployStore();
+  const deployStore = createDeployStore(testDeployBackings());
   const deploy = createDeployService({
+    ...singleProcessDeps(),
     externalSharingAllowed: async () => true,
     deployStore,
     provider: {
@@ -181,15 +191,15 @@ test("subdomain ingress: portal sign-in admits the owner, denies strangers, boun
       destroy: async () => {},
     },
     auditLog,
-    acl: createAclStore(),
+    acl: createAclStore(createPostgresGrantStore(testDatabaseUrl())),
     deployDir: mkdtempSync(join(tmpdir(), "signin-")),
   });
   const app = createApp({
     deploy,
-    acl: createAclStore(),
-    directory: createDirectoryStore(),
-    sessions: createMemorySessionStore(),
-    identity: createIdentityService(),
+    acl: createAclStore(createPostgresGrantStore(testDatabaseUrl())),
+    directory: createPostgresDirectoryStore(testDatabaseUrl()),
+    sessions: createPostgresSessionStore(testDatabaseUrl()),
+    identity: createIdentityService(testMap(), { externalMembers: testMap() }),
   } as unknown as Parameters<typeof createApp>[0]);
   await app.deploy({
     ownerScopeId: scopeId("personal", "alice@example.com"),
@@ -371,11 +381,12 @@ test("subdomain ingress: portal sign-in admits the owner, denies strangers, boun
 test("org-wide app access admits only signed-in org members", async () => {
   const upstream = createHttpServer((_req, res) => res.end("UPSTREAM OK"));
   upstream.listen(0);
-  const acl = createAclStore();
-  const identity = createIdentityService();
+  const acl = createAclStore(createPostgresGrantStore(testDatabaseUrl()));
+  const identity = createIdentityService(testMap(), { externalMembers: testMap() });
   const deploy = createDeployService({
+    ...singleProcessDeps(),
     externalSharingAllowed: async () => false,
-    deployStore: createDeployStore(),
+    deployStore: createDeployStore(testDeployBackings()),
     provider: {
       profile: { managedScaleToZero: false },
       apply: async () => ({ host: "127.0.0.1", port: (upstream.address() as AddressInfo).port }),
@@ -388,8 +399,8 @@ test("org-wide app access admits only signed-in org members", async () => {
   const app = createApp({
     deploy,
     acl,
-    directory: createDirectoryStore(),
-    sessions: createMemorySessionStore(),
+    directory: createPostgresDirectoryStore(testDatabaseUrl()),
+    sessions: createPostgresSessionStore(testDatabaseUrl()),
     identity,
   } as unknown as Parameters<typeof createApp>[0]);
   const d = await app.deploy({
@@ -432,8 +443,9 @@ test("org-wide app access admits only signed-in org members", async () => {
 });
 
 test("subdomain ingress: without the session config the domain has no door — a 503, not a bounce", async () => {
-  const deployStore = createDeployStore();
+  const deployStore = createDeployStore(testDeployBackings());
   const deploy = createDeployService({
+    ...singleProcessDeps(),
     externalSharingAllowed: async () => true,
     deployStore,
     provider: {
@@ -442,15 +454,15 @@ test("subdomain ingress: without the session config the domain has no door — a
       destroy: async () => {},
     },
     auditLog,
-    acl: createAclStore(),
+    acl: createAclStore(createPostgresGrantStore(testDatabaseUrl())),
     deployDir: mkdtempSync(join(tmpdir(), "signin-off-")),
   });
   const app = createApp({
     deploy,
-    acl: createAclStore(),
-    directory: createDirectoryStore(),
-    sessions: createMemorySessionStore(),
-    identity: createIdentityService(),
+    acl: createAclStore(createPostgresGrantStore(testDatabaseUrl())),
+    directory: createPostgresDirectoryStore(testDatabaseUrl()),
+    sessions: createPostgresSessionStore(testDatabaseUrl()),
+    identity: createIdentityService(testMap(), { externalMembers: testMap() }),
   } as unknown as Parameters<typeof createApp>[0]);
   await app.deploy({
     ownerScopeId: scopeId("personal", "alice@example.com"),

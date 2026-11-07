@@ -1,7 +1,9 @@
 import { promisify } from "node:util";
 import { deflateRaw, inflateRaw } from "node:zlib";
 import { orgId as configOrgId } from "../config.ts";
+import { isTenantId, tenantClaim } from "../tenants/context.ts";
 import type { CandidateDestination, Destination, EgressPolicy, Principal, ScopeId } from "../types.ts";
+import type { SessionOrigin } from "../sessions/session-store.ts";
 import { mintSignedPayload, verifySignedPayload } from "./signed-token.ts";
 
 export const CAPABILITY_TTL_MS = 60 * 60_000;
@@ -23,6 +25,7 @@ export function parseSandboxCapabilityTtlMs(value: string | undefined): number {
 export const SANDBOX_CAPABILITY_TTL_MS = parseSandboxCapabilityTtlMs(undefined);
 
 export const BROWSER_MODEL_AUD = "browser-model";
+export const SANDBOX_MODEL_AUD = "sandbox-model";
 
 export const CONTROL_PLANE_AUD = "control-plane";
 export const OAUTH_CONSENT_AUD = "oauth-consent";
@@ -30,13 +33,16 @@ export const CREDENTIAL_BROKER_AUD = "credential-broker";
 export const EGRESS_PROXY_AUD = "egress-proxy";
 export const BLOB_TRANSFER_AUD = "blob-transfer";
 export const SECRET_DROP_AUD = "secret-drop";
+export const SPEND_EXPORT_AUD = "spend-export";
 
 interface BlobGrant {
   dir: "read" | "write";
   id?: string;
 }
 
-type BlobTransferClaims = CapabilityClaims & { aud: typeof BLOB_TRANSFER_AUD; blob: BlobGrant };
+export type VerifiedCapability = CapabilityClaims & { tenant?: string };
+
+type BlobTransferClaims = VerifiedCapability & { aud: typeof BLOB_TRANSFER_AUD; blob: BlobGrant };
 
 export interface CapabilityClaims {
   externalSlack?: true;
@@ -62,6 +68,7 @@ export interface CapabilityClaims {
   liveActor?: boolean;
   runId?: string;
   sessionId?: string;
+  origin?: SessionOrigin;
   runAttempt?: number;
   runLeaseToken?: string;
   deployment?: string;
@@ -83,7 +90,7 @@ export async function mintCapabilityToken(
   secret: string,
   compressionEnabled = false,
 ): Promise<string> {
-  const value = { orgId: configOrgId(), ...claims };
+  const value = { orgId: configOrgId(), ...claims, ...tenantClaim() };
   const bytes = Buffer.from(JSON.stringify(value));
   if (bytes.length > MAX_CLAIMS_BYTES) throw new Error("Capability claims exceed size limit");
   return mintSignedPayload(
@@ -94,14 +101,14 @@ export async function mintCapabilityToken(
   );
 }
 
-async function readCapabilityClaims(token: string, secret: string | string[]): Promise<CapabilityClaims | null> {
+async function readCapabilityClaims(token: string, secret: string | string[]): Promise<VerifiedCapability | null> {
   const value = await verifySignedPayload(token, secret);
   if (!value || typeof value !== "object") return null;
-  if (!("encoding" in value)) return value as CapabilityClaims;
+  if (!("encoding" in value)) return value as VerifiedCapability;
   if (value.encoding !== "deflate-raw" || !("claims" in value) || typeof value.claims !== "string") return null;
   try {
     const bytes = await decompress(Buffer.from(value.claims, "base64url"), { maxOutputLength: MAX_CLAIMS_BYTES });
-    return JSON.parse(bytes.toString("utf8")) as CapabilityClaims;
+    return JSON.parse(bytes.toString("utf8")) as VerifiedCapability;
   } catch {
     return null;
   }
@@ -122,10 +129,11 @@ export async function verifyCapabilityToken(
   token: string,
   secret: string | string[],
   now: number = Date.now(),
-): Promise<CapabilityClaims | null> {
+): Promise<VerifiedCapability | null> {
   const claims = await readCapabilityClaims(token, secret);
   if (
     !claims ||
+    (claims.tenant !== undefined && !isTenantId(claims.tenant)) ||
     typeof claims.actorId !== "string" ||
     typeof claims.scopeId !== "string" ||
     typeof claims.exp !== "number"
@@ -164,7 +172,11 @@ export async function verifyCapabilityToken(
     return null;
   if (claims.deployment !== undefined && (typeof claims.deployment !== "string" || !claims.deployment)) return null;
   if (claims.exp === 0) {
-    if (![CONTROL_PLANE_AUD, OAUTH_CONSENT_AUD, CREDENTIAL_BROKER_AUD, EGRESS_PROXY_AUD].includes(claims.aud ?? ""))
+    if (
+      ![CONTROL_PLANE_AUD, OAUTH_CONSENT_AUD, CREDENTIAL_BROKER_AUD, EGRESS_PROXY_AUD, SANDBOX_MODEL_AUD].includes(
+        claims.aud ?? "",
+      )
+    )
       return null;
   } else if (!Number.isSafeInteger(claims.exp) || now >= claims.exp) return null;
   return claims;

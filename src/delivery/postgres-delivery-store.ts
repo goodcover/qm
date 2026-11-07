@@ -1,29 +1,17 @@
 import { randomUUID } from "node:crypto";
-import { createPgPool, type PgPool } from "../persistence/pg-pool.ts";
+import { createPgPool, withPgTransaction, type PgPool } from "../persistence/pg-pool.ts";
+import { claimAcrossTenants, poolAcrossTenants, rowTenant } from "../tenants/claim.ts";
 import type { Delivery, DeliveryProvenance, Destination, OutgoingAttachment } from "../types.ts";
-import { DELIVERY_MAX_AGE_MS, logDeliveryExpiry, type DeliveryStore } from "./delivery-store.ts";
-import { cronIdOf, threadRefCronIdExpr } from "../sessions/session-store.ts";
+import { DELIVERY_MAX_AGE_MS, logDeliveryExpiry, type ClaimOptions, type DeliveryStore } from "./delivery-store.ts";
 import { pgTextSafe } from "../util/text.ts";
+import { TENANCY, tenantTables } from "../tenants/migrations.ts";
+import { createTenantListeners } from "../tenants/context.ts";
 
 const NOW_MS_SQL = "(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT";
-const SOURCE_CRON_ID_EXPR = threadRefCronIdExpr("provenance->>'sourceThreadRef'");
-
-export async function backfillDeliverySourceCronIdBatch(q: PgPool["q"], limit: number): Promise<number> {
-  const updated = await q(
-    `UPDATE deliveries
-        SET source_cron_id = ${SOURCE_CRON_ID_EXPR}
-      WHERE id IN (SELECT id FROM deliveries
-                    WHERE source_cron_id IS NULL AND ${SOURCE_CRON_ID_EXPR} IS NOT NULL
-                    LIMIT $1)
-      RETURNING 1`,
-    [limit],
-  );
-  return updated.length;
-}
-
 function rowToDelivery(r: Record<string, unknown>): Delivery {
   return {
     id: r.id as string,
+    ...rowTenant(r),
     destination: r.destination as Destination,
     text: r.text as string,
     ...(r.attachments != null ? { attachments: r.attachments as OutgoingAttachment[] } : {}),
@@ -32,6 +20,7 @@ function rowToDelivery(r: Record<string, unknown>): Delivery {
     createdAt: Number(r.created_at),
     deliveredAt: r.delivered_at === null ? null : Number(r.delivered_at),
     ...(r.expired_at != null ? { expiredAt: Number(r.expired_at) } : {}),
+    ...(r.failed_reason != null ? { failedReason: r.failed_reason as string } : {}),
     ...(r.shadow === true ? { shadow: true } : {}),
     ...(r.recipient_thread_ref != null ? { recipientThreadRef: r.recipient_thread_ref as string } : {}),
     ...(r.deliver_latency_ms != null ? { deliverLatencyMs: Number(r.deliver_latency_ms) } : {}),
@@ -41,7 +30,8 @@ function rowToDelivery(r: Record<string, unknown>): Delivery {
 
 export function createPostgresDeliveryStore(connectionString: string, opts?: { maxAgeMs?: number }): DeliveryStore {
   const maxAgeMs = opts?.maxAgeMs ?? DELIVERY_MAX_AGE_MS;
-  const { q, query } = createPgPool(connectionString, [
+  const db = createPgPool(connectionString, [
+    ...TENANCY,
     {
       id: "delivery/store/0001",
       statements: [
@@ -90,12 +80,27 @@ export function createPostgresDeliveryStore(connectionString: string, opts?: { m
         `ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS source_cron_id TEXT`,
       ],
     },
+    {
+      id: "delivery/store/0007",
+      statements: [
+        `SET LOCAL lock_timeout = '3s'`,
+        `ALTER TABLE deliveries ADD COLUMN IF NOT EXISTS failed_reason TEXT`,
+      ],
+    },
+    ...tenantTables("delivery/store/0008-tenants", [
+      {
+        table: "deliveries",
+        primaryKey: "id",
+        unique: [{ name: "deliveries_idempotency_key_key", columns: "idempotency_key", constraint: true }],
+      },
+    ]),
   ]);
+  const { q, query } = db;
 
-  const enqueueListeners = new Set<() => void>();
+  const enqueueListeners = createTenantListeners<[string]>("delivery enqueue");
 
-  async function expireOveraged(): Promise<void> {
-    const rows = await q(
+  async function expireOveraged(pg: PgPool): Promise<void> {
+    const rows = await pg.q(
       `UPDATE deliveries
           SET expired_at = ${NOW_MS_SQL}
         WHERE id IN (
@@ -116,22 +121,54 @@ export function createPostgresDeliveryStore(connectionString: string, opts?: { m
     }
   }
 
+  async function claimOn(pg: PgPool, type: string, ttlMs: number, opts?: ClaimOptions): Promise<Delivery[]> {
+    await expireOveraged(pg);
+    const claim = `UPDATE deliveries
+          SET claim_expires_at = ${NOW_MS_SQL} + $2
+        WHERE id IN (
+          SELECT id FROM deliveries d
+           WHERE delivered_at IS NULL AND expired_at IS NULL AND NOT shadow AND destination->>'type' = $1
+             AND (claim_expires_at IS NULL
+               OR claim_expires_at <= ${NOW_MS_SQL})
+             ${
+               opts?.oldestPerConversation
+                 ? `AND NOT EXISTS (
+               SELECT 1 FROM deliveries o
+                WHERE o.tenant_id = d.tenant_id AND o.destination->>'type' = $1
+                  AND o.destination->>'target' = d.destination->>'target'
+                  AND o.delivered_at IS NULL AND o.expired_at IS NULL AND NOT o.shadow
+                  AND (o.claim_expires_at > ${NOW_MS_SQL} OR (o.created_at, o.id) < (d.created_at, d.id)))`
+                 : ""
+             }
+           ORDER BY created_at
+             FOR UPDATE SKIP LOCKED
+        )
+        RETURNING *`;
+    const rows = opts?.oldestPerConversation
+      ? await withPgTransaction(await pg.pool(), async (client) => {
+          await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`deliveries:claim:${type}`]);
+          return (await client.query(claim, [type, ttlMs])).rows;
+        })
+      : await pg.q(claim, [type, ttlMs]);
+    return rows.map(rowToDelivery).sort((a, b) => a.createdAt - b.createdAt);
+  }
+
   return {
     async enqueue(input) {
       const inserted = await q(
-        `INSERT INTO deliveries (id, idempotency_key, destination, text, attachments, provenance, source_cron_id, created_at, shadow)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-         ON CONFLICT (idempotency_key) DO UPDATE
+        `INSERT INTO deliveries (id, idempotency_key, destination, text, attachments, provenance, created_at, shadow)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         ON CONFLICT (tenant_id, idempotency_key) DO UPDATE
            SET destination = EXCLUDED.destination,
                text = EXCLUDED.text,
                attachments = EXCLUDED.attachments,
                provenance = EXCLUDED.provenance,
-               source_cron_id = EXCLUDED.source_cron_id,
                created_at = EXCLUDED.created_at,
                shadow = EXCLUDED.shadow,
                expired_at = NULL,
                claim_expires_at = NULL
            WHERE deliveries.delivered_at IS NULL AND deliveries.expired_at IS NOT NULL
+             AND deliveries.failed_reason IS NULL
          RETURNING *`,
         [
           randomUUID(),
@@ -140,13 +177,12 @@ export function createPostgresDeliveryStore(connectionString: string, opts?: { m
           pgTextSafe(input.text),
           input.attachments?.length ? JSON.stringify(input.attachments) : null,
           input.provenance ? JSON.stringify(input.provenance) : null,
-          cronIdOf(input.provenance?.sourceThreadRef),
           Date.now(),
           input.shadow === true,
         ],
       );
       if (inserted[0]) {
-        if (input.shadow !== true) for (const l of enqueueListeners) l();
+        if (input.shadow !== true) enqueueListeners.emit(input.destination.type);
         return rowToDelivery(inserted[0]);
       }
       const existing = await q("SELECT * FROM deliveries WHERE idempotency_key = $1", [input.idempotencyKey]);
@@ -162,23 +198,21 @@ export function createPostgresDeliveryStore(connectionString: string, opts?: { m
       );
       return rows.map(rowToDelivery);
     },
-    async claimPending(type, ttlMs) {
-      await expireOveraged();
-      const rows = await q(
-        `UPDATE deliveries
-            SET claim_expires_at = ${NOW_MS_SQL} + $2
-          WHERE id IN (
-            SELECT id FROM deliveries
-             WHERE delivered_at IS NULL AND expired_at IS NULL AND NOT shadow AND destination->>'type' = $1
-               AND (claim_expires_at IS NULL
-                 OR claim_expires_at <= ${NOW_MS_SQL})
-             ORDER BY created_at
-               FOR UPDATE SKIP LOCKED
-          )
-          RETURNING *`,
-        [type, ttlMs],
+    async pendingAcrossTenants(type) {
+      const { rows } = await claimAcrossTenants(
+        db,
+        `SELECT * FROM deliveries
+          WHERE delivered_at IS NULL AND expired_at IS NULL AND NOT shadow AND destination->>'type' = $1
+          ORDER BY created_at`,
+        [type],
       );
-      return rows.map(rowToDelivery).sort((a, b) => a.createdAt - b.createdAt);
+      return rows.map(rowToDelivery);
+    },
+    claimPending(type, ttlMs, opts) {
+      return claimOn(db, type, ttlMs, opts);
+    },
+    async claimPendingAcrossTenants(type, ttlMs, opts) {
+      return claimOn(await poolAcrossTenants(db), type, ttlMs, opts);
     },
     async listShadow(opts) {
       const limit = Math.max(1, opts?.limit ?? 100);
@@ -199,11 +233,21 @@ export function createPostgresDeliveryStore(connectionString: string, opts?: { m
         [id, at, slackApiMs ?? null],
       );
     },
+    async fail(id, reason, at) {
+      const rows = await q(
+        `UPDATE deliveries
+            SET expired_at = $3, failed_reason = $2, claim_expires_at = NULL
+          WHERE id = $1 AND delivered_at IS NULL AND expired_at IS NULL
+          RETURNING *`,
+        [id, reason, at],
+      );
+      return rows[0] ? rowToDelivery(rows[0]) : null;
+    },
     async ackByKey(idempotencyKey, at) {
       await query(
         `INSERT INTO deliveries (id, idempotency_key, destination, text, created_at, delivered_at)
          VALUES ($1, $2, '{"type":"ack-tombstone","target":""}', '', $3, $3)
-         ON CONFLICT (idempotency_key)
+         ON CONFLICT (tenant_id, idempotency_key)
          DO UPDATE SET delivered_at = COALESCE(deliveries.delivered_at, EXCLUDED.delivered_at),
                        expired_at = CASE WHEN deliveries.delivered_at IS NULL THEN NULL ELSE deliveries.expired_at END`,
         [randomUUID(), idempotencyKey, at],
@@ -259,46 +303,8 @@ export function createPostgresDeliveryStore(connectionString: string, opts?: { m
       );
       return rows.map(rowToDelivery).reverse();
     },
-    async sentCountsBySourceSessions(sources) {
-      const counts = new Map<string, number>();
-      if (!sources.length) return counts;
-      const byThreadRef = new Map(sources.map((s) => [s.threadRef, s.sessionId]));
-      const rows = await q(
-        `SELECT provenance->>'sourceSessionId' AS session_id,
-                provenance->>'sourceThreadRef' AS thread_ref,
-                COUNT(*)::int AS sent
-           FROM deliveries
-          WHERE NOT shadow AND expired_at IS NULL
-            AND (provenance->>'sourceSessionId' = ANY($1)
-              OR (provenance->>'sourceSessionId' IS NULL AND provenance->>'sourceThreadRef' = ANY($2)))
-          GROUP BY 1, 2`,
-        [sources.map((s) => s.sessionId), sources.map((s) => s.threadRef)],
-      );
-      for (const r of rows as Array<{ session_id: string | null; thread_ref: string | null; sent: number }>) {
-        const id = r.session_id ?? (r.thread_ref ? byThreadRef.get(r.thread_ref) : undefined);
-        if (id) counts.set(id, (counts.get(id) ?? 0) + Number(r.sent));
-      }
-      return counts;
-    },
-    async sentRunCountsByCron(cronIds) {
-      const counts = new Map<string, number>();
-      if (!cronIds.length) return counts;
-      const rows = await q(
-        `SELECT d.cron_id, COUNT(DISTINCT d.run)::int AS runs
-           FROM (SELECT COALESCE(source_cron_id, ${SOURCE_CRON_ID_EXPR}) AS cron_id,
-                        COALESCE(provenance->>'sourceSessionId', provenance->>'sourceThreadRef') AS run
-                   FROM deliveries
-                  WHERE NOT shadow AND expired_at IS NULL AND provenance->>'sourceThreadRef' IS NOT NULL) d
-          WHERE d.cron_id = ANY($1)
-          GROUP BY d.cron_id`,
-        [cronIds],
-      );
-      for (const r of rows as Array<{ cron_id: string; runs: number }>) counts.set(r.cron_id, Number(r.runs));
-      return counts;
-    },
     onEnqueue(listener) {
-      enqueueListeners.add(listener);
-      return () => enqueueListeners.delete(listener);
+      return enqueueListeners.add(listener);
     },
   };
 }

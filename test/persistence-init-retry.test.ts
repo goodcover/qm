@@ -1,24 +1,19 @@
 import { test } from "node:test";
+import { randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
 import { createPgPool, type PgPool, type Rows } from "../src/persistence/pg-pool.ts";
 import { createPostgresMap } from "../src/persistence/durable-map.ts";
 import { createAdminGrantStore, type AdminGrant, type AdminGrantPersistence } from "../src/admin/admin-grant-store.ts";
 import { scopeId } from "../src/types.ts";
+import { withTenant } from "../src/tenants/context.ts";
 
 const URL = process.env.DATABASE_URL;
 const skip = URL ? false : "set DATABASE_URL (a Postgres) to run the live-pool tests";
 
-function flakyPgPool(failures: number): PgPool {
+function flakyMigrationPool(failures: number): PgPool {
   let remaining = failures;
   async function query(_text: string, _params: unknown[] = []): Promise<{ rows: Rows; rowCount: number }> {
-    if (remaining > 0) {
-      remaining--;
-      throw new Error("transient pg failure");
-    }
-    return {
-      rows: [{ token: "t", json: { n: 1 } }],
-      rowCount: 1,
-    };
+    return { rows: [{ json: { n: 1 } }], rowCount: 1 };
   }
   return {
     sessionPool: () => Promise.reject(new Error("not backed by a real pool")),
@@ -26,15 +21,22 @@ function flakyPgPool(failures: number): PgPool {
     query,
     q: async (text, params) => (await query(text, params ?? [])).rows,
     registerMigration: () => {},
-    migrate: async () => {},
+    migrate: async () => {
+      if (remaining > 0) {
+        remaining--;
+        throw new Error("transient pg failure");
+      }
+    },
     close: async () => {},
   };
 }
 
 test("pg map: a failed table-create is retried on the next call (rejection not cached)", async () => {
-  const m = createPostgresMap<{ n: number }>(flakyPgPool(1), "retry_widgets");
-  await assert.rejects(() => m.all(), /transient pg failure/);
-  assert.deepEqual(await m.all(), [{ n: 1 }], "second call re-runs the table create and proceeds to the query");
+  const m = createPostgresMap<{ n: number }>(flakyMigrationPool(1), "retry_widgets");
+  await withTenant(randomUUID(), async () => {
+    await assert.rejects(() => m.all(), /transient pg failure/);
+    assert.deepEqual(await m.all(), [{ n: 1 }], "second call re-runs the table create and proceeds to the query");
+  });
 });
 
 test("admin grants: a failed seed is retried on the next call (rejection not cached)", async () => {
@@ -65,7 +67,9 @@ test("admin grants: a failed seed is retried on the next call (rejection not cac
 });
 
 test("pg pool: a failed init is retried with a fresh attempt (rejection not cached)", async () => {
-  const pg = createPgPool("postgres://127.0.0.1:9/nope", "test/retry/unreachable/0001", ["SELECT 1"]);
+  const pg = createPgPool("postgres://127.0.0.1:9/nope", [
+    { id: "test/retry/unreachable/0001", statements: ["SELECT 1"] },
+  ]);
   const first = await pg.q("SELECT 1").catch((e: unknown) => e);
   const second = await pg.q("SELECT 1").catch((e: unknown) => e);
   assert.ok(first instanceof Error);
@@ -75,7 +79,7 @@ test("pg pool: a failed init is retried with a fresh attempt (rejection not cach
 });
 
 test("pg pool: an idle-client 'error' is logged, not fatal", { skip }, async () => {
-  const pg = createPgPool(URL!, "test/retry/live/0001", ["SELECT 1"]);
+  const pg = createPgPool(URL!, [{ id: "test/retry/live/0001", statements: ["SELECT 1"] }]);
   const pool = await pg.pool();
   assert.doesNotThrow(() => pool.emit("error", new Error("backend died")));
   assert.deepEqual((await pg.query("SELECT 1 AS one")).rows, [{ one: 1 }], "pool keeps serving queries");
@@ -83,7 +87,7 @@ test("pg pool: an idle-client 'error' is logged, not fatal", { skip }, async () 
 });
 
 test("pg pool: a timeoutMs query gives the connection back usable, not poisoned", { skip }, async () => {
-  const pg = createPgPool(URL!, "test/retry/timeout/0001", ["SELECT 1"]);
+  const pg = createPgPool(URL!, [{ id: "test/retry/timeout/0001", statements: ["SELECT 1"] }]);
   await assert.rejects(
     () => pg.q("SELECT pg_sleep(5)", [], { timeoutMs: 150 }),
     /statement timeout/i,

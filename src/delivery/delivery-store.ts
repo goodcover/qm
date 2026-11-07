@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { Delivery, DeliveryProvenance, Destination, OutgoingAttachment, ScopeId } from "../types.ts";
 import type { TurnOrigin } from "../core/turn-origin.ts";
-import { cronIdOf } from "../sessions/session-store.ts";
+import { createTenantListeners } from "../tenants/context.ts";
 
 export const DELIVERY_MAX_AGE_MS = 6 * 3_600_000;
 
@@ -34,6 +34,10 @@ export function turnDeliveryProvenance(input: {
   };
 }
 
+export interface ClaimOptions {
+  oldestPerConversation?: boolean;
+}
+
 export interface DeliveryStore {
   enqueue(input: {
     destination: Destination;
@@ -44,9 +48,12 @@ export interface DeliveryStore {
     shadow?: boolean;
   }): Promise<Delivery>;
   pending(type: string): Promise<Delivery[]>;
-  claimPending(type: string, ttlMs: number): Promise<Delivery[]>;
+  pendingAcrossTenants(type: string): Promise<Delivery[]>;
+  claimPending(type: string, ttlMs: number, opts?: ClaimOptions): Promise<Delivery[]>;
+  claimPendingAcrossTenants(type: string, ttlMs: number, opts?: ClaimOptions): Promise<Delivery[]>;
   listShadow(opts?: { limit?: number }): Promise<Delivery[]>;
   ack(id: string, at: number, slackApiMs?: number): Promise<void>;
+  fail(id: string, reason: string, at: number): Promise<Delivery | null>;
   ackByKey(idempotencyKey: string, at: number): Promise<void>;
   setEditRefByKey(idempotencyKey: string, editRef: string): Promise<void>;
   get(id: string): Promise<Delivery | null>;
@@ -54,9 +61,7 @@ export interface DeliveryStore {
   recordRecipientThread(id: string, recipientThreadRef: string, at: number): Promise<void>;
   listByRecipientThread(recipientThreadRef: string, opts?: { limit?: number }): Promise<Delivery[]>;
   listBySourceSession(sourceSessionId: string, sourceThreadRef: string, opts?: { limit?: number }): Promise<Delivery[]>;
-  sentCountsBySourceSessions(sources: Array<{ sessionId: string; threadRef: string }>): Promise<Map<string, number>>;
-  sentRunCountsByCron(cronIds: string[]): Promise<Map<string, number>>;
-  onEnqueue(listener: () => void): () => void;
+  onEnqueue(listener: (type: string) => void): () => void;
 }
 
 export function createDeliveryStore(opts?: { maxAgeMs?: number }): DeliveryStore {
@@ -64,7 +69,7 @@ export function createDeliveryStore(opts?: { maxAgeMs?: number }): DeliveryStore
   const deliveries = new Map<string, Delivery>();
   const byKey = new Map<string, string>();
   const claimedUntil = new Map<string, number>();
-  const enqueueListeners = new Set<() => void>();
+  const enqueueListeners = createTenantListeners<[string]>("delivery enqueue");
 
   const expireOveraged = (now: number): void => {
     for (const d of deliveries.values()) {
@@ -87,7 +92,7 @@ export function createDeliveryStore(opts?: { maxAgeMs?: number }): DeliveryStore
       const existingId = byKey.get(input.idempotencyKey);
       if (existingId) {
         const existing = deliveries.get(existingId)!;
-        if (existing.deliveredAt === null && existing.expiredAt !== undefined) {
+        if (existing.deliveredAt === null && existing.expiredAt !== undefined && !existing.failedReason) {
           existing.destination = input.destination;
           existing.text = input.text;
           if (input.attachments?.length) existing.attachments = input.attachments;
@@ -99,7 +104,7 @@ export function createDeliveryStore(opts?: { maxAgeMs?: number }): DeliveryStore
           claimedUntil.delete(existing.id);
           if (input.shadow) existing.shadow = true;
           else delete existing.shadow;
-          if (!existing.shadow) for (const l of enqueueListeners) l();
+          if (!existing.shadow) enqueueListeners.emit(existing.destination.type);
         }
         return existing;
       }
@@ -116,25 +121,32 @@ export function createDeliveryStore(opts?: { maxAgeMs?: number }): DeliveryStore
       };
       deliveries.set(delivery.id, delivery);
       byKey.set(delivery.idempotencyKey, delivery.id);
-      if (!delivery.shadow) for (const l of enqueueListeners) l();
+      if (!delivery.shadow) enqueueListeners.emit(delivery.destination.type);
       return delivery;
+    },
+    async pendingAcrossTenants(type) {
+      return this.pending(type);
+    },
+    async claimPendingAcrossTenants(type, ttlMs, opts) {
+      return this.claimPending(type, ttlMs, opts);
     },
     async pending(type) {
       return [...deliveries.values()].filter(
         (d) => d.deliveredAt === null && d.expiredAt === undefined && !d.shadow && d.destination.type === type,
       );
     },
-    async claimPending(type, ttlMs) {
+    async claimPending(type, ttlMs, opts) {
       const now = Date.now();
       expireOveraged(now);
-      const rows = [...deliveries.values()].filter(
-        (d) =>
-          d.deliveredAt === null &&
-          d.expiredAt === undefined &&
-          !d.shadow &&
-          d.destination.type === type &&
-          (claimedUntil.get(d.id) ?? 0) <= now,
+      const open = [...deliveries.values()].filter(
+        (d) => d.deliveredAt === null && d.expiredAt === undefined && !d.shadow && d.destination.type === type,
       );
+      const seen = new Set<string>();
+      const rows = open.filter((d) => {
+        const first = !seen.has(d.destination.target);
+        seen.add(d.destination.target);
+        return (claimedUntil.get(d.id) ?? 0) <= now && (first || !opts?.oldestPerConversation);
+      });
       for (const d of rows) claimedUntil.set(d.id, now + ttlMs);
       return rows;
     },
@@ -153,6 +165,14 @@ export function createDeliveryStore(opts?: { maxAgeMs?: number }): DeliveryStore
         d.deliverLatencyMs = Math.max(0, at - d.createdAt);
         if (slackApiMs !== undefined) d.slackApiMs = slackApiMs;
       }
+    },
+    async fail(id, reason, at) {
+      const d = deliveries.get(id);
+      if (!d || d.deliveredAt !== null || d.expiredAt !== undefined) return null;
+      d.expiredAt = at;
+      d.failedReason = reason;
+      claimedUntil.delete(id);
+      return d;
     },
     async ackByKey(idempotencyKey, at) {
       const existingId = byKey.get(idempotencyKey);
@@ -211,38 +231,8 @@ export function createDeliveryStore(opts?: { maxAgeMs?: number }): DeliveryStore
         .sort((a, b) => a.createdAt - b.createdAt)
         .slice(-limit);
     },
-    async sentCountsBySourceSessions(sources) {
-      const counts = new Map<string, number>();
-      const byId = new Set(sources.map((s) => s.sessionId));
-      const byThreadRef = new Map(sources.map((s) => [s.threadRef, s.sessionId]));
-      for (const d of deliveries.values()) {
-        if (d.shadow || d.expiredAt !== undefined || !d.provenance) continue;
-        let id: string | undefined;
-        if (d.provenance.sourceSessionId) {
-          if (byId.has(d.provenance.sourceSessionId)) id = d.provenance.sourceSessionId;
-        } else if (d.provenance.sourceThreadRef) {
-          id = byThreadRef.get(d.provenance.sourceThreadRef);
-        }
-        if (id) counts.set(id, (counts.get(id) ?? 0) + 1);
-      }
-      return counts;
-    },
-    async sentRunCountsByCron(cronIds) {
-      const wanted = new Set(cronIds);
-      const runs = new Map<string, Set<string>>();
-      for (const d of deliveries.values()) {
-        if (d.shadow || d.expiredAt !== undefined || !d.provenance?.sourceThreadRef) continue;
-        const cronId = cronIdOf(d.provenance.sourceThreadRef);
-        if (!cronId || !wanted.has(cronId)) continue;
-        let set = runs.get(cronId);
-        if (!set) runs.set(cronId, (set = new Set()));
-        set.add(d.provenance.sourceSessionId ?? d.provenance.sourceThreadRef);
-      }
-      return new Map([...runs].map(([k, v]) => [k, v.size]));
-    },
     onEnqueue(listener) {
-      enqueueListeners.add(listener);
-      return () => enqueueListeners.delete(listener);
+      return enqueueListeners.add(listener);
     },
   };
 }

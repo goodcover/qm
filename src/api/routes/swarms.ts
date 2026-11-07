@@ -40,8 +40,9 @@ async function swarmRequest(ctx: ApiCtx): Promise<void> {
       ...(caller.kind === "human" ? ["runId"] : []),
       ...(ACTION_FIELDS[String(body.action)] ?? ["requestId", "text"]),
       ...(body.action === "spawn" ? ["count", "context", "contexts", "forumSandboxId", ...SPAWN_RUNTIME_FIELDS] : []),
-      ...(body.action === "send" ? ["audience", "replyTo", "notify"] : []),
+      ...(body.action === "send" ? ["audience", "replyTo", "wake"] : []),
       ...(body.action === "spawn" ? ["settings", "backend"] : []),
+      ...(body.action === "spawn" || body.action === "send" ? ["goal"] : []),
     ]);
     if (Object.keys(body).some((key) => !allowed.has(key))) throw new Error("unsupported swarm request field");
     if (body.action === "context") {
@@ -72,6 +73,7 @@ async function swarmRequest(ctx: ApiCtx): Promise<void> {
         ...(typeof body.forumSandboxId === "string" ? { forumSandboxId: body.forumSandboxId } : {}),
         ...(isObj(body.settings) ? { settings: body.settings } : {}),
         ...(typeof body.backend === "string" ? { backend: body.backend } : {}),
+        ...("goal" in body ? { goal: body.goal } : {}),
         ...Object.fromEntries(
           SPAWN_RUNTIME_FIELDS.filter((field) => field in body).map((field) => [field, body[field]]),
         ),
@@ -81,7 +83,7 @@ async function swarmRequest(ctx: ApiCtx): Promise<void> {
     if (body.action === "send") {
       if (
         !(Array.isArray(body.audience) || body.audience === "all") ||
-        (body.notify !== undefined && typeof body.notify !== "boolean") ||
+        (body.wake !== undefined && typeof body.wake !== "boolean") ||
         (body.replyTo !== undefined && typeof body.replyTo !== "string")
       )
         throw new Error("invalid message parameters");
@@ -89,8 +91,9 @@ async function swarmRequest(ctx: ApiCtx): Promise<void> {
         requestId: body.requestId,
         text: body.text,
         audience: body.audience,
-        ...(typeof body.notify === "boolean" ? { notify: body.notify } : {}),
+        ...(typeof body.wake === "boolean" ? { wake: body.wake } : {}),
         ...(typeof body.replyTo === "string" ? { replyTo: body.replyTo } : {}),
+        ...("goal" in body ? { goal: body.goal } : {}),
       });
       return sendJson(res, 202, { message });
     }

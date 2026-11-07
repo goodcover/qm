@@ -1,7 +1,9 @@
 import { isEmbeddingModel, type EmbeddingModel } from "./model-overlay.ts";
-import type { ModelGatewayTransportConfig } from "./provider-endpoints.ts";
+import { gatewayRoot, type ModelGatewayTransportConfig } from "./provider-endpoints.ts";
 import { GATEWAY_MODEL_PREFIX, GATEWAY_PROVIDER, setGatewayModels, type GatewayModel } from "./gateway-models.ts";
 import { modelOfferedInWebui, selectableBaseModels } from "./pi-models.ts";
+import { perTenant } from "../tenants/context.ts";
+import { readBoundedText } from "../util/bytes.ts";
 
 const MAX_BYTES = 2 * 1024 * 1024;
 const MAX_MODELS = 1_000;
@@ -73,7 +75,7 @@ function parseModel(value: unknown, allowed: Set<string>, baseUrl: string): Gate
     name: info.model_group,
     provider: GATEWAY_PROVIDER,
     api,
-    baseUrl: anthropic ? baseUrl.replace(/\/v1$/, "") : baseUrl,
+    baseUrl: anthropic ? gatewayRoot(baseUrl) : baseUrl,
     reasoning: (anthropic || openai) && info.supports_reasoning === true,
     input: info.supports_vision === true ? ["text", "image"] : ["text"],
     contextWindow,
@@ -115,25 +117,7 @@ async function readCatalog(
   });
   if (!response.ok)
     throw Object.assign(new Error(`Gateway catalog returned HTTP ${response.status}`), { status: response.status });
-  if (!response.body || Number(response.headers.get("content-length")) > MAX_BYTES)
-    throw new Error("Gateway catalog exceeds size limit");
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let bytes = 0;
-  let body = "";
-  try {
-    while (true) {
-      const chunk = await reader.read();
-      if (chunk.done) break;
-      bytes += chunk.value.byteLength;
-      if (bytes > MAX_BYTES) throw new Error("Gateway catalog exceeds size limit");
-      body += decoder.decode(chunk.value, { stream: true });
-    }
-    body += decoder.decode();
-  } finally {
-    void reader.cancel().catch(() => {});
-    reader.releaseLock();
-  }
+  const body = await readBoundedText(response, MAX_BYTES, () => new Error("Gateway catalog exceeds size limit"));
   const data = record(JSON.parse(body))?.data;
   if (!Array.isArray(data) || data.length > MAX_MODELS) throw new Error("Invalid gateway catalog");
   return data;
@@ -144,26 +128,28 @@ export function createGatewayCatalog(
   fetcher: typeof fetch = fetch,
   now: () => number = Date.now,
 ) {
-  const root = config.url.replace(/\/v1$/, "");
+  const root = gatewayRoot(config.url);
   const baseUrl = `${root}/v1`;
-  let routes: Readonly<Record<string, string>> = { ...config.models };
-  let discovered = false;
-  let expiresAt = 0;
-  let retryAt = 0;
-  let lastSuccessAt = 0;
-  let inFlight: Promise<void> | undefined;
+  const discovery = perTenant<{
+    routes: Readonly<Record<string, string>>;
+    discovered: boolean;
+    retryAt: number;
+    lastSuccessAt: number;
+    inFlight?: Promise<void>;
+  }>(() => ({ routes: { ...config.models }, discovered: false, retryAt: 0, lastSuccessAt: 0 }));
   const transport: ModelGatewayTransportConfig = {
     ...config,
     reservedModelIds: new Set(Object.keys(config.models)),
     refresh,
     get models() {
-      return routes;
+      return discovery().routes;
     },
   };
   async function refresh(): Promise<void> {
-    if (inFlight) return inFlight;
-    if (now() < retryAt) return;
-    inFlight = (async () => {
+    const state = discovery();
+    if (state.inFlight) return state.inFlight;
+    if (now() < state.retryAt) return;
+    state.inFlight = (async () => {
       try {
         const [listing, metadata] = await Promise.all([
           readCatalog(`${baseUrl}/models`, config, fetcher),
@@ -187,11 +173,10 @@ export function createGatewayCatalog(
           if (allowed.has(target) && !models.some((m) => m.id === GATEWAY_MODEL_PREFIX + target && isEmbeddingModel(m)))
             next[id] = target;
         }
-        routes = next;
-        discovered = true;
-        expiresAt = now() + TTL_MS;
-        retryAt = expiresAt;
-        lastSuccessAt = now();
+        state.routes = next;
+        state.discovered = true;
+        state.retryAt = now() + TTL_MS;
+        state.lastSuccessAt = now();
         const offeredAliases = new Set(
           selectableBaseModels()
             .filter(({ id }) => modelOfferedInWebui(id))
@@ -206,22 +191,21 @@ export function createGatewayCatalog(
           ),
         );
       } catch (error) {
-        retryAt = now() + RETRY_MS;
-        if (discovered && transientFailure(error) && now() - lastSuccessAt < STALE_MS) {
+        state.retryAt = now() + RETRY_MS;
+        if (state.discovered && transientFailure(error) && now() - state.lastSuccessAt < STALE_MS) {
           console.warn("[model] Gateway model discovery failed; keeping last known models and retrying in 30 seconds");
           return;
         }
-        if (discovered || Object.keys(config.models).length === 0) {
-          routes = {};
-          expiresAt = 0;
+        if (state.discovered || Object.keys(config.models).length === 0) {
+          state.routes = {};
           setGatewayModels([]);
           console.warn("[model] Gateway model discovery unavailable; retrying in 30 seconds");
         }
       }
     })().finally(() => {
-      inFlight = undefined;
+      state.inFlight = undefined;
     });
-    return inFlight;
+    return state.inFlight;
   }
   return { transport, refresh };
 }

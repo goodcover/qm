@@ -3,7 +3,6 @@ import { isBearerSecret, isStrongSigningSecret } from "../auth/source-auth.ts";
 type SecretGate =
   | "production"
   | "background-work-control"
-  | "postgres"
   | "sprites"
   | "smolmachines"
   | "e2b"
@@ -11,6 +10,7 @@ type SecretGate =
   | "porter"
   | "agent37"
   | "superserve"
+  | "render"
   | "do-managed-agents"
   | "porter-deploy"
   | "e2b-deploy"
@@ -28,6 +28,7 @@ type SecretGate =
 export interface RuntimeSecretSpec {
   name: string;
   requiredWhen: SecretGate | readonly SecretGate[];
+  reason?: string;
 }
 
 export const CORE_SECRET_SPECS: readonly RuntimeSecretSpec[] = [
@@ -41,10 +42,16 @@ export const CORE_SECRET_SPECS: readonly RuntimeSecretSpec[] = [
   { name: "OPENAI_API_KEY", requiredWhen: ["model-openai"] },
   { name: "ANTHROPIC_API_KEY", requiredWhen: "model-anthropic" },
   { name: "OPENROUTER_API_KEY", requiredWhen: "model-openrouter" },
-  { name: "DATABASE_URL", requiredWhen: "postgres" },
+  {
+    name: "DATABASE_URL",
+    requiredWhen: "production",
+    reason:
+      "sessions, runs, approvals, audit, locks and leases must survive restarts and be shared across instances, or a blue-green rollout can destroy a scope's resident disk",
+  },
   { name: "SPRITES_TOKEN", requiredWhen: "sprites" },
   { name: "SMOLMACHINES_TOKEN", requiredWhen: "smolmachines" },
   { name: "AGENT37_API_KEY", requiredWhen: "agent37" },
+  { name: "RENDER_API_KEY", requiredWhen: "render" },
   { name: "SUPERSERVE_API_KEY", requiredWhen: "superserve" },
   { name: "E2B_API_KEY", requiredWhen: ["e2b", "e2b-deploy"] },
   { name: "DO_AGENTS_API_TOKEN", requiredWhen: "do-managed-agents" },
@@ -66,7 +73,6 @@ function sandboxBackendSelected(env: NodeJS.ProcessEnv, backend: string): boolea
 const GATE_PREDICATES: Readonly<Record<SecretGate, (env: NodeJS.ProcessEnv) => boolean>> = {
   production: (env) => env.NODE_ENV === "production",
   "background-work-control": (env) => Boolean(env.BACKGROUND_DEPLOYMENT_ID?.trim()),
-  postgres: (env) => env.SESSION_STORE === "postgres" || env.RUN_STORE === "postgres",
   sprites: (env) => sandboxBackendSelected(env, "sprites"),
   smolmachines: (env) => sandboxBackendSelected(env, "smolmachines"),
   e2b: (env) => sandboxBackendSelected(env, "e2b"),
@@ -74,6 +80,7 @@ const GATE_PREDICATES: Readonly<Record<SecretGate, (env: NodeJS.ProcessEnv) => b
   porter: (env) => sandboxBackendSelected(env, "porter"),
   agent37: (env) => sandboxBackendSelected(env, "agent37"),
   superserve: (env) => sandboxBackendSelected(env, "superserve"),
+  render: (env) => sandboxBackendSelected(env, "render") || env.DEPLOY_PROVIDER === "render",
   "do-managed-agents": (env) => sandboxBackendSelected(env, "do-managed-agents"),
   "porter-deploy": (env) => env.DEPLOY_PROVIDER === "porter",
   "e2b-deploy": (env) => env.DEPLOY_PROVIDER === "e2b",
@@ -85,8 +92,7 @@ const GATE_PREDICATES: Readonly<Record<SecretGate, (env: NodeJS.ProcessEnv) => b
   "linear-oauth": (env) => Boolean(env.LINEAR_OAUTH_CLIENT_ID),
   "email-auth": (env) => env.AUTH_ALLOWED_EMAILS !== undefined,
   "model-anthropic": (env) => env.MODEL_PROVIDER?.trim() === "anthropic",
-  "model-openai": (env) =>
-    env.MODEL_PROVIDER?.trim() === "openai" && !(env.CODEX_AUTH_FILE?.trim() || env.CODEX_AUTH_CREDENTIAL?.trim()),
+  "model-openai": (env) => env.MODEL_PROVIDER?.trim() === "openai" && !env.CODEX_AUTH_CREDENTIAL?.trim(),
   "model-openrouter": (env) => env.MODEL_PROVIDER?.trim() === "openrouter",
 };
 

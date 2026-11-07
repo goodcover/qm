@@ -1,6 +1,7 @@
+import { inTenantOf } from "../tenants/claim.ts";
 import type { SkillPackStore } from "./skill-pack-store.ts";
 import type { SkillPackFetcher } from "./pack-fetcher.ts";
-import { createNoopLeaderLease, type LeaderLease } from "../persistence/leader-lease.ts";
+import type { LeaderLease } from "../persistence/leader-lease.ts";
 import { createSweeper } from "../util/sweeper.ts";
 import { errMessage, reportFailureAs } from "../util/errors.ts";
 
@@ -17,11 +18,11 @@ export interface SkillSyncDeps {
   packs: SkillPackStore;
   fetcher: SkillPackFetcher;
   reconcile: (packId: string) => Promise<unknown>;
-  leaderLease?: LeaderLease;
+  leaderLease: LeaderLease;
 }
 
 export function createSkillSyncEngine(deps: SkillSyncDeps): SkillSyncEngine {
-  const leaderLease = deps.leaderLease ?? createNoopLeaderLease();
+  const leaderLease = deps.leaderLease;
 
   async function syncOne(packId: string): Promise<void> {
     const pack = await deps.packs.get(packId);
@@ -40,9 +41,9 @@ export function createSkillSyncEngine(deps: SkillSyncDeps): SkillSyncEngine {
   }
 
   async function syncAll(): Promise<void> {
-    for (const pack of await deps.packs.list()) {
+    for (const pack of await deps.packs.acrossTenants()) {
       try {
-        await syncOne(pack.id);
+        await inTenantOf(pack.tenantId, () => syncOne(pack.id));
       } catch (e) {
         console.error("%s", `[skill-sync] pack ${pack.id} failed:`, errMessage(e));
       }

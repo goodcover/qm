@@ -1,36 +1,39 @@
 import "./support/auto-fake-sprites.ts";
 import test from "node:test";
+import pg from "pg";
 import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import { createServer } from "../src/api/server.ts";
-import { buildApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import { testConfig } from "./support/test-config.ts";
 import { mintSignedPayload } from "../src/auth/signed-token.ts";
 import { signRequest } from "../src/auth/source-auth.ts";
-import { createMemoryReplayDedupe } from "../src/auth/replay-dedupe.ts";
 import { trustedPrincipal } from "../plugins/portal/src/trusted-entry.ts";
 import { provisionTrustedAdmin } from "../plugins/portal/src/trusted-admin.ts";
+import { withTenant } from "../src/tenants/context.ts";
+import { createPostgresReplayDedupe } from "../src/auth/replay-dedupe.ts";
+import { testDatabaseUrl } from "./support/test-database.ts";
 
 const signingSecret = "core-test-secret".repeat(3);
 const identitySecret = "portal-test-secret".repeat(3);
 const issuer = "https://identity.example.test";
+const TENANT = "3f1c7a52-9d4e-4b8a-a6f0-2c5e8d1b7a93";
 function start(enabled = true) {
-  const built = buildApp(
-    testConfig({
-      dataDir: mkdtempSync(join(tmpdir(), "trusted-admin-")),
-      orgId: "default-org",
-      ...(enabled ? { trustedOidcAdminIssuer: issuer } : {}),
-    }),
-  );
+  const config = testConfig({
+    dataDir: mkdtempSync(join(tmpdir(), "trusted-admin-")),
+    orgId: "default-org",
+    ...(enabled ? { trustedOidcAdminIssuer: issuer } : {}),
+  });
+  const built = buildApp(config);
   const server = createServer(built.app, {
     signingSecret,
     capabilitySecret: "capability-secret".repeat(3),
     portalIdentitySecret: identitySecret,
     requireSignedPortalIdentity: true,
-    replayDedupe: { ...createMemoryReplayDedupe(), durable: true },
+    replayDedupe: createPostgresReplayDedupe(testDatabaseUrl()),
     admin: built.admin,
     identity: built.identity,
     auditLog: built.auditLog,
@@ -38,6 +41,7 @@ function start(enabled = true) {
   server.listen(0);
   return {
     built,
+    databaseUrl: config.databaseUrl!,
     base: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
     close: () => new Promise<void>((resolve) => server.close(() => resolve())),
   };
@@ -99,6 +103,7 @@ test("provisioning rejects forged, unrelated, expired, impersonated, and replaye
     { subject: "\ud800" },
     { imp: "operator" },
     { jti: "" },
+    { tenant: TENANT },
   ])
     assert.ok((await send(s.base, claims(invalid))).status >= 400, JSON.stringify(invalid));
   assert.equal((await send(s.base, claims(), signingSecret)).status, 403);
@@ -111,6 +116,22 @@ test("provisioning rejects forged, unrelated, expired, impersonated, and replaye
   const payload = claims();
   assert.equal((await send(s.base, payload)).status, 200);
   assert.equal((await send(s.base, payload)).status, 409);
+});
+
+test("provisioning from a bound portal carries its tenant to core", async (t) => {
+  const s = start();
+  t.after(s.close);
+  const owner = new pg.Client({ connectionString: s.databaseUrl });
+  await owner.connect();
+  try {
+    await owner.query(`INSERT INTO tenants(id, settings) VALUES ($1, '{"orgId":"default-org"}')`, [TENANT]);
+  } finally {
+    await owner.end();
+  }
+  const config = { core: s.base, signingSecret, identitySecret, org: "default-org", issuer };
+  await withTenant(TENANT, () => provisionTrustedAdmin(config, "founder-8"));
+  const principal = { id: trustedPrincipal(issuer, "founder-8"), type: "internal" as const };
+  assert.equal((await withTenant(TENANT, () => s.built.admin.adminStatusOf(principal))).isAdmin, true);
 });
 
 test("provisioning needs core opt-in and never reactivates a deactivated founder", async (t) => {

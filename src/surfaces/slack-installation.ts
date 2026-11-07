@@ -1,5 +1,7 @@
 import type { DurableMap } from "../persistence/durable-map.ts";
+import { tenantOrgId } from "../config.ts";
 import { decryptSecret, deriveConnectorKey, encryptSecret } from "../connectors/connector-client-store.ts";
+import { SLACK_AUTH_ERRORS } from "../slack/payloads.ts";
 
 interface ActiveSlackInstallation {
   serviceBlocked?: boolean;
@@ -54,6 +56,7 @@ interface SlackInstallationStatus {
 
 export interface SlackInstallationStore {
   get(): Promise<SlackInstallation | null>;
+  tenantIds(): Promise<string[]>;
   status(): Promise<SlackInstallationStatus>;
   set(input: {
     botToken: string;
@@ -79,10 +82,11 @@ export interface SlackInstallationStore {
 }
 
 export function createSlackInstallationStore(
-  orgId: string,
+  fallbackOrgId: string,
   map: DurableMap<StoredSlackInstallation>,
   keyMaterial: Buffer | string,
 ): SlackInstallationStore {
+  const orgId = () => tenantOrgId(fallbackOrgId);
   const key = deriveConnectorKey(keyMaterial, "slack-installation");
   const publicStatus = (record: StoredSlackInstallation | null): SlackInstallationStatus =>
     record && !record.disabled
@@ -97,8 +101,11 @@ export function createSlackInstallationStore(
         }
       : { configured: false, managed: record !== null };
   return {
+    async tenantIds() {
+      return [...new Set((await map.acrossTenants()).map((entry) => entry.tenantId))];
+    },
     async get() {
-      const record = await map.get(orgId);
+      const record = await map.get(orgId());
       if (!record || record.disabled) return null;
       return {
         botToken: decryptSecret(record.botTokenEnc, key),
@@ -114,13 +121,12 @@ export function createSlackInstallationStore(
       };
     },
     async status() {
-      return publicStatus(await map.get(orgId));
+      return publicStatus(await map.get(orgId()));
     },
     async set(input) {
-      if (!map.update) throw new Error("Atomic installation updates are required");
       const updatedAt = Date.now();
       const record: StoredSlackInstallation = {
-        orgId,
+        orgId: orgId(),
         disabled: false,
         serviceBlocked: true,
         botTokenEnc: encryptSecret(input.botToken, key),
@@ -133,8 +139,8 @@ export function createSlackInstallationStore(
         updatedBy: input.updatedBy,
         version: `${updatedAt}:${crypto.randomUUID()}`,
       };
-      await map.putIfAbsent(orgId, record);
-      const stored = await map.update(orgId, (current) => ({
+      await map.putIfAbsent(orgId(), record);
+      const stored = await map.update(orgId(), (current) => ({
         ...record,
         ...(current.installedAt !== undefined ? { installedAt: current.installedAt } : {}),
       }));
@@ -142,16 +148,15 @@ export function createSlackInstallationStore(
       return publicStatus(stored);
     },
     async setManaged(input) {
-      if (!map.update) throw new Error("Atomic installation updates are required");
-      await map.putIfAbsent(orgId, {
-        orgId,
+      await map.putIfAbsent(orgId(), {
+        orgId: orgId(),
         disabled: true,
         updatedAt: 0,
         updatedBy: "slack-service",
         version: "initial",
       });
       let accepted = false;
-      await map.update(orgId, (record) => {
+      await map.update(orgId(), (record) => {
         if (record.serviceBlocked || (!record.disabled && !record.installId)) return record;
         if (!record.disabled && record.installId === input.installId) {
           accepted =
@@ -162,7 +167,7 @@ export function createSlackInstallationStore(
           return record;
         accepted = true;
         return {
-          orgId,
+          orgId: orgId(),
           disabled: false,
           botTokenEnc: encryptSecret(input.botToken, key),
           appId: input.appId,
@@ -178,9 +183,8 @@ export function createSlackInstallationStore(
       return accepted;
     },
     async enableManaged() {
-      if (!map.update) throw new Error("Atomic installation updates are required");
       let accepted = true;
-      await map.update(orgId, (record) => {
+      await map.update(orgId(), (record) => {
         if (!record.disabled && !record.installId) {
           accepted = false;
           return record;
@@ -190,13 +194,12 @@ export function createSlackInstallationStore(
       return accepted;
     },
     async disableManaged(installId) {
-      if (!map.update) throw new Error("Atomic installation updates are required");
       let disabled = false;
-      await map.update(orgId, (record) => {
+      await map.update(orgId(), (record) => {
         if (record.disabled || record.installId !== installId) return record;
         disabled = true;
         return {
-          orgId,
+          orgId: orgId(),
           disabled: true,
           installedAt: record.installedAt,
           updatedAt: Date.now(),
@@ -207,21 +210,19 @@ export function createSlackInstallationStore(
       return disabled;
     },
     async delete(updatedBy) {
-      if (map.update) {
-        const record = await map.update(orgId, (current) => ({
-          orgId,
-          disabled: true,
-          serviceBlocked: current.serviceBlocked || (!current.disabled && !current.installId),
-          ...(current.installedAt ? { installedAt: current.installedAt } : {}),
-          updatedAt: Date.now(),
-          updatedBy,
-          version: crypto.randomUUID(),
-        }));
-        if (record) return;
-      }
+      const record = await map.update(orgId(), (current) => ({
+        orgId: orgId(),
+        disabled: true,
+        serviceBlocked: current.serviceBlocked || (!current.disabled && !current.installId),
+        ...(current.installedAt ? { installedAt: current.installedAt } : {}),
+        updatedAt: Date.now(),
+        updatedBy,
+        version: crypto.randomUUID(),
+      }));
+      if (record) return;
       const updatedAt = Date.now();
-      await map.put(orgId, {
-        orgId,
+      await map.put(orgId(), {
+        orgId: orgId(),
         disabled: true,
         updatedAt,
         updatedBy,
@@ -312,7 +313,7 @@ export async function validateSlackInstallation(
     }
     const payload = (await response.json()) as SlackValidationResponse;
     if (!response.ok || !payload.ok) {
-      if (["invalid_auth", "token_revoked", "not_authed", "account_inactive"].includes(payload.error ?? ""))
+      if (SLACK_AUTH_ERRORS.has(payload.error ?? ""))
         throw new Error(
           `${label} was rejected by Slack. Copy a current token from the same installed Slack app and try again.`,
         );

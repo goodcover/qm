@@ -1,11 +1,14 @@
+import type { Claimed } from "../tenants/claim.ts";
+import { withTenant } from "../tenants/context.ts";
 import { randomUUID } from "node:crypto";
-import type { Monitor } from "../types.ts";
-import { createMemoryMap, type DurableMap } from "../persistence/durable-map.ts";
+import type { Monitor } from "../triggers/types.ts";
+import type { DurableMap } from "../persistence/durable-map.ts";
 import {
   assertNoEscalation,
   buildTriggerBase,
   setTriggerEnabled,
   type CreateTriggerInput,
+  ownedBy,
 } from "../triggers/trigger-store.ts";
 
 interface CreateMonitorInput extends CreateTriggerInput {
@@ -23,7 +26,9 @@ export interface MonitorStore {
   create(input: CreateMonitorInput): Promise<Monitor>;
   get(id: string): Promise<Monitor | null>;
   list(): Promise<Monitor[]>;
+  ownedBy(scopeId: string): Promise<Monitor[]>;
   enabled(): Promise<Monitor[]>;
+  enabledAcrossTenants(): Promise<Array<Claimed<Monitor>>>;
   setEnabled(id: string, enabled: boolean): Promise<void>;
   delete(id: string): Promise<void>;
   deleteDefunct(now: number): Promise<number>;
@@ -42,7 +47,7 @@ function defunctBefore(cutoff: number): (m: Monitor) => boolean {
   return (m) => !m.enabled && lastActivityAt(m) <= cutoff;
 }
 
-export function createMonitorStore(backing: DurableMap<Monitor> = createMemoryMap<Monitor>()): MonitorStore {
+export function createMonitorStore(backing: DurableMap<Monitor>): MonitorStore {
   return {
     async create(input) {
       assertNoEscalation(input);
@@ -62,8 +67,14 @@ export function createMonitorStore(backing: DurableMap<Monitor> = createMemoryMa
     },
     get: (id) => backing.get(id),
     list: () => backing.all(),
+    ownedBy: (scopeId) => ownedBy(backing, scopeId),
     async enabled() {
       return (await backing.all()).filter((m) => m.enabled);
+    },
+    async enabledAcrossTenants() {
+      return (await backing.acrossTenants())
+        .filter(({ value }) => value.enabled)
+        .map(({ tenantId, value }) => ({ ...value, tenantId }));
     },
     setEnabled(id, enabled) {
       return setTriggerEnabled(backing, id, enabled);
@@ -72,13 +83,8 @@ export function createMonitorStore(backing: DurableMap<Monitor> = createMemoryMa
     async deleteDefunct(now) {
       const isDefunct = defunctBefore(now - DEFUNCT_MONITOR_GRACE_MS);
       let deleted = 0;
-      for (const m of (await backing.all()).filter(isDefunct)) {
-        if (backing.deleteIf) {
-          if (await backing.deleteIf(m.id, isDefunct)) deleted++;
-        } else {
-          await backing.delete(m.id);
-          deleted++;
-        }
+      for (const { tenantId, id, value } of await backing.acrossTenants()) {
+        if (isDefunct(value) && (await withTenant(tenantId, () => backing.deleteIf(id, isDefunct)))) deleted++;
       }
       return deleted;
     },

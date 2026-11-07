@@ -46,7 +46,7 @@ import {
   secretDestinations,
   secretsForService,
 } from "../secrets.ts";
-import { manifestRef } from "../manifest.ts";
+import { isPlaceholderRef, manifestRef } from "../manifest.ts";
 import { CONNECTIVITY_CODES, CoreUnreachableError, type DeploymentLayerTransport } from "../deployment-layer.ts";
 
 const flyServiceCtx = (config: QmConfig, appPrefix: string, deployAppPrefix: string): ServiceCtx => {
@@ -56,7 +56,6 @@ const flyServiceCtx = (config: QmConfig, appPrefix: string, deployAppPrefix: str
     orgId: config.orgId,
     deployAppPrefix,
     publicUrl: config.publicUrl,
-    hasPortal: config.services.includes("portal"),
     hasAuth: config.services.includes("auth"),
     ...(config.env.auth?.AUTH_ALLOWED_EMAIL_DOMAIN
       ? { authAllowedEmailDomain: config.env.auth.AUTH_ALLOWED_EMAIL_DOMAIN }
@@ -190,7 +189,6 @@ export interface FlyUpOpts {
 
 interface FlyCtx {
   config: QmConfig;
-  templateRoot: string;
   generatedRoot: string;
   commandCwd: string;
   sourceRoot?: string;
@@ -335,8 +333,7 @@ const flyOwnershipMarker = (flyOrg: string, orgId: string, appPrefix: string): s
 
 function deriveToml(ctx: FlyCtx, service: ServiceName): string {
   const spec = serviceDef(service).fly!;
-  const nested = join(ctx.templateRoot, service, "fly.toml");
-  const base = readFileSync(existsSync(nested) ? nested : join(ctx.templateRoot, `${service}.toml`), "utf8");
+  const base = readFileSync(join(flyTemplateRoot(), `${service}.toml`), "utf8");
   const sandboxEnv = service === "core" ? sandboxCoreEnv(ctx.config).env : {};
   const virtualEnv = service === "core" ? virtualServiceEnv(ctx.config.services, ctx.config.env) : {};
   const modelEnv: Record<string, string> =
@@ -429,7 +426,6 @@ export function derivedTomlFor(config: QmConfig, service: ServiceName, repoRoot:
   const deployAppPrefix = config.deployAppPrefix ?? `${appPrefix}-d`;
   const ctx: FlyCtx = {
     config,
-    templateRoot: join(repoRoot, "deploy"),
     generatedRoot: join(repoRoot, "deploy", "stacks", ".generated"),
     commandCwd: repoRoot,
     sourceRoot: repoRoot,
@@ -672,6 +668,24 @@ function ensureFlycast(app: string): void {
   note(`flycast: allocated private v6 for ${app}`);
 }
 
+function ensurePublicIngress(app: string): void {
+  let ips: Array<{ Type?: string }>;
+  try {
+    ips = JSON.parse(fly(["ips", "list", "-a", app, "--json"]) || "[]");
+  } catch {
+    throw new CliError(`fly ips list returned invalid JSON for ${app}`);
+  }
+  const types = new Set(ips.map((ip) => ip.Type));
+  if (!types.has("v6")) {
+    fly(["ips", "allocate-v6", "-a", app]);
+    note(`public ingress: allocated v6 for ${app}`);
+  }
+  if (!types.has("v4") && !types.has("shared_v4")) {
+    fly(["ips", "allocate-v4", "--shared", "-a", app]);
+    note(`public ingress: allocated shared v4 for ${app}`);
+  }
+}
+
 interface FlyImageDetail {
   digest: string;
   immutableReference: string;
@@ -747,7 +761,7 @@ function imageSourceFor(ctx: FlyCtx, opts: FlyUpOpts): ImageSource | undefined {
   return { kind: "manifest" };
 }
 
-const SAFE_AFTER_CORE = new Set<ServiceName>(["web-ui", "admin", "auth"]);
+const SAFE_AFTER_CORE = new Set<ServiceName>(["web-ui", "auth"]);
 
 export function flyDeployPhases(services: ServiceName[]): ServiceName[][] {
   const phases: ServiceName[][] = [];
@@ -790,7 +804,6 @@ function sourceRootFor(configDir: string, explicit?: string): string | undefined
     const root = resolve(explicit);
     return existsSync(join(root, "package.json")) &&
       existsSync(join(root, "src", "index.ts")) &&
-      existsSync(join(root, "deploy", "core", "fly.toml")) &&
       existsSync(join(root, "deploy", "core", "Dockerfile"))
       ? root
       : undefined;
@@ -808,12 +821,11 @@ function sourceRootFor(configDir: string, explicit?: string): string | undefined
     (root) =>
       existsSync(join(root, "package.json")) &&
       existsSync(join(root, "src", "index.ts")) &&
-      existsSync(join(root, "deploy", "core", "fly.toml")) &&
       existsSync(join(root, "deploy", "core", "Dockerfile")),
   );
 }
 
-function packagedFlyTemplateRoot(): string {
+function flyTemplateRoot(): string {
   const source = fileURLToPath(new URL("../../templates/fly", import.meta.url));
   if (existsSync(source)) return source;
   return fileURLToPath(new URL("../../../templates/fly", import.meta.url));
@@ -831,7 +843,6 @@ function buildCtx(config: QmConfig, configDir: string, opts: Pick<FlyUpOpts, "bu
   const deployAppPrefix = config.deployAppPrefix ?? `${appPrefix}-d`;
   return {
     config,
-    templateRoot: sourceRoot ? join(sourceRoot, "deploy") : packagedFlyTemplateRoot(),
     generatedRoot: join(configDir, ".generated", "fly"),
     commandCwd: configDir,
     ...(sourceRoot ? { sourceRoot } : {}),
@@ -854,6 +865,7 @@ async function deployService(
   note(`\n=== deploying ${app} ===`);
   if (service === "core") timing.time(service, "Postgres ensure", () => ensurePostgres(ctx));
   if (spec.flycast) timing.time(service, "Flycast ensure", () => ensureFlycast(app));
+  if (spec.publicIngress) timing.time(service, "public ingress ensure", () => ensurePublicIngress(app));
   const cfgPath = serviceCfgPath(ctx, service);
   const args = ["deploy", "--yes", "-c", cfgPath, ...spec.deployFlags];
   if (imageSource?.kind === "tagged") {
@@ -935,14 +947,13 @@ function pluginTomlContent(
   flyOrg: string,
   orgId: string,
   publicUrl: string,
-  hasPortal: boolean,
   region: string,
   plugin: ResolvedPlugin,
   brand?: BrandEnv,
 ): string {
   const env: Record<string, string> = {
     ...(plugin.coreAccess === false ? {} : { CORE_API_URL: `http://${appPrefix}-core.internal:8080` }),
-    ...orgEnv(plugin.name, orgId, publicUrl, hasPortal, brand),
+    ...orgEnv(plugin.name, orgId, publicUrl, brand),
     PORT: "8080",
     ...plugin.env,
     [FLY_DEPLOYMENT_ID_ENV]: flyDeploymentId(flyOrg, orgId, appPrefix),
@@ -968,7 +979,6 @@ export function derivedPluginTomlFor(config: QmConfig, plugin: ResolvedPlugin): 
     config.flyOrg ?? "",
     config.orgId,
     config.publicUrl,
-    config.services.includes("portal"),
     config.region ?? "",
     plugin,
     brandEnvOf(config),
@@ -985,7 +995,6 @@ function writePluginDerived(ctx: FlyCtx, plugin: ResolvedPlugin): string {
       ctx.flyOrg,
       ctx.orgId,
       ctx.config.publicUrl,
-      ctx.config.services.includes("portal"),
       ctx.region,
       plugin,
       brandEnvOf(ctx.config),
@@ -1506,7 +1515,8 @@ export async function flyDoctor(config: QmConfig, configDir: string, envFile?: s
   if (failures.length) throw new CliError(`doctor failed:\n${failures.map((failure) => `  - ${failure}`).join("\n")}`);
   const localSecrets = localDoctorSecrets(configDir, envFile);
   verifyLocalFlyTokens(config, localSecrets);
-  await doctorCommon(config, localSecrets, { configDir });
+  note("Live credential checks use local values; Fly does not expose stored secret values.");
+  await doctorCommon(config, localSecrets, { configDir, allowMissingValues: true });
 }
 
 export function verifyLocalFlyTokens(config: QmConfig, secrets: ReadonlyMap<string, string>): void {
@@ -1601,7 +1611,7 @@ export async function flyCheckLive(
     if (firstParty.has(workload)) {
       const configured = config.imageOverrides[workload as ServiceName];
       const packaged = configured ? undefined : manifestRef(workload as ServiceName);
-      const expected = configured ?? (packaged?.includes("registry.invalid") ? undefined : packaged);
+      const expected = configured ?? (packaged && isPlaceholderRef(packaged) ? undefined : packaged);
       const expectedDigest = expected?.match(/@(?<digest>sha256:[a-f0-9]{64})$/)?.groups?.["digest"];
       let imageDetails: FlyImageDetail[] = [];
       if (expectedDigest && machines.some((machine) => !machine.config?.image?.includes("@sha256:"))) {
@@ -1649,7 +1659,6 @@ export async function flyCheckLive(
             ctx.flyOrg,
             ctx.orgId,
             config.publicUrl,
-            config.services.includes("portal"),
             ctx.region,
             plugin!,
             brandEnvOf(config),

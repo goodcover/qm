@@ -27,7 +27,7 @@ Do not deploy the example names in these templates directly.
 ## Topology
 
 The public portal is the only Internet-facing service. It authenticates users
-over OIDC and proxies the private Web UI and admin surfaces. Core, Postgres, and
+over OIDC and proxies the private Web UI, including its administrator settings. Core, Postgres, and
 agent computers stay private. The optional Slack surface runs inside core over
 outbound Socket Mode.
 
@@ -40,7 +40,7 @@ The self-hoster supplies an admin address, a verified sender, and a Resend key
 or SMTP credentials; the CLI generates the broker's signing key and the portal's
 client credentials and wires both sides. Core receives the same `RESEND_API_KEY`
 and `AUTH_EMAIL_FROM`, which let admins email invitations to external users from
-the admin Users tab or by chatting with QM; both are optional on core, and
+the Users settings page or by chatting with QM; both are optional on core, and
 without them the invitation is still created and the sign-in link is shared by
 hand. Dropping `"auth"` from `services` hands
 sign-in back to an external identity provider, which then has to register the
@@ -51,7 +51,7 @@ the authenticated admin connector URL returned by `qm outputs`. Secrets are
 encrypted in durable storage and are never committed to a deployment directory.
 The agent advertises only connectors whose admin configuration is enabled.
 
-`deploy/auth/fly.toml` declares an `[http_service]` like every other surface, but the
+`cli/templates/fly/auth.toml` declares an `[http_service]` like every other surface, but the
 CLI always deploys it `--flycast --no-public-ips`; on AWS the ALB assertions refuse to
 attach it to a load balancer. Never `fly launch` that file by hand — a broker with a
 public IP exposes its token endpoint and lets a caller forge the rate-limit client
@@ -60,6 +60,6 @@ address.
 ## Fixtures
 
 [`stacks/`](./stacks/) contains account-neutral contract fixtures. The checked-in
-`deploy/<service>/fly.toml` files are templates from which the CLI derives
+`cli/templates/fly/<service>.toml` files are templates from which the CLI derives
 deployment-specific copies under the ignored `deploy/stacks/.generated/`
 directory.

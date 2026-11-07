@@ -1,5 +1,8 @@
 # Plain OAuth for MCP
 
+Superseded: this records a 0.1.11-era derived image. Its change now lives in
+the source tree, and current releases build from source.
+
 QM supports Plain's authorization-code flow with PKCE and the required
 `openid offline_access` scopes. Authorization and token requests include the
 resource `https://mcp.plain.com/mcp`. Client secrets and user access/refresh

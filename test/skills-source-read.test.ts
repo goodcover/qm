@@ -1,7 +1,7 @@
 import "./support/auto-fake-sprites.ts";
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { buildApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import { testConfig } from "./support/test-config.ts";
 import type { TurnRequest } from "../src/types.ts";
 
@@ -56,7 +56,7 @@ async function fixture(t: TestContext) {
 test("published skill sources and assets read without a sandbox, respecting scope and archive", async (t) => {
   const b = await fixture(t);
   const skill = await b.publish("personal:U1", "PUBLISHED_BODY");
-  assert.match(await b.turn("!sysprompt source-helper"), /\*\*source-helper\*\*/);
+  assert.match(await b.turn("!sysprompt"), /^- source-helper — /m);
   assert.match(
     await b.turn("!skill source-helper"),
     /^\/.+\/\.agent-skills\/\w+\/[a-f0-9]{16}\/source-helper\nPUBLISHED_BODY$/,
@@ -149,7 +149,7 @@ test("a body read avoids sandbox work and a file request materializes that skill
         },
       },
       sandbox: {
-        provision: async (_layers: unknown, options?: { sandboxId?: string }) => {
+        provision: async (_owner: unknown, options?: { sandboxId?: string }) => {
           sandboxIds.push(options?.sandboxId);
           provisions++;
           return { ...handle, id: options?.sandboxId ?? handle.id };
@@ -165,14 +165,14 @@ test("a body read avoids sandbox work and a file request materializes that skill
     input: { origin: { kind: "human" } },
     actor: { id: "U1" },
     session: { id: "s" },
-    resolution: { layers: [{ scopeId: "personal:U1", mountPath: "", mode: "rw" }] },
+    resolution: { writableScopeId: "personal:U1", readOnlyScopeIds: [] },
     scopeId: "personal:U1",
     memoryScopeId: "personal:U1",
     turnSessionDir: "turn/s",
     turnFilesDir: "turn/s/t",
     connectorEnv: {},
     visibleSkillsForTurn: async () => visible,
-    emitGapWork: () => {},
+    perf: { credsMs: 0 },
   } as unknown as TurnSandboxContext);
   const bodyOnly = structuredClone(unrelated);
   bodyOnly.skill!.id = "body-only";
@@ -233,119 +233,78 @@ test("pack assets run from the skills root and stay across turns", async (t) => 
   assert.match(await b.turn("!skill source-helper"), /no skill file/);
 });
 
-test("owner sandbox loads current global skill sources separately and removes revoked trees", async () => {
+test("a scratch computer carries current org skill files at the scoped paths, never room skills, and survives a failed write", async () => {
   const { createTurnSandboxes } = await import("../src/core/orchestrator/sandboxes.ts");
   type TurnSandboxContext = import("../src/core/orchestrator/sandboxes.ts").TurnSandboxContext;
   type SkillResolution = import("../src/skills/skill-store.ts").SkillResolution;
-  const disks = new Map<string, Map<string, string>>();
-  const provisions: string[] = [];
   const skill = (name: string, scopeId: string): SkillResolution =>
     ({
       skill: {
         id: name,
         version: 1,
         scopeId,
-        pack: { packId: "pack", commit: "c", upstreamName: name },
         manifest: { name, body: name, files: [{ path: "scripts/run.py", content: name }] },
       },
       shadowed: [],
     }) as unknown as SkillResolution;
-  let current = [skill("commander", "org:default-org"), skill("room-helper", "channel:room")];
-  let failWrites = false;
-  let failCleanup = false;
-  let reads = 0;
-  let revokeAtRead = 0;
-  let writes = 0;
-  let unrelatedScreens = 0;
-  const turn = createTurnSandboxes({
-    deps: {
-      skills: { recordUse: async () => {} },
-      sandbox: {
-        provision: async (_layers: unknown, options?: { scratch?: unknown }) => {
-          const id = options?.scratch ? "owner" : "shared";
-          provisions.push(id);
-          disks.set(id, new Map());
-          return { id, rootDir: "/workspace" };
-        },
-        listDir: async () => [],
-        removeDir: async (h: { id: string }, path: string) => {
-          if (failCleanup) throw new Error("fixture cleanup failed");
-          const files = disks.get(h.id)!;
-          for (const key of files.keys()) if (key === path || key.startsWith(`${path}/`)) files.delete(key);
-        },
-        readFile: async (h: { id: string }, path: string) => disks.get(h.id)?.get(path) ?? null,
-        writeFile: async (h: { id: string }, path: string, content: string) => {
-          writes++;
-          if (failWrites && path.endsWith("scripts/run.py")) {
-            failCleanup = true;
-            throw new Error("fixture write failed");
-          }
-          disks.get(h.id)!.set(path, content);
+  const bodyOnly = skill("org-notes", "org:default-org");
+  (bodyOnly.skill!.manifest as { files?: unknown }).files = [];
+  const current = [skill("org-helper", "org:default-org"), skill("room-helper", "channel:room"), bodyOnly];
+  const sandboxes = (failScratchWrites: boolean) => {
+    const disks = new Map<string, Map<string, string>>();
+    const errors: unknown[] = [];
+    let scratchCount = 0;
+    const turn = createTurnSandboxes({
+      deps: {
+        skills: { recordUse: async () => {} },
+        errors: { record: (...args: unknown[]) => errors.push(args) },
+        sandbox: {
+          provision: async (_owner: unknown, options?: { scratch?: unknown }) => {
+            const id = options?.scratch ? `scratch-${++scratchCount}` : "shared";
+            disks.set(id, new Map());
+            return { id, rootDir: "/workspace" };
+          },
+          listDir: async () => [],
+          removeDir: async () => {},
+          readFile: async (h: { id: string }, path: string) => disks.get(h.id)?.get(path) ?? null,
+          writeFile: async (h: { id: string }, path: string, content: string) => {
+            if (failScratchWrites && h.id.startsWith("scratch")) throw new Error("fixture write failed");
+            disks.get(h.id)!.set(path, content);
+          },
         },
       },
-    },
-    input: { origin: { kind: "human" } },
-    actor: { id: "U1" },
-    session: { id: "s" },
-    resolution: {
-      layers: [
-        { scopeId: "org:default-org", mountPath: "global", mode: "ro" },
-        { scopeId: "channel:room", mountPath: "", mode: "rw" },
-      ],
-    },
-    scopeId: "channel:room",
-    memoryScopeId: "channel:room",
-    turnSessionDir: "turn/s",
-    turnFilesDir: "turn/s/t",
-    transferId: "t",
-    connectorEnv: {},
-    ownerAuthAvailable: true,
-    visibleSkillsForTurn: async (sources?: readonly string[]) => {
-      if (++reads === revokeAtRead) current = [];
-      const selected = current.filter((entry) => !sources || sources.includes(entry.skill!.scopeId));
-      unrelatedScreens += selected.filter((entry) => entry.skill!.scopeId !== "org:default-org").length;
-      return selected;
-    },
-    emitGapWork: () => {},
-  } as unknown as TurnSandboxContext);
-  const { hashId } = await import("../src/util/crypto.ts");
-  const assetPath = (name: string) => `.agent-skills/s/${hashId([name, "1"], 16)}/${name}/scripts/run.py`;
-  await turn.provisionOwnerAuth!();
-  assert.deepEqual(provisions, ["owner"]);
-  assert.equal(unrelatedScreens, 0);
-  assert.equal(disks.get("owner")!.get(assetPath("commander")), "commander");
-  assert.ok(![...disks.get("owner")!.keys()].some((path) => path.includes("room-helper")));
-  const writesBeforeUsageUpdate = writes;
-  current = current.map((r) => ({ ...r, skill: { ...r.skill!, lastUsedAt: Date.now() } }));
-  await turn.provisionOwnerAuth!();
-  assert.equal(writes, writesBeforeUsageUpdate);
-  assert.equal(unrelatedScreens, 0);
-  const loaded = await turn.useSkill("commander", "SKILL.md");
-  assert.equal(loaded.dir, `/workspace/${assetPath("commander").replace("/scripts/run.py", "")}`);
-  assert.equal(disks.get("shared")!.get(`${loaded.dir!.replace("/workspace/", "")}/scripts/run.py`), "commander");
-  turn.invalidateProvision();
-  const reloaded = await turn.useSkill("commander", "SKILL.md");
-  assert.equal(disks.get("shared")!.get(`${reloaded.dir!.replace("/workspace/", "")}/scripts/run.py`), "commander");
-  current = [];
-  await turn.provisionOwnerAuth!();
-  assert.ok(!disks.get("owner")!.has(assetPath("commander")));
-  current = [skill("commander", "org:default-org")];
-  failWrites = true;
-  await assert.rejects(turn.provisionOwnerAuth!(), (error: unknown) => {
-    assert.ok(error instanceof AggregateError);
-    assert.equal(error.message, "fixture write failed");
-    assert.deepEqual(
-      error.errors.map((failure: Error) => failure.message),
-      ["fixture write failed", "fixture cleanup failed"],
-    );
-    assert.equal(error.cause, error.errors[0]);
-    return true;
-  });
-  failWrites = false;
-  failCleanup = false;
-  current = [skill("new-helper", "org:default-org")];
-  reads = 0;
-  revokeAtRead = 2;
-  await assert.rejects(turn.provisionOwnerAuth!(), /global skills changed/);
-  assert.ok(!disks.get("owner")!.has(assetPath("new-helper")));
+      input: { origin: { kind: "human" } },
+      actor: { id: "U1" },
+      session: { id: "s" },
+      resolution: { writableScopeId: "channel:room", readOnlyScopeIds: [], orgScopeId: "org:default-org" },
+      scopeId: "channel:room",
+      memoryScopeId: "channel:room",
+      turnSessionDir: "turn/s",
+      turnFilesDir: "turn/s/t",
+      transferId: "t",
+      connectorEnv: {},
+      visibleSkillsForTurn: async (sources?: readonly string[]) => {
+        return current.filter((entry) => !sources || sources.includes(entry.skill!.scopeId));
+      },
+    } as unknown as TurnSandboxContext);
+    return { turn, disks, errors };
+  };
+
+  const { turn, disks } = sandboxes(false);
+  const scratch = await turn.provisionScratch();
+  const loaded = await turn.useSkill("org-helper", "SKILL.md");
+  const script = `${loaded.dir!.slice("/workspace/".length)}/scripts/run.py`;
+  assert.equal(disks.get("shared")!.get(script), "org-helper");
+  assert.equal(disks.get(scratch.id)!.get(script), "org-helper");
+  assert.ok(
+    ![...disks.get(scratch.id)!.keys()].some((path) => path.includes("room-helper") || path.includes("org-notes")),
+  );
+
+  const failing = sandboxes(true);
+  const usable = await failing.turn.provisionScratch();
+  assert.equal(await failing.turn.provisionScratch(), usable);
+  assert.equal(failing.errors.length, 1);
+  const [recorded] = failing.errors[0] as [{ code: string; message: string }];
+  assert.equal(recorded.code, "tree_materialize_failed");
+  assert.match(recorded.message, /^org-helper: /);
 });

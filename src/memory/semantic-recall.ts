@@ -1,18 +1,15 @@
-import type { SessionEntry } from "../types.ts";
+import { isAgentReply, isUserItem, type Item } from "../sessions/items.ts";
 import type { MemoryService, MemoryRecallContext } from "./memory-service.ts";
-import { factCandidate, factHash, recentCandidates, type MemoryCandidate } from "./facts.ts";
+import { factCandidate, recentCandidates, type MemoryCandidate } from "./facts.ts";
 import { unitVector, type MemoryEmbedder } from "../model/embeddings.ts";
 import type { MemoryVectorStore } from "./postgres-vector-store.ts";
 import { disclosedMemory } from "./disclosure.ts";
 
-export function memoryRecallQuery(message: string, visibleEntries: readonly SessionEntry[]): string {
-  const recent = visibleEntries
-    .filter((entry) => entry.type === "user" || entry.type === "assistant")
+export function memoryRecallQuery(message: string, visibleItems: readonly Item[]): string {
+  const recent = visibleItems
+    .filter((item) => isUserItem(item) || isAgentReply(item))
     .slice(-4)
-    .map((entry) => {
-      const text = (entry.payload as { text?: unknown } | null)?.text;
-      return typeof text === "string" ? `${entry.type}: ${text.slice(-1000)}` : "";
-    })
+    .map((item) => `${isUserItem(item) ? "user" : "assistant"}: ${(item.text ?? "").slice(-1000)}`)
     .filter(Boolean)
     .join("\n")
     .slice(-2000);
@@ -46,7 +43,7 @@ export function createSemanticMemoryService(
       ...notebook,
       withDisclosure: (access) => view(disclosedMemory(notebook, access)),
       async recall(scope: string, context: MemoryRecallContext = {}): Promise<MemoryCandidate[]> {
-        const facts = (await notebook.facts?.(scope)) ?? [];
+        const facts = context.disclosedFacts?.get(scope) ?? (await notebook.facts?.(scope)) ?? [];
         if (!facts.length) return [];
         try {
           const query = index && context.query?.trim() ? await queryFor(context) : undefined;
@@ -55,12 +52,12 @@ export function createSemanticMemoryService(
             const matches = await index.search({
               scope,
               ...query,
-              facts: facts.map((fact) => ({ id: fact.id, hash: factHash(fact.text), at: fact.createdAt })),
+              ids: facts.map((fact) => fact.id),
               minSimilarity: opts.minSimilarity,
             });
             return matches.flatMap((match) => {
               const fact = byId.get(match.factId);
-              return fact ? [factCandidate(fact, match.score)] : [];
+              return fact?.updatedAt === match.updatedAt ? [factCandidate(fact, match.score)] : [];
             });
           }
           return recentCandidates(facts);

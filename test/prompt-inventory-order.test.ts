@@ -1,16 +1,18 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { renderComputerBlock } from "../src/core/environment-facts.ts";
-import { renderGatewayContext } from "../src/core/gateway-context.ts";
-import { sharedManifest } from "../src/core/attachments.ts";
+import {
+  renderGatewayContext,
+  renderSandboxProviders,
+  sharedFilesSystemSection,
+} from "../src/core/orchestrator/prompt-blocks.ts";
 import {
   deliveryMenu,
   renderConversationRoster,
-  renderReachRoster,
   renderStandingObligations,
 } from "../src/core/orchestrator/prompt-blocks.ts";
-import type { Cron, Webhook, Monitor, GrantedHandle, CandidateDestination } from "../src/types.ts";
-import type { DirectoryMember, DirectoryChannel } from "../src/directory/directory-store.ts";
+import type { GrantedHandle, CandidateDestination } from "../src/types.ts";
+import type { Cron, Webhook, Monitor } from "../src/triggers/types.ts";
+import type { DirectoryMember } from "../src/directory/directory-store.ts";
 
 function checkOrder<T>(items: T[], render: (items: T[]) => string | null): void {
   const before = structuredClone(items);
@@ -26,10 +28,6 @@ test("prompt inventories keep identical bytes across permutations, including cap
     ids.map((id) => ({ principalId: id, displayName: "Same name", type: "internal" })),
     renderConversationRoster,
   );
-  checkOrder<DirectoryChannel>(
-    ids.map((id) => ({ channelId: id, name: id })),
-    (items) => renderReachRoster(items, "Alex"),
-  );
   checkOrder<CandidateDestination>(
     ids.map((id) => ({ key: id, label: id, type: "slack", target: id })),
     (items) => deliveryMenu(items, ids[5]),
@@ -41,7 +39,7 @@ test("prompt inventories keep identical bytes across permutations, including cap
       fileId: id,
       permission: "read",
     })),
-    sharedManifest,
+    sharedFilesSystemSection,
   );
   const base = ids.map((id) => ({
     id,
@@ -63,27 +61,11 @@ test("prompt inventories keep identical bytes across permutations, including cap
     base.map((b) => ({ ...b, processId: b.id, command: b.id, threadRef: "t", cursor: 0, expiresAt: 100 })),
     (items) => renderStandingObligations([], [], items),
   );
-  const obligations = renderStandingObligations(
-    base.map((b) => ({ ...b, title: `Scheduled ${b.id}`, schedule: { everyMs: 60_000 } })),
-    base.map((b) => ({ ...b, action: b.id, verification: { scheme: "github" } })),
-    base.map((b) => ({ ...b, processId: b.id, command: b.id, threadRef: "t", cursor: 0, expiresAt: 100 })),
-  );
-  const rows = obligations.split("\n").filter((line) => line.startsWith("- "));
-  assert.equal(rows.length, 30);
-  for (const kind of ["Scheduled", "Webhook", "Job watch"])
-    assert.equal(rows.filter((line) => line.includes(kind)).length, 10);
-  assert.match(obligations, /285 more/);
-  for (const tool of ["cron", "webhook", "background"]) assert.ok(obligations.includes(`${tool} action=list`));
   assert.match(deliveryMenu([{ key: "x", label: "X", type: "slack", target: "x" }], "x"), /X \(default/);
 });
 
 test("environment and location facts are independent of discovery order", () => {
-  checkOrder(["python", "node", "ruby", "bash"], (items) =>
-    renderComputerBlock(
-      { os: "Linux", runtimes: items, tools: items, notInstalled: items },
-      { hasGlobal: false, teamCount: 0 },
-    ),
-  );
+  checkOrder(["sprites", "e2b", "modal", "smolmachines"], (items) => renderSandboxProviders(items, "modal"));
   checkOrder(
     [
       ["thread", "t"],

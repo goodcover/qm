@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { gatewayActorId } from "../../../model/provider-endpoints.ts";
 import { mintSignedPayload } from "../../../auth/signed-token.ts";
 import { scopeId as makeScopeId } from "../../../types.ts";
 import { adminStatusFromGrants, AdminError } from "../../../admin/admin-service.ts";
@@ -59,9 +60,12 @@ export async function listUsers(ctx: ApiCtx): Promise<void> {
     ...(deps.inviteMailer ? {} : { problem: INVITE_EMAIL_NOT_CONFIGURED }),
     ...(signInUrl ? { signInUrl } : {}),
   };
+  const actorKey = deps.modelGatewayTransport?.actorKey;
   return sendJson(res, 200, {
     scopeId: scope,
-    users,
+    users: actorKey
+      ? users.map((user) => ({ ...user, gatewayActor: gatewayActorId(user.principalId, actorKey) }))
+      : users,
     grants,
     externalUsers,
     inviteEmail,
@@ -121,7 +125,7 @@ async function inviteUser(ctx: ApiCtx, teammate: boolean): Promise<void> {
   if (role !== "member" && role !== "org_admin") return bad("role must be member or org_admin");
   const expiry = normalizeInboundExpiresAt(endOfDayUtc(b.expiresAt));
   if (!expiry.ok) return bad(expiry.message);
-  if (teammate && (!deps.portalUrl || !deps.portalIdentitySecret || !deps.replayDedupe?.durable))
+  if (teammate && (!deps.portalUrl || !deps.portalIdentitySecret || !deps.replayDedupe))
     return sendJson(res, 503, {
       error: "not_configured",
       message: "Invitation sign-in requires a portal and durable token storage.",
@@ -359,18 +363,10 @@ export async function listKeychainStatus(ctx: ApiCtx): Promise<void> {
     pendingAskCount: asks.filter((a) => samePerson(a.ownerId, principalId) && a.status === "pending").length,
   }));
 
-  const tally = (await deps.auditLog?.tallyByResource?.("keychain.materialize")) ?? new Map<string, number>();
-  const useCountByGrant = new Map<string, number>();
-  for (const [resource, n] of tally) {
-    const m = /\(grant ([0-9a-f]+)\)$/.exec(resource);
-    if (m) useCountByGrant.set(m[1]!, (useCountByGrant.get(m[1]!) ?? 0) + n);
-  }
-  const grantsWithUse = grants.map((g) => ({ ...g, useCount: useCountByGrant.get(g.id) ?? 0 }));
-
-  return sendJson(res, 200, { scopeId: scope, people, credentials, grants: grantsWithUse, asks, enabled: true });
+  return sendJson(res, 200, { scopeId: scope, people, credentials, grants, asks, enabled: true });
 }
 
-async function resolveAdminUser(deps: ApiCtx["deps"], requestedPrincipal: string) {
+export async function resolveAdminUser(deps: ApiCtx["deps"], requestedPrincipal: string) {
   const member = await deps.directory?.get(requestedPrincipal);
   return { member, principalId: member?.principalId ?? personKey(requestedPrincipal) };
 }
@@ -386,7 +382,7 @@ export async function getUserDetail(ctx: ApiCtx): Promise<void> {
 
   const [grants, stats, onboarding] = await Promise.all([
     deps.admin?.listGrants() ?? [],
-    deps.sessions?.scopeSessionStats(personal, false, "conversation"),
+    deps.sessions?.scopeConversationCount(personal),
     deps.memory ? deps.memory.read(personal).then(detectOnboardingStatus) : null,
   ]);
   const config = deps.config
@@ -406,7 +402,8 @@ export async function getUserDetail(ctx: ApiCtx): Promise<void> {
     scopeId: personal,
     ...(member?.displayName ? { displayName: member.displayName } : {}),
     admin: adminStatusFromGrants(grants, principalId),
-    stats: { sessions: stats?.total ?? 0 },
+    deactivated: deps.identity?.deactivationSource(principalId) !== undefined,
+    stats: { sessions: stats ?? 0 },
     config,
     onboarding,
   });

@@ -2,10 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { FIRST_PARTY_SECRET_SPECS } from "../cli/src/secrets.ts";
-import { MODEL_PROVIDERS, MODEL_PROVIDER_HARNESSES } from "../cli/src/config.ts";
 import { isInvalidSecret as cliRejectsSecret } from "../cli/src/util.ts";
 import { CORE_SECRET_SPECS, validateCoreSecretEnv } from "../src/deployment/secret-schema.ts";
-import { HARNESS_IDS, defaultModelForProvider } from "../src/model/pi-models.ts";
 
 test("the standalone CLI and core agree on runtime-enforced core secret names", () => {
   const cli = new Set(
@@ -17,7 +15,7 @@ test("the standalone CLI and core agree on runtime-enforced core secret names", 
   assert.deepEqual([...runtime].sort(), [...cli].filter((name) => name !== "PUBLIC_API_URL").sort());
 });
 
-test("background ownership requires strong control credentials only for configured deployments", () => {
+test("a deployment id requires strong control credentials only for configured deployments", () => {
   assert.deepEqual(validateCoreSecretEnv({}), []);
   for (const secret of [undefined, "", " ".repeat(32), "short", "separate-control-secret-value-0000000000\n"]) {
     assert.deepEqual(
@@ -93,10 +91,6 @@ test("an OpenAI base model needs an API key unless a company ChatGPT login serve
     validateCoreSecretEnv({ MODEL_PROVIDER: "openai", CODEX_AUTH_CREDENTIAL: "cred-1" } as NodeJS.ProcessEnv),
     [],
   );
-  assert.deepEqual(
-    validateCoreSecretEnv({ MODEL_PROVIDER: "openai", CODEX_AUTH_FILE: "/tmp/auth.json" } as NodeJS.ProcessEnv),
-    [],
-  );
 });
 
 test("each core secret is named by exactly one spec, so boot failures never repeat a name", () => {
@@ -108,16 +102,6 @@ test("each core secret is named by exactly one spec, so boot failures never repe
   );
 });
 
-test("the CLI's provider/harness table matches what the core model registry can actually serve", () => {
-  for (const provider of MODEL_PROVIDERS) {
-    assert.deepEqual(
-      HARNESS_IDS.filter((harness) => defaultModelForProvider(harness, provider) !== undefined).sort(),
-      [...MODEL_PROVIDER_HARNESSES[provider]].sort(),
-      `MODEL_PROVIDER_HARNESSES.${provider} has drifted from the registry`,
-    );
-  }
-});
-
 test("production rejects weak encryption key material for managed credentials", () => {
   const strong = "x".repeat(32);
   const env = {
@@ -127,6 +111,7 @@ test("production rejects weak encryption key material for managed credentials", 
     CORE_SIGNING_SECRET: strong,
     PORTAL_IDENTITY_SECRET: "identity",
     SKILL_SIGNING_SECRET: strong,
+    DATABASE_URL: "postgres://qm@localhost/qm",
   } as NodeJS.ProcessEnv;
   assert.deepEqual(validateCoreSecretEnv(env), []);
   assert.deepEqual(validateCoreSecretEnv({ ...env, CONNECTOR_SECRET_KEY: "short" }), ["CONNECTOR_SECRET_KEY"]);

@@ -9,11 +9,11 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { AddressInfo } from "node:net";
 import type { Server } from "node:http";
-import { buildApp, type BuiltApp } from "../src/wiring.ts";
+import { type BuiltApp } from "../src/wiring.ts";
+import { buildApp } from "./support/build-app.ts";
 import { createServer } from "../src/api/server.ts";
 import { createSecretDropStore, SECRET_DROP_TTL_MS } from "../src/credentials/secret-drop.ts";
 import { fireDropResolution, type DropResolution } from "../src/triggers/keychain-ask.ts";
-import { createMemoryMap } from "../src/persistence/durable-map.ts";
 import { createDeliveryStore } from "../src/delivery/delivery-store.ts";
 import { createIdempotencyStore, type IdempotencyRecord } from "../src/idempotency/idempotency-store.ts";
 import { createIdentityService } from "../src/identity/identity-service.ts";
@@ -28,6 +28,8 @@ import { signedRequestHeaders } from "../plugins/chassis/src/source-auth-sign.ts
 import { scopeId, type TurnRequest, type TurnResult } from "../src/types.ts";
 import { testConfig } from "./support/test-config.ts";
 import { materializeGrant } from "./support/materialize-grant.ts";
+import { testMap, testDatabaseUrl } from "./support/test-database.ts";
+import { createPostgresReplayDedupe } from "../src/auth/replay-dedupe.ts";
 
 const SECRET = "secret-drop-test-secret".repeat(3);
 const execFileAsync = promisify(execFile);
@@ -35,7 +37,7 @@ const execFileAsync = promisify(execFile);
 describe("SecretDropStore", () => {
   it("mint → peek (non-consuming) → redeem (single-use)", async () => {
     const t = 1_000_000;
-    const store = createSecretDropStore(createMemoryMap(), { now: () => t });
+    const store = createSecretDropStore(testMap(), { now: () => t });
     const { dropId } = await store.mint({
       ownerId: "U_A",
       service: "stripe",
@@ -56,7 +58,7 @@ describe("SecretDropStore", () => {
 
   it("expires after the TTL, on both peek and redeem", async () => {
     let t = 1_000_000;
-    const store = createSecretDropStore(createMemoryMap(), { now: () => t });
+    const store = createSecretDropStore(testMap(), { now: () => t });
     const { dropId } = await store.mint({ ownerId: "U_A", service: "x", purpose: "p", requestedBy: "U_A" });
     t += SECRET_DROP_TTL_MS + 1;
     assert.deepEqual(await store.peek(dropId), { ok: false, reason: "expired" });
@@ -65,7 +67,7 @@ describe("SecretDropStore", () => {
 
   it("siblings: pending drops for the same conversation only — other threads, expired links, and same-service twins excluded", async () => {
     let t = 1_000_000;
-    const store = createSecretDropStore(createMemoryMap(), { now: () => t });
+    const store = createSecretDropStore(testMap(), { now: () => t });
     const base = {
       ownerId: "U_A",
       purpose: "p",
@@ -95,8 +97,8 @@ describe("SecretDropStore", () => {
 describe("fireDropResolution", () => {
   const depsWith = (run: (req: TurnRequest) => Promise<TurnResult>) => ({
     deliveries: createDeliveryStore(),
-    idempotency: createIdempotencyStore(createMemoryMap<IdempotencyRecord>()),
-    identity: createIdentityService(createMemoryMap()),
+    idempotency: createIdempotencyStore(testMap<IdempotencyRecord>()),
+    identity: createIdentityService(testMap(), { externalMembers: testMap() }),
     run,
   });
 
@@ -150,8 +152,8 @@ describe("fireDropResolution", () => {
     const deliveries = createDeliveryStore();
     const deps = {
       deliveries,
-      idempotency: createIdempotencyStore(createMemoryMap<IdempotencyRecord>()),
-      identity: createIdentityService(createMemoryMap()),
+      idempotency: createIdempotencyStore(testMap<IdempotencyRecord>()),
+      identity: createIdentityService(testMap(), { externalMembers: testMap() }),
       run: async () => ({ status: "pending_approval" }) as TurnResult,
     };
     const destination = { type: "slack", target: "C1", audienceScopeId: scopeId("channel", "C1") } as const;
@@ -242,11 +244,11 @@ describe("/v1/keychain/drops — mint, form, redeem", async () => {
       ],
     );
     server = createServer(built.app, {
+      replayDedupe: createPostgresReplayDedupe(testDatabaseUrl()),
       signingSecret: SECRET,
       keychain: built.keychain,
       secretDrops: built.secretDrops,
       deliveries: built.deliveries,
-      workspace: built.workspace,
       auditLog: built.auditLog,
       runs: built.runs,
       signals: built.signals,
@@ -282,8 +284,8 @@ describe("/v1/keychain/drops — mint, form, redeem", async () => {
     });
     await built.signals.send(run.id, {
       kind: "steer",
-      text: "U_SPEAKER: I can provide my linear key",
-      request: { actor: { externalId: "U_SPEAKER" } } as any,
+      text: "I can provide my linear key",
+      request: { actor: { externalId: "U_SPEAKER" }, origin: { kind: "human" } } as any,
     });
     const cap = await capFor("U_A", scopeId("channel", "C1"), { threadRef: THREAD });
 
@@ -658,11 +660,11 @@ describe("/v1/keychain/drops — sibling-aware resume", () => {
     const fires: DropResolution[] = [];
     let fired: (() => void) | undefined;
     const server = createServer(built.app, {
+      replayDedupe: createPostgresReplayDedupe(testDatabaseUrl()),
       signingSecret: SECRET,
       keychain: built.keychain,
       secretDrops: built.secretDrops,
       deliveries: built.deliveries,
-      workspace: built.workspace,
       auditLog: built.auditLog,
       fireDropResolution: async (drop) => {
         fires.push(drop);

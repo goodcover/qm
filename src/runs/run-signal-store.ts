@@ -1,6 +1,4 @@
-import { randomUUID } from "node:crypto";
-import type { OrchestratorInput } from "../core/orchestrator/types.ts";
-import type { ClientToolResult, TurnRequest } from "../types.ts";
+import type { ClientToolResult, StopScope, TurnRequest } from "../types.ts";
 import { swallowAs } from "../util/errors.ts";
 
 export type RunSignalKind = "abort" | "steer" | "client_result";
@@ -11,91 +9,24 @@ export interface RunSignal {
   ts?: string;
   request?: TurnRequest;
   dedupeKey?: string;
-  sessionRequest?: OrchestratorInput;
   queuedRunId?: string;
   callId?: string;
   result?: ClientToolResult;
   reason?: string;
+  scope?: StopScope;
 }
 
 export interface RunSignalStore {
   send(runId: string, signal: RunSignal): Promise<boolean>;
-  hasDedupeKey(dedupeKey: string): Promise<boolean>;
+  runForDedupeKey(dedupeKey: string): Promise<string | undefined>;
   pending(runId: string): Promise<Array<{ id: string; signal: RunSignal }>>;
   acknowledge(runId: string, id: string): Promise<void>;
   takePending(runId: string): Promise<RunSignal[]>;
   steerAuthors(runId: string): Promise<string[]>;
-  pendingRunIds(): Promise<string[]>;
+  pendingRuns(): Promise<Array<{ runId: string; tenantId?: string }>>;
   prune(olderThanMs: number): Promise<void>;
   onSignal(runId: string, cb: () => void): () => void;
   close?(): Promise<void>;
-}
-
-const MAX_MEMORY_DEDUPE_KEYS = 10_000;
-
-export function createMemoryRunSignalStore(): RunSignalStore {
-  const pending = new Map<string, RunSignal[]>();
-  const receipts = new WeakMap<RunSignal, string>();
-  const authors = new Map<string, Array<{ at: number; author: string }>>();
-  const listeners = new Map<string, Set<() => void>>();
-  const dedupeKeys = new Set<string>();
-  return {
-    async send(runId, signal) {
-      if (signal.dedupeKey) {
-        if (dedupeKeys.has(signal.dedupeKey)) return false;
-        dedupeKeys.add(signal.dedupeKey);
-        if (dedupeKeys.size > MAX_MEMORY_DEDUPE_KEYS) dedupeKeys.delete(dedupeKeys.values().next().value!);
-      }
-      const list = pending.get(runId) ?? [];
-      signal = { ...signal };
-      receipts.set(signal, randomUUID());
-      list.push(signal);
-      pending.set(runId, list);
-      const author = signal.kind === "steer" ? signal.request?.actor?.externalId : undefined;
-      if (author) authors.set(runId, [...(authors.get(runId) ?? []), { at: Date.now(), author }]);
-      for (const cb of listeners.get(runId) ?? []) cb();
-      return true;
-    },
-    async hasDedupeKey(dedupeKey) {
-      return dedupeKeys.has(dedupeKey);
-    },
-    async steerAuthors(runId) {
-      return [...new Set((authors.get(runId) ?? []).map((a) => a.author))];
-    },
-    async pending(runId) {
-      return (pending.get(runId) ?? []).map((signal) => ({ id: receipts.get(signal)!, signal }));
-    },
-    async acknowledge(runId, id) {
-      const remaining = (pending.get(runId) ?? []).filter((signal) => receipts.get(signal) !== id);
-      if (remaining.length) pending.set(runId, remaining);
-      else pending.delete(runId);
-    },
-    async takePending(runId) {
-      const list = pending.get(runId) ?? [];
-      pending.delete(runId);
-      return list;
-    },
-    async pendingRunIds() {
-      return [...pending.keys()];
-    },
-    async prune(olderThanMs) {
-      const cutoff = Date.now() - olderThanMs;
-      for (const [runId, list] of authors) {
-        const kept = list.filter((a) => a.at >= cutoff);
-        if (kept.length) authors.set(runId, kept);
-        else authors.delete(runId);
-      }
-    },
-    onSignal(runId, cb) {
-      const set = listeners.get(runId) ?? new Set();
-      set.add(cb);
-      listeners.set(runId, set);
-      return () => {
-        set.delete(cb);
-        if (set.size === 0) listeners.delete(runId);
-      };
-    },
-  };
 }
 
 export function waitForClientResult(
@@ -158,7 +89,7 @@ const SIGNAL_POLL_MS = 5_000;
 
 export interface SignalPollHandlers {
   onSteer(text: string, ts?: string, request?: TurnRequest, acknowledge?: () => Promise<void>): Promise<void | boolean>;
-  onAbort(reason?: string): Promise<void>;
+  onAbort(stop: RunSignal): Promise<void>;
 }
 
 export function startSignalPoll(
@@ -166,41 +97,52 @@ export function startSignalPoll(
   runId: string,
   handlers: SignalPollHandlers,
   opts?: { intervalMs?: number; onError?: (e: unknown) => void; drainOnStop?: boolean },
-): (canStop?: () => boolean) => Promise<boolean> {
+): () => Promise<void> {
   const declined = new Set<string>();
   let draining = false;
   let redrain = false;
   let accepting = true;
   let inFlight: Promise<void> = Promise.resolve();
+  let stopDelivered = false;
+  let stopCheck: Promise<void> = Promise.resolve();
+  const deliverStop = (known?: Awaited<ReturnType<RunSignalStore["pending"]>>): Promise<void> => {
+    const check = async (): Promise<void> => {
+      if (stopDelivered) return;
+      const stop = (known ?? (await signals.pending(runId))).find(({ signal }) => signal.kind === "abort");
+      if (stop?.signal.kind !== "abort") return;
+      await handlers.onAbort(stop.signal);
+      stopDelivered = true;
+    };
+    return (stopCheck = stopCheck.then(check, check));
+  };
   const drain = (forced = false): void => {
     if (!accepting && !forced) return;
     if (draining) {
       redrain = true;
+      void deliverStop().catch((e: unknown) => opts?.onError?.(e));
       return;
     }
     draining = true;
+    stopDelivered = false;
     inFlight = (async () => {
-      let abortDelivered = false;
-      for (const { id, signal: s } of await signals.pending(runId)) {
-        if (s.kind === "client_result") continue;
+      const pending = await signals.pending(runId);
+      await deliverStop(pending).catch((e: unknown) => opts?.onError?.(e));
+      let tookOne = false;
+      for (const { id, signal: s } of pending) {
+        if (s.kind === "abort" || s.kind === "client_result" || declined.has(id)) continue;
         try {
-          if (s.kind === "abort") {
-            if (!abortDelivered) {
-              await handlers.onAbort(s.reason);
-              abortDelivered = true;
+          if (tookOne) await deliverStop();
+          tookOne = true;
+          if (s.text || s.request?.attachments?.length) {
+            const delivered = await handlers.onSteer(s.text ?? "", s.ts, s.request, () =>
+              signals.acknowledge(runId, id),
+            );
+            if (delivered === false) {
+              declined.add(id);
+              continue;
             }
-          } else if (!declined.has(id)) {
-            if (s.text || s.request?.attachments?.length) {
-              const delivered = await handlers.onSteer(s.text ?? "", s.ts, s.request, () =>
-                signals.acknowledge(runId, id),
-              );
-              if (delivered === false) {
-                declined.add(id);
-                continue;
-              }
-            }
-            await signals.acknowledge(runId, id);
           }
+          await signals.acknowledge(runId, id);
         } catch (e) {
           opts?.onError?.(e);
         }
@@ -218,28 +160,15 @@ export function startSignalPoll(
   const unsubscribe = signals.onSignal(runId, drain);
   const timer = setInterval(drain, opts?.intervalMs ?? SIGNAL_POLL_MS);
   timer.unref?.();
-  const waitForDrain = async () => {
+  return async () => {
+    accepting = false;
+    clearInterval(timer);
+    unsubscribe();
+    if (opts?.drainOnStop) drain(true);
     for (;;) {
       const current = inFlight;
       await current;
       if (!draining && inFlight === current) break;
     }
-  };
-  return async (canStop) => {
-    if (canStop) {
-      for (;;) {
-        const current = inFlight;
-        await current;
-        if (draining || inFlight !== current) continue;
-        if (!canStop()) return false;
-        break;
-      }
-    }
-    accepting = false;
-    clearInterval(timer);
-    unsubscribe();
-    if (opts?.drainOnStop) drain(true);
-    await waitForDrain();
-    return true;
   };
 }

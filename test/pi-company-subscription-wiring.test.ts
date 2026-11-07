@@ -2,23 +2,24 @@ import "./support/auto-fake-sprites.ts";
 import assert from "node:assert/strict";
 import { mock, test } from "node:test";
 import { rm } from "node:fs/promises";
-import * as pi from "../src/harness/pi-harness.ts";
-import type { Harness } from "../src/harness/harness.ts";
+import * as agentRun from "../src/agent/agent-run.ts";
+import type { Agent } from "../src/agent/agent.ts";
 import { hashId } from "../src/util/crypto.ts";
 import { testConfig } from "./support/test-config.ts";
 
-let harness: Harness;
-mock.module("../src/harness/pi-harness.ts", {
+let agent: Agent;
+mock.module("../src/agent/agent-run.ts", {
   namedExports: {
-    ...pi,
-    createPiHarness: (options: pi.PiHarnessOptions) => {
-      harness = pi.createPiHarness(options);
-      return harness;
+    ...agentRun,
+    createAgent: (options: agentRun.AgentOptions) => {
+      agent = agentRun.createAgent(options);
+      return agent;
     },
   },
 });
 
 const { buildApp } = await import("../src/wiring.ts");
+const { stopAtEnd } = await import("./support/build-app.ts");
 const ownerId = "subscription-owner";
 const service = "qm-default-chatgpt";
 const credentialId = hashId([ownerId, service, "file"]);
@@ -26,15 +27,14 @@ const accountId = "subscription-account";
 const token = (exp: number) =>
   `e30.${Buffer.from(JSON.stringify({ exp, "https://api.openai.com/auth": { chatgpt_account_id: accountId } })).toString("base64url")}.test`;
 
-for (const modelId of ["gpt-5.6-sol", "gpt-6.1-sol", "codex/gpt-6.1-sol"]) {
-  test(`company wiring reuses the existing file login through Pi for ${modelId}`, async (t) => {
+for (const modelId of ["gpt-5.6-sol"]) {
+  test(`company wiring reuses the existing file login for ${modelId}`, async (t) => {
     const config = testConfig({
-      harness: "pi",
       modelId,
       codexAuthCredential: credentialId,
       openaiApiKey: "synthetic-metered-key",
     });
-    const built = buildApp(config);
+    const built = stopAtEnd(buildApp(config));
     t.after(async () => {
       built.mcpToolService.close();
       await rm(config.dataDir, { recursive: true, force: true });
@@ -61,25 +61,24 @@ for (const modelId of ["gpt-5.6-sol", "gpt-6.1-sol", "codex/gpt-6.1-sol"]) {
       urls.push(String(input instanceof Request ? input.url : input));
       return new Response(JSON.stringify({ error: { message: "offline subscription response" } }), { status: 400 });
     });
-    await assert.rejects(harness.models.oneShot!("system", "hello"), /offline subscription response/);
+    await assert.rejects(agent.oneShot!("system", "hello"), /offline subscription response/);
     assert.ok(urls.length > 0);
     assert.ok(urls.every((url) => new URL(url).hostname === "chatgpt.com"));
     await built.keychain!.remove(ownerId, credentialId);
     urls.length = 0;
-    assert.equal(await harness.models.oneShot!("system", "hello"), undefined);
+    assert.equal(await agent.oneShot!("system", "hello"), undefined);
     assert.deepEqual(urls, []);
   });
 }
 
-for (const modelId of ["gpt-6-astra-ultrafast", "gpt-6.1-sol-ultrafast"]) {
+for (const modelId of ["gpt-6.1-sol-ultrafast"]) {
   test(`company subscription wiring never sends API-only ${modelId} to a metered provider`, async (t) => {
     const config = testConfig({
-      harness: "pi",
       modelId,
       codexAuthCredential: credentialId,
       openaiApiKey: "synthetic-metered-key",
     });
-    const built = buildApp(config);
+    const built = stopAtEnd(buildApp(config));
     t.after(async () => {
       built.mcpToolService.close();
       await rm(config.dataDir, { recursive: true, force: true });
@@ -87,19 +86,26 @@ for (const modelId of ["gpt-6-astra-ultrafast", "gpt-6.1-sol-ultrafast"]) {
     const fetches = t.mock.method(globalThis, "fetch", async () =>
       assert.fail("must fail before any provider request"),
     );
-    await assert.rejects(harness.models.oneShot!("system", "hello"), /Unsupported model: codex\//);
+    await assert.rejects(
+      agent.compactHistory!({
+        session: { id: "ultrafast-company-work" } as Parameters<NonNullable<Agent["compactHistory"]>>[0]["session"],
+        history: [],
+        runtime: { modelId },
+        recordModelCall: () => {},
+      }),
+      /Unsupported model: codex\//,
+    );
     assert.equal(fetches.mock.callCount(), 0);
   });
 }
 
-test("company Pi wiring refreshes and rotates the existing saved ChatGPT login without API fallback", async (t) => {
+test("company wiring refreshes and rotates the existing saved ChatGPT login without API fallback", async (t) => {
   const config = testConfig({
-    harness: "pi",
     modelId: "codex/gpt-6.1-sol",
     codexAuthCredential: credentialId,
     openaiApiKey: "synthetic-metered-key",
   });
-  const built = buildApp(config);
+  const built = stopAtEnd(buildApp(config));
   t.after(async () => {
     built.mcpToolService.close();
     await rm(config.dataDir, { recursive: true, force: true });
@@ -130,7 +136,7 @@ test("company Pi wiring refreshes and rotates the existing saved ChatGPT login w
     assert.equal(new URL(url).hostname, "chatgpt.com");
     return Response.json({ error: { message: "offline refreshed subscription response" } }, { status: 400 });
   });
-  await assert.rejects(harness.models.oneShot!("system", "hello"), /offline refreshed subscription response/);
+  await assert.rejects(agent.oneShot!("system", "hello"), /offline refreshed subscription response/);
   assert.equal(urls.filter((url) => url === "https://auth.openai.com/oauth/token").length, 1);
   const files = (await built.keychain!.materializeOwnFiles(ownerId)).find(
     (bundle) => bundle.credentialId === credentialId,

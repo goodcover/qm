@@ -1,18 +1,18 @@
 import { gatewayModelCatalog } from "./gateway-models.ts";
 import {
-  modelSupportedByHarness,
+  modelSupported,
   registerOpenRouterCatalogModel,
   resolveModel,
   selectableBaseModels,
-  modelOverlayVersion,
   overlayModelCatalog,
 } from "./pi-models.ts";
-import { customModelCatalog, customProvidersVersion } from "./custom-providers.ts";
+import { customModelCatalog } from "./custom-providers.ts";
+import { readBoundedText } from "../util/bytes.ts";
+import { perTenant } from "../tenants/context.ts";
 
 export interface ModelCatalogEntry {
   id: string;
   name: string;
-  /** A built-in provider or the slug of an admin-registered custom provider. */
   provider: string;
 }
 
@@ -25,15 +25,12 @@ const CACHE_TTL_MS = 5 * 60_000;
 const FAILURE_TTL_MS = 30_000;
 
 interface CacheEntry {
-  customVersion?: number;
-  overlayVersion?: number;
   dynamic?: ModelCatalogEntry[];
   expiresAt: number;
-  models: ModelCatalogEntry[];
   inFlight?: Promise<ModelCatalogEntry[]>;
 }
 
-const cache = new WeakMap<typeof fetch, CacheEntry>();
+const cache = perTenant(() => new WeakMap<typeof fetch, CacheEntry>());
 
 export function builtInModelCatalog(): ModelCatalogEntry[] {
   const builtIns = selectableBaseModels().flatMap((model) => {
@@ -49,29 +46,6 @@ export function builtInModelCatalog(): ModelCatalogEntry[] {
       (model) => !known.has(model.id),
     ),
   ];
-}
-
-async function boundedJson(response: Response): Promise<unknown> {
-  const contentLength = Number(response.headers.get("content-length"));
-  if (Number.isFinite(contentLength) && contentLength > MAX_CATALOG_BYTES)
-    throw new Error("OpenRouter catalog is too large");
-  if (!response.body) throw new Error("OpenRouter catalog has no body");
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let bytes = 0;
-  let text = "";
-  while (true) {
-    const chunk = await reader.read();
-    if (chunk.done) break;
-    bytes += chunk.value.byteLength;
-    if (bytes > MAX_CATALOG_BYTES) {
-      await reader.cancel();
-      throw new Error("OpenRouter catalog is too large");
-    }
-    text += decoder.decode(chunk.value, { stream: true });
-  }
-  text += decoder.decode();
-  return JSON.parse(text) as unknown;
 }
 
 function finiteNumber(value: unknown): number | undefined {
@@ -151,7 +125,9 @@ function parseOpenRouterModel(candidate: unknown): ModelCatalogEntry | undefined
 async function fetchOpenRouterModels(fetcher: typeof fetch): Promise<ModelCatalogEntry[]> {
   const response = await fetcher(OPENROUTER_MODELS_URL, { signal: AbortSignal.timeout(5_000) });
   if (!response.ok) throw new Error(`OpenRouter catalog returned ${response.status}`);
-  const body = (await boundedJson(response)) as { data?: unknown };
+  const body = JSON.parse(
+    await readBoundedText(response, MAX_CATALOG_BYTES, () => new Error("OpenRouter catalog is too large")),
+  ) as { data?: unknown };
   if (!Array.isArray(body.data)) throw new Error("OpenRouter catalog is invalid");
   return body.data.slice(0, MAX_CATALOG_MODELS).flatMap((candidate) => {
     const model = parseOpenRouterModel(candidate);
@@ -159,66 +135,45 @@ async function fetchOpenRouterModels(fetcher: typeof fetch): Promise<ModelCatalo
   });
 }
 
-export async function selectableModelCatalog(fetcher: typeof fetch = fetch): Promise<ModelCatalogEntry[]> {
-  const now = Date.now();
-  const existing = cache.get(fetcher);
-  if (
-    existing &&
-    existing.expiresAt > now &&
-    existing.customVersion === customProvidersVersion() &&
-    existing.overlayVersion === modelOverlayVersion()
-  )
-    return existing.models;
-  if (existing?.inFlight) return existing.inFlight;
-  const entry = existing ?? { expiresAt: 0, models: [] };
-  entry.inFlight = fetchOpenRouterModels(fetcher)
+function withBuiltIns(dynamic: readonly ModelCatalogEntry[]): ModelCatalogEntry[] {
+  const models = builtInModelCatalog();
+  const known = new Set(models.map((model) => model.id));
+  return [...models, ...dynamic.filter((model) => !known.has(model.id))];
+}
+
+function openRouterModels(fetcher: typeof fetch): Promise<ModelCatalogEntry[]> {
+  const entry = cache().get(fetcher) ?? { expiresAt: 0 };
+  cache().set(fetcher, entry);
+  if (entry.expiresAt > Date.now()) return Promise.resolve(entry.dynamic ?? []);
+  entry.inFlight ??= fetchOpenRouterModels(fetcher)
     .then((dynamic) => {
       entry.dynamic = dynamic;
-      const models = builtInModelCatalog();
-      const known = new Set(models.map((model) => model.id));
-      entry.models = [...models, ...dynamic.filter((model) => !known.has(model.id))];
       entry.expiresAt = Date.now() + CACHE_TTL_MS;
-      entry.customVersion = customProvidersVersion();
-      entry.overlayVersion = modelOverlayVersion();
-      return entry.models;
+      return dynamic;
     })
     .catch(() => {
-      const models = builtInModelCatalog();
-      const known = new Set(models.map((model) => model.id));
-      entry.models = [...models, ...(entry.dynamic ?? []).filter((model) => !known.has(model.id))];
       entry.expiresAt = Date.now() + FAILURE_TTL_MS;
-      entry.customVersion = customProvidersVersion();
-      entry.overlayVersion = modelOverlayVersion();
-      return entry.models;
+      return entry.dynamic ?? [];
     })
     .finally(() => {
       delete entry.inFlight;
     });
-  cache.set(fetcher, entry);
   return entry.inFlight;
 }
 
-export function selectableCatalogForHarness(
-  catalog: readonly ModelCatalogEntry[],
-  harness: string,
-): ModelCatalogEntry[] {
-  return catalog.filter(
-    (model) =>
-      (model.provider !== "openrouter" || harness === "pi" || harness === "mock") &&
-      modelSupportedByHarness(model.id, harness),
-  );
+export async function selectableModelCatalog(fetcher: typeof fetch = fetch): Promise<ModelCatalogEntry[]> {
+  return withBuiltIns(await openRouterModels(fetcher));
+}
+
+export function selectableCatalog(catalog: readonly ModelCatalogEntry[]): ModelCatalogEntry[] {
+  return catalog.filter((model) => modelSupported(model.id));
 }
 
 export function cachedModelCatalog(fetcher: typeof fetch = fetch): {
   models: ModelCatalogEntry[];
   refreshing: boolean;
 } {
-  void selectableModelCatalog(fetcher);
-  const models = builtInModelCatalog();
-  const known = new Set(models.map((model) => model.id));
-  const entry = cache.get(fetcher);
-  return {
-    models: [...models, ...(entry?.dynamic ?? []).filter((model) => !known.has(model.id))],
-    refreshing: !!entry?.inFlight,
-  };
+  void openRouterModels(fetcher);
+  const entry = cache().get(fetcher);
+  return { models: withBuiltIns(entry?.dynamic ?? []), refreshing: !!entry?.inFlight };
 }

@@ -9,27 +9,20 @@ import { createMemoryVectorIndexer } from "./vector-indexer.ts";
 
 export function createSemanticMemory(opts: {
   notebook: MemoryService;
-  databaseUrl: string | undefined;
+  databaseUrl: string;
   embeddingModel: () => Promise<string | null | undefined>;
   resolveEmbedder: (id: string) => Promise<MemoryEmbedder>;
   leaderLease: LeaderLease;
   createSweeper: typeof createSweeper;
 }) {
   const { databaseUrl } = opts;
-  if (!databaseUrl)
-    return {
-      memory: opts.notebook,
-      start() {},
-      async stop() {},
-      async close() {},
-    };
   let store: MemoryVectorStore | undefined;
+  const vectors = (): MemoryVectorStore => (store ??= createPostgresVectorStore(databaseUrl));
   const resolve = async () => {
     const id = await opts.embeddingModel();
     if (!id) return undefined;
     const embedder = await opts.resolveEmbedder(id);
-    store ??= createPostgresVectorStore(databaseUrl);
-    return { embedder, store };
+    return { embedder, store: vectors() };
   };
   const memory = createSemanticMemoryService(
     opts.notebook,
@@ -37,7 +30,11 @@ export function createSemanticMemory(opts: {
     { search: (input) => store!.search(input) },
     { onError: (error) => reportFailure("memory semantic recall; using recent facts", error) },
   );
-  const indexer = createMemoryVectorIndexer({ resolve, leaderLease: opts.leaderLease });
+  const indexer = createMemoryVectorIndexer({
+    resolve,
+    eachTenant: (fn) => vectors().eachTenant(fn),
+    leaderLease: opts.leaderLease,
+  });
   const sweeper = opts.createSweeper(() => indexer.tick(), 30_000, { label: "memory-vector-index", immediate: true });
   return {
     memory,

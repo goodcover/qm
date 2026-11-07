@@ -2,10 +2,14 @@ import "./instrument.ts";
 import { handleVoiceRoute, sweepDictationSpool } from "./voice-routes.ts";
 import { browserErrorConfig } from "./browser-error-config.ts";
 import { flushErrorReporting, reportBackendError } from "../../chassis/src/error-reporting.ts";
+import { swallow } from "../../chassis/src/errors.ts";
+import { drainOnSigterm } from "../../chassis/src/drain.ts";
+import { withoutTenant } from "../../chassis/src/tenant.ts";
 import { appEditSlug } from "../src/app-edit.ts";
 import { composioCallbackUrl } from "./composio-return.ts";
 import { sharedSessionHtml } from "./shared-session.ts";
 import { uiCanvasRoutes } from "./ui-canvas-routes.ts";
+import { adminRoutes } from "./admin-routes.ts";
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from "node:http";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { Readable } from "node:stream";
@@ -16,9 +20,11 @@ import { randomBytes } from "node:crypto";
 import { LRUCache } from "lru-cache";
 import {
   fetchCoreText,
+  relayCoreStream,
   signedHeaders,
   withSourceAuthNonce,
   CAPABILITY_HEADER,
+  relayCoreDownload,
   type HttpMethod,
 } from "../../chassis/src/core-client.ts";
 import { findRoute } from "../../chassis/src/router.ts";
@@ -32,6 +38,8 @@ import {
   serveFavicon,
 } from "../../chassis/src/http.ts";
 import { verifyPortalIdentity, PORTAL_IDENTITY_HEADER } from "../../chassis/src/portal-identity.ts";
+import { boundTenant, withTenant } from "../../chassis/src/tenant.ts";
+import { coreHostTenants, inHostTenant, requestHostname } from "../../chassis/src/host-tenant.ts";
 import { createBrandingCache, injectBranding } from "../../chassis/src/branding.ts";
 import { parseSuggestedActivities } from "../../chassis/src/suggested-activities.ts";
 import { principalInAllowlist } from "../../chassis/src/principal-allowlist.ts";
@@ -129,16 +137,14 @@ async function brandIndexHtml(html: string): Promise<string> {
 
 const portalTokenStore = new AsyncLocalStorage<string | undefined>();
 
-const runOwners = new Map<string, string>();
 const runThreadKeys = new Map<string, string>();
 const activeRunsByThread = new Map<string, string[]>();
 
 function threadKey(user: string, threadRef: string): string {
-  return `${user}\0${threadRef}`;
+  return `${boundTenant() ?? ""}\0${user}\0${threadRef}`;
 }
 
 function forgetRun(runId: string): void {
-  runOwners.delete(runId);
   const key = runThreadKeys.get(runId);
   if (key) {
     const remaining = (activeRunsByThread.get(key) ?? []).filter((id) => id !== runId);
@@ -149,17 +155,19 @@ function forgetRun(runId: string): void {
 }
 
 function rememberRun(runId: string, user: string, threadRef: string): void {
-  if (runOwners.size > 5000) {
-    const oldest = runOwners.keys().next().value;
+  if (runThreadKeys.size > 5000) {
+    const oldest = runThreadKeys.keys().next().value;
     if (oldest !== undefined) forgetRun(oldest);
   }
-  runOwners.set(runId, user);
   const key = threadKey(user, threadRef);
   runThreadKeys.set(runId, key);
   activeRunsByThread.set(key, [...(activeRunsByThread.get(key) ?? []), runId]);
 }
 
 const deliveryClients = new Map<string, Set<ServerResponse>>();
+const clientTenants = new WeakMap<ServerResponse, string | undefined>();
+const hostTenants = coreHostTenants(CORE, CORE_SIGNING_SECRET);
+let multiTenant = true;
 
 function ownerOfWebThread(threadRef: string): string | null {
   if (!threadRef.startsWith("web:")) return null;
@@ -426,7 +434,7 @@ async function webTurnBase(
     surface: "web",
     actor: { externalId: user, ...(displayName ? { displayName } : {}) },
     conversation,
-    liveActor: true,
+    origin: { kind: "human" },
     deliveryTarget: threadRef,
     ...(inboxContext ? { conversationHeader: inboxContext } : {}),
     ...(appSlug
@@ -494,9 +502,10 @@ function sessionCookie(id: string): string {
 const MAX_BODY_BYTES = 1_000_000;
 const readBody = (req: IncomingMessage): Promise<string> => readBodyCapped(req, MAX_BODY_BYTES);
 
-const slackUrlCache = new LRUCache<string, { url: string | null }>({ max: 1, ttl: 5 * 60_000 });
+const slackUrlCache = new LRUCache<string, { url: string | null }>({ max: 1_000, ttl: 5 * 60_000 });
 async function slackWorkspaceUrl(): Promise<string | null> {
-  const hit = slackUrlCache.get("url");
+  const key = boundTenant() ?? "";
+  const hit = slackUrlCache.get(key);
   if (hit) return hit.url;
   let urlValue: string | null = null;
   try {
@@ -505,61 +514,85 @@ async function slackWorkspaceUrl(): Promise<string | null> {
   } catch {
     void 0;
   }
-  slackUrlCache.set("url", { url: urlValue });
+  slackUrlCache.set(key, { url: urlValue });
   return urlValue;
 }
 
 const WEB_DELIVERY_POLL_MS = Number(process.env.WEB_DELIVERY_POLL_MS ?? 2500);
 const WEB_DELIVERY_GIVEUP_MS = 60_000;
 let deliveriesPollInFlight = false;
+let deliveriesPollFailing = false;
+
+function inTenant<T>(tenantId: string | undefined, fn: () => T): T {
+  return tenantId === undefined ? withoutTenant(fn) : withTenant(tenantId, fn);
+}
 
 interface PendingWebDelivery {
   id: string;
+  tenantId?: string;
   createdAt: number;
   destination?: { target?: string };
 }
 
-async function drainWebDeliveries(): Promise<void> {
+export async function drainWebDeliveries(): Promise<void> {
   if (deliveriesPollInFlight) return;
   deliveriesPollInFlight = true;
   try {
-    const r = await coreFetch("GET", "/v1/deliveries?type=web");
-    if (r.status !== 200) return;
-    let pending: PendingWebDelivery[] = [];
-    try {
-      pending = (JSON.parse(r.text) as { deliveries?: PendingWebDelivery[] }).deliveries ?? [];
-    } catch {
-      return;
-    }
-    const now = Date.now();
-    for (const d of pending) {
-      const target = d.destination?.target ?? "";
-      const conns = deliveryClients.get(ownerOfWebThread(target) ?? "");
-      if (conns && conns.size) {
-        for (const res of conns) sseEvent(res, "delivery", { threadRef: target });
-      } else if (now - (d.createdAt ?? 0) < WEB_DELIVERY_GIVEUP_MS) {
-        continue;
-      }
-      await coreFetch("POST", `/v1/deliveries/${encodeURIComponent(d.id)}/ack`).catch(() => {});
-    }
-  } catch {
-    void 0;
+    noteDeliveriesPoll(await pollWebDeliveries());
+  } catch (e) {
+    noteDeliveriesPoll(e);
   } finally {
     deliveriesPollInFlight = false;
   }
+}
+
+function noteDeliveriesPoll(failure: unknown): void {
+  if (failure === undefined) {
+    if (deliveriesPollFailing) console.log("[web-ui] web delivery poll recovered");
+    deliveriesPollFailing = false;
+    return;
+  }
+  if (!deliveriesPollFailing) swallow("web-ui: web delivery poll (further failures quiet until recovery)", failure);
+  deliveriesPollFailing = true;
+}
+
+async function pollWebDeliveries(): Promise<unknown> {
+  const r = await withoutTenant(() => coreFetch("GET", "/v1/deliveries/across-tenants?type=web"));
+  if (r.status !== 200) return new Error(`GET /v1/deliveries/across-tenants http ${r.status}: ${r.text.slice(0, 200)}`);
+  const pending = (JSON.parse(r.text) as { deliveries?: PendingWebDelivery[] }).deliveries ?? [];
+  const now = Date.now();
+  let failure: unknown;
+  for (const d of pending) {
+    const target = d.destination?.target ?? "";
+    const conns = tenantClients(ownerOfWebThread(target) ?? "", d.tenantId);
+    if (conns.length) {
+      for (const res of conns) sseEvent(res, "delivery", { threadRef: target });
+    } else if (now - (d.createdAt ?? 0) < WEB_DELIVERY_GIVEUP_MS) {
+      continue;
+    }
+    try {
+      const ack = await inTenant(d.tenantId, () => coreFetch("POST", `/v1/deliveries/${encodeURIComponent(d.id)}/ack`));
+      if (ack.status !== 200)
+        failure ??= new Error(`ack delivery ${d.id} http ${ack.status}: ${ack.text.slice(0, 200)}`);
+    } catch (e) {
+      failure ??= e;
+    }
+  }
+  return failure;
 }
 
 const SSE_HEARTBEAT_MS = 15_000;
 const STATE_FEED_RECONNECT_MS = Number(process.env.STATE_FEED_RECONNECT_MS ?? 3_000);
 
 interface SessionStateFrame {
+  tenantId?: string;
   threadRef?: string;
   state?: string;
   participants?: string[];
   [k: string]: unknown;
 }
 
-function forwardSessionState(frame: SessionStateFrame): void {
+export function forwardSessionState(frame: SessionStateFrame): void {
   const threadRef = typeof frame.threadRef === "string" ? frame.threadRef : "";
   if (!threadRef) return;
   const targets = new Set<string>(
@@ -569,10 +602,15 @@ function forwardSessionState(frame: SessionStateFrame): void {
     const owner = ownerOfWebThread(threadRef);
     if (owner) targets.add(owner);
   }
-  const { participants: _participants, ...visible } = frame;
-  for (const user of targets) {
-    for (const res of deliveryClients.get(user) ?? []) sseEvent(res, "session_state", visible);
-  }
+  const { participants: _participants, tenantId, ...visible } = frame;
+  for (const user of targets) for (const res of tenantClients(user, tenantId)) sseEvent(res, "session_state", visible);
+}
+
+function tenantClients(user: string, tenant: string | undefined): ServerResponse[] {
+  return [...(deliveryClients.get(user) ?? [])].filter((res) => {
+    const own = clientTenants.get(res);
+    return own === undefined ? !multiTenant : own === tenant;
+  });
 }
 
 async function consumeCoreFeed(
@@ -642,7 +680,7 @@ function runInboxFeed(): Promise<void> {
   return consumeCoreFeed(
     "/v1/loop-items/events",
     "loop_item",
-    (data) => void forwardInboxItem(data as { loopId?: string; itemId?: string; op?: string }),
+    (data) => void forwardInboxItem(data as InboxItemFrame),
     resyncInbox,
   );
 }
@@ -651,13 +689,21 @@ function resyncInbox(): void {
   for (const conns of deliveryClients.values()) for (const res of conns) sseEvent(res, "inbox_resync", {});
 }
 
-async function forwardInboxItem(ev: { loopId?: string; itemId?: string; op?: string }): Promise<void> {
-  if (!ev.loopId || !ev.itemId || !deliveryClients.size) return;
-  const r = await coreFetch(
-    "POST",
-    "/v1/inbox/viewers",
-    JSON.stringify({ loopId: ev.loopId, candidates: [...deliveryClients.keys()] }),
-  ).catch(() => null);
+interface InboxItemFrame {
+  tenantId?: string;
+  loopId?: string;
+  itemId?: string;
+  op?: string;
+}
+
+export async function forwardInboxItem(ev: InboxItemFrame): Promise<void> {
+  const { tenantId } = ev;
+  if (!ev.loopId || !ev.itemId) return;
+  const candidates = [...deliveryClients.keys()].filter((user) => tenantClients(user, tenantId).length);
+  if (!candidates.length) return;
+  const body = JSON.stringify({ loopId: ev.loopId, candidates });
+  const viewersFetch = () => coreFetch("POST", "/v1/inbox/viewers", body);
+  const r = await (tenantId ? withTenant(tenantId, viewersFetch) : viewersFetch()).catch(() => null);
   if (r?.status === 404) return;
   let viewers: string[] | undefined;
   try {
@@ -667,7 +713,7 @@ async function forwardInboxItem(ev: { loopId?: string; itemId?: string; op?: str
   }
   if (!viewers) return resyncInbox();
   const frame = { loopId: ev.loopId, itemId: ev.itemId, op: ev.op ?? "" };
-  for (const user of viewers) for (const res of deliveryClients.get(user) ?? []) sseEvent(res, "inbox_item", frame);
+  for (const user of viewers) for (const res of tenantClients(user, tenantId)) sseEvent(res, "inbox_item", frame);
 }
 
 async function coreFetch(
@@ -688,11 +734,7 @@ async function coreFetch(
   });
 }
 
-async function coreFetchCap(
-  method: HttpMethod,
-  pathWithQuery: string,
-  rawBody = "",
-): Promise<{ status: number; text: string }> {
+async function mintSessionCap(): Promise<{ token: string } | { status: number; text: string }> {
   const cap = await coreFetch("POST", "/v1/session-cap", "");
   if (cap.status !== 200) return { status: cap.status === 401 ? 401 : 503, text: cap.text };
   let token: string | undefined;
@@ -703,9 +745,19 @@ async function coreFetchCap(
   }
   if (!token)
     return { status: 503, text: JSON.stringify({ error: "not_configured", message: "no session capability" }) };
+  return { token };
+}
+
+async function coreFetchCap(
+  method: HttpMethod,
+  pathWithQuery: string,
+  rawBody = "",
+): Promise<{ status: number; text: string }> {
+  const cap = await mintSessionCap();
+  if (!("token" in cap)) return cap;
   const r = await fetch(`${CORE}${pathWithQuery}`, {
     method,
-    headers: { "content-type": "application/json", [CAPABILITY_HEADER]: token },
+    headers: { "content-type": "application/json", [CAPABILITY_HEADER]: cap.token },
     ...(rawBody ? { body: rawBody } : {}),
     redirect: "manual",
   });
@@ -713,11 +765,27 @@ async function coreFetchCap(
 }
 
 async function relayCore(res: ServerResponse, method: HttpMethod, pathWithQuery: string, rawBody = ""): Promise<void> {
-  relay(res, await coreFetch(method, pathWithQuery, rawBody));
+  const portalTok = portalTokenStore.getStore();
+  return relayCoreStream(res, {
+    origin: CORE,
+    secret: CORE_SIGNING_SECRET,
+    method,
+    path: pathWithQuery,
+    body: rawBody,
+    headers: portalTok ? { [PORTAL_IDENTITY_HEADER]: portalTok } : undefined,
+  });
 }
 
 async function relayCap(res: ServerResponse, method: HttpMethod, pathWithQuery: string, rawBody = ""): Promise<void> {
-  relay(res, await coreFetchCap(method, pathWithQuery, rawBody));
+  const cap = await mintSessionCap();
+  if (!("token" in cap)) return relay(res, cap);
+  return relayCoreStream(res, {
+    origin: CORE,
+    method,
+    path: pathWithQuery,
+    body: rawBody,
+    headers: { [CAPABILITY_HEADER]: cap.token },
+  });
 }
 
 /**
@@ -922,10 +990,9 @@ async function uploadBlobFromRequest(req: IncomingMessage, res: ServerResponse, 
 async function uploadFileFromRequest(
   req: IncomingMessage,
   res: ServerResponse,
-  user: string,
-  scope: string | null,
   sha256: string,
   name: string,
+  register: { path: string; fields: Record<string, string>; headers?: Record<string, string> },
 ): Promise<void> {
   if (!/^[0-9a-f]{64}$/.test(sha256)) {
     req.resume();
@@ -939,14 +1006,21 @@ async function uploadFileFromRequest(
   }
   const stagedBody = JSON.parse(stagedText) as { blobId: string };
   const body = JSON.stringify({
-    principalId: user,
-    ...(scope ? { scopeId: scope } : {}),
+    ...register.fields,
     name,
     mimetype:
       typeof req.headers["content-type"] === "string" ? req.headers["content-type"] : "application/octet-stream",
     blobId: stagedBody.blobId,
   });
-  const registered = await coreFetch("POST", "/v1/files/upload", body);
+  const portalTok = portalTokenStore.getStore();
+  const registered = await fetchCoreText({
+    origin: CORE,
+    secret: CORE_SIGNING_SECRET,
+    method: "POST",
+    path: register.path,
+    body,
+    headers: register.headers ?? (portalTok ? { [PORTAL_IDENTITY_HEADER]: portalTok } : undefined),
+  });
   return sendBuffered(res, registered.status, { "content-type": "application/json" }, registered.text);
 }
 
@@ -1375,6 +1449,16 @@ const apiRoutes: readonly WebRoute[] = [
     },
   },
   {
+    method: "POST",
+    path: "/api/composio/disconnect",
+    handle: async (c) => {
+      const body = await readJson<{ accountId?: unknown }>(c.req, c.res, false);
+      if (!body) return;
+      c.res.setHeader("Cache-Control", "no-store");
+      return relayCore(c.res, "POST", "/v1/composio/disconnect", JSON.stringify({ accountId: body.accountId }));
+    },
+  },
+  {
     match: (_method, pathname) => pathname === "/me",
     handle: async (c) => {
       const { req, res, user } = c;
@@ -1422,8 +1506,8 @@ const apiRoutes: readonly WebRoute[] = [
         impersonatedBy: resolveIdentity(req)?.impersonator ?? null,
         displayName: resolveIdentity(req)?.name ?? null,
         ...(welcomeCohort ? { welcomeCohort } : {}),
-        ...(suggestedActivities.length ? { suggestedActivities } : {}),
         ...(activityConfig ? { suggestedActivitiesGeneration: true } : {}),
+        ...(suggestedActivities.length && !activityConfig ? { suggestedActivities } : {}),
         permissions,
       });
     },
@@ -1441,14 +1525,11 @@ const apiRoutes: readonly WebRoute[] = [
     path: "/api/files/upload",
     handle: async (c) => {
       const { req, res, url, user } = c;
-      return uploadFileFromRequest(
-        req,
-        res,
-        user,
-        url.searchParams.get("scope"),
-        declaredSha(url),
-        uploadFileName(url),
-      );
+      const scope = url.searchParams.get("scope");
+      return uploadFileFromRequest(req, res, declaredSha(url), uploadFileName(url), {
+        path: "/v1/files/upload",
+        fields: { principalId: user, ...(scope ? { scopeId: scope } : {}) },
+      });
     },
   },
   {
@@ -1481,9 +1562,37 @@ const apiRoutes: readonly WebRoute[] = [
     method: "GET",
     path: "/api/sessions",
     handle: async (c) => {
-      const { res, user } = c;
-      return relayCore(res, "GET", `/v1/sessions?principalId=${encodeURIComponent(user)}`);
+      const { res, url, user } = c;
+      const qs = new URLSearchParams({ principalId: user });
+      for (const p of ["limit", "before", "status", "surface", "scope", "q"] as const) {
+        const v = url.searchParams.get(p);
+        if (v !== null) qs.set(p, v.slice(0, 500));
+      }
+      return relayCore(res, "GET", `/v1/sessions?${qs.toString()}`);
     },
+  },
+  {
+    method: "GET",
+    path: "/api/sessions/row",
+    handle: async (c) => {
+      const { res, url, user } = c;
+      const qs = new URLSearchParams({ principalId: user });
+      for (const p of ["id", "threadRef"] as const) {
+        const v = url.searchParams.get(p);
+        if (v !== null) qs.set(p, v);
+      }
+      return relayCore(res, "GET", `/v1/sessions/row?${qs.toString()}`);
+    },
+  },
+  {
+    method: "GET",
+    path: "/api/sessions/:id/children",
+    handle: async (c) =>
+      relayCore(
+        c.res,
+        "GET",
+        `/v1/sessions/${encodeURIComponent(c.params.id!)}/children?principalId=${encodeURIComponent(c.user)}`,
+      ),
   },
   {
     method: "GET",
@@ -1550,15 +1659,16 @@ const apiRoutes: readonly WebRoute[] = [
     handle: async (c) => {
       const { req, res, user } = c;
       const id = c.params.id!;
-      const p = await readJson<{ name?: unknown }>(req, res);
+      const p = await readJson<{ name?: unknown; icon?: unknown }>(req, res);
       if (!p) return;
       const name = typeof p.name === "string" ? p.name.trim().slice(0, 200) : "";
-      if (!name) return json(res, 400, { error: "bad_request", message: "name required" });
+      const hasIcon = Object.hasOwn(p, "icon");
+      if (!name && !hasIcon) return json(res, 400, { error: "bad_request", message: "name or icon required" });
       return relayCore(
         res,
         "PATCH",
         `/v1/projects/${encodeURIComponent(id)}`,
-        JSON.stringify({ principalId: user, name }),
+        JSON.stringify({ principalId: user, ...(name ? { name } : {}), ...(hasIcon ? { icon: p.icon } : {}) }),
       );
     },
   },
@@ -1641,12 +1751,36 @@ const apiRoutes: readonly WebRoute[] = [
     method: "POST",
     path: "/api/suggested-activities",
     handle: async (c) => {
-      const input = JSON.parse((await readBody(c.req)) || "{}") as { timezone?: unknown; poll?: unknown };
+      const input = JSON.parse((await readBody(c.req)) || "{}") as {
+        timezone?: unknown;
+        poll?: unknown;
+        refresh?: unknown;
+      };
       const response = await coreFetch(
         "POST",
         "/v1/suggested-activities",
-        JSON.stringify({ principalId: c.user, seeds: suggestedActivities, timezone: input.timezone, poll: input.poll }),
+        JSON.stringify({
+          principalId: c.user,
+          seeds: suggestedActivities,
+          timezone: input.timezone,
+          poll: input.poll,
+          refresh: input.refresh,
+        }),
         60_000,
+      );
+      return json(c.res, response.status, JSON.parse(response.text));
+    },
+  },
+  {
+    method: "POST",
+    path: "/api/suggested-activities/dismiss",
+    handle: async (c) => {
+      const input = JSON.parse((await readBody(c.req)) || "{}") as { id?: unknown };
+      const response = await coreFetch(
+        "POST",
+        "/v1/suggested-activities/dismiss",
+        JSON.stringify({ principalId: c.user, id: input.id }),
+        15_000,
       );
       return json(c.res, response.status, JSON.parse(response.text));
     },
@@ -1658,6 +1792,11 @@ const apiRoutes: readonly WebRoute[] = [
       const { res } = c;
       return relayCore(res, "GET", "/v1/surface-config");
     },
+  },
+  {
+    method: "GET",
+    path: "/api/custom-emoji",
+    handle: async (c) => relayCore(c.res, "GET", "/v1/custom-emoji"),
   },
   {
     method: "GET",
@@ -1679,6 +1818,20 @@ const apiRoutes: readonly WebRoute[] = [
       return relayCore(res, "PUT", "/v1/ui-state", JSON.stringify({ ...body, principalId: user }));
     },
   },
+  ...adminRoutes({
+    origin: CORE,
+    secret: CORE_SIGNING_SECRET,
+    org: ORG,
+    portalHeaders: (): Record<string, string> => {
+      const token = portalTokenStore.getStore();
+      return token ? { [PORTAL_IDENTITY_HEADER]: token } : {};
+    },
+    impersonated: (req) => Boolean(resolveIdentity(req)?.impersonator),
+    readBody,
+    uploadFile: uploadFileFromRequest,
+    refreshBranding: () => brandingCache.refreshNow(),
+    json,
+  }),
   ...uiCanvasRoutes({
     impersonated: (req) => Boolean(resolveIdentity(req)?.impersonator),
     coreFetch,
@@ -1958,19 +2111,40 @@ const apiRoutes: readonly WebRoute[] = [
     },
   },
   {
+    method: "GET",
+    path: "/api/sessions/:id/side-chats",
+    handle: async (c) =>
+      relayCore(
+        c.res,
+        "GET",
+        `/v1/sessions/${encodeURIComponent(c.params.id!)}/side-chats?principalId=${encodeURIComponent(c.user)}`,
+      ),
+  },
+  {
+    method: "POST",
+    path: "/api/sessions/:id/expand",
+    handle: async (c) =>
+      relayCore(
+        c.res,
+        "POST",
+        `/v1/sessions/${encodeURIComponent(c.params.id!)}/expand`,
+        JSON.stringify({ principalId: c.user }),
+      ),
+  },
+  {
     method: "POST",
     path: "/api/sessions/:id/fork",
     handle: async (c) => {
       const { req, res, user } = c;
       const id = c.params.id!;
-      const p = await readJson<{ upToSeq?: unknown }>(req, res);
+      const p = await readJson<{ upToSeq?: unknown; sideChat?: unknown }>(req, res);
       if (!p) return;
       const upToSeq = typeof p.upToSeq === "number" ? p.upToSeq : undefined;
       return relayCore(
         res,
         "POST",
         `/v1/sessions/${encodeURIComponent(id)}/fork`,
-        JSON.stringify({ principalId: user, ...(upToSeq !== undefined ? { upToSeq } : {}) }),
+        JSON.stringify({ principalId: user, upToSeq, sideChat: p.sideChat }),
       );
     },
   },
@@ -2032,7 +2206,7 @@ const apiRoutes: readonly WebRoute[] = [
   },
   {
     method: "GET",
-    path: "/api/sessions/:id/entries/:seq",
+    path: "/api/sessions/:id/items/:seq",
     handle: async (c) => {
       const { res, user } = c;
       const { id, seq } = c.params as { id: string; seq: string };
@@ -2040,7 +2214,7 @@ const apiRoutes: readonly WebRoute[] = [
       return relayCore(
         res,
         "GET",
-        `/v1/sessions/${encodeURIComponent(id)}/entries/${seq}?viewer=${encodeURIComponent(user)}`,
+        `/v1/sessions/${encodeURIComponent(id)}/items/${seq}?viewer=${encodeURIComponent(user)}`,
       );
     },
   },
@@ -2110,6 +2284,19 @@ const apiRoutes: readonly WebRoute[] = [
     handle: async (c) => {
       const { res, user } = c;
       return relayCore(res, "GET", `/v1/memory?principalId=${encodeURIComponent(user)}`);
+    },
+  },
+  {
+    method: "GET",
+    path: "/api/spend",
+    handle: async (c) => {
+      const { res, url, user } = c;
+      const qs = new URLSearchParams({ principalId: user });
+      for (const key of ["from", "to", "bucket"]) {
+        const value = url.searchParams.get(key);
+        if (value) qs.set(key, value);
+      }
+      return relayCore(res, "GET", `/v1/spend?${qs.toString()}`);
     },
   },
   {
@@ -2504,7 +2691,6 @@ const apiRoutes: readonly WebRoute[] = [
       let text = "";
       let threadRef = `${ownPrefix}default`;
       let model: string | undefined;
-      let harness: string | undefined;
       let thinkingLevel: string | undefined;
       let fastMode: boolean | undefined;
       let timezone: string | undefined;
@@ -2515,8 +2701,12 @@ const apiRoutes: readonly WebRoute[] = [
       let desktopClientId: string | undefined;
       let proactiveOpener = false;
       let idempotencyKey: string | undefined;
+      let clientTools: unknown[] | undefined;
+      let surfaceBriefing: Record<string, unknown> | undefined;
+      let midTurn: unknown;
       try {
         const p = JSON.parse(await readBody(req));
+        midTurn = p.midTurn;
         text = String(p.text ?? "");
         if (typeof p.desktopClientId === "string" && p.desktopClientId.length === 36)
           desktopClientId = p.desktopClientId;
@@ -2545,10 +2735,12 @@ const apiRoutes: readonly WebRoute[] = [
         if (typeof p.scopeId === "string" && p.scopeId) scope = p.scopeId;
         if (typeof p.channelName === "string" && p.channelName.trim()) channelName = p.channelName.trim().slice(0, 200);
         if (typeof p.model === "string" && p.model) model = p.model;
-        if (typeof p.harness === "string") harness = p.harness;
         if (typeof p.thinkingLevel === "string") thinkingLevel = p.thinkingLevel;
         if (typeof p.fastMode === "boolean") fastMode = p.fastMode;
         if (typeof p.timezone === "string" && p.timezone.trim()) timezone = p.timezone.trim().slice(0, 64);
+        if (Array.isArray(p.clientTools)) clientTools = p.clientTools;
+        if (p.surfaceBriefing && typeof p.surfaceBriefing === "object" && !Array.isArray(p.surfaceBriefing))
+          surfaceBriefing = p.surfaceBriefing;
         if (Array.isArray(p.attachments)) {
           for (const raw of p.attachments as unknown[]) {
             if (!raw || typeof raw !== "object") continue;
@@ -2571,18 +2763,22 @@ const apiRoutes: readonly WebRoute[] = [
       const resolved = await resolveWebConversation(user, threadRef, scope, channelName);
       if ("error" in resolved) return json(res, 403, resolved);
 
+      const privateConversation = threadRef.startsWith(ownPrefix) && resolved.conversation.kind === "dm";
+
       const turn = {
         ...(await webTurnBase(req, user, resolved.conversation, threadRef, text)),
-        ...(harness ? { harness } : {}),
         ...(model ? { model } : {}),
         ...(thinkingLevel ? { thinkingLevel } : {}),
         ...(typeof fastMode === "boolean" ? { fastMode } : {}),
         ...(timezone ? { timezone } : {}),
+        ...(privateConversation && clientTools ? { clientTools } : {}),
+        ...(privateConversation && surfaceBriefing !== undefined ? { surfaceBriefing } : {}),
         ...(attachments.length ? { attachments } : {}),
         ...(approval ? { approval } : {}),
         ...(proactiveOpener ? { proactiveOpener: true } : {}),
         ...(desktopClientId && !proactiveOpener ? { desktopClientId } : {}),
         ...(idempotencyKey ? { idempotencyKey } : {}),
+        ...(midTurn ? { midTurn } : {}),
       };
       return postTurnAndMint(req, res, turn, user, threadRef);
     },
@@ -2592,6 +2788,7 @@ const apiRoutes: readonly WebRoute[] = [
     path: "/api/deliveries/events",
     handle: async (c) => {
       const { req, res, user } = c;
+      if (boundTenant() === undefined) multiTenant = (await hostTenants(requestHostname(req))).multi;
       res.writeHead(200, {
         "content-type": "text/event-stream; charset=utf-8",
         "cache-control": "no-cache, no-transform",
@@ -2605,6 +2802,7 @@ const apiRoutes: readonly WebRoute[] = [
         deliveryClients.set(user, set);
       }
       set.add(res);
+      clientTenants.set(res, boundTenant());
       const beat = setInterval(() => res.write(": ping\n\n"), SSE_HEARTBEAT_MS);
       beat.unref?.();
       req.on("close", () => {
@@ -2684,6 +2882,7 @@ const apiRoutes: readonly WebRoute[] = [
         callId?: unknown;
         result?: unknown;
         desktopClientId?: unknown;
+        tree?: unknown;
       }>(req, res, false, 6_000_000);
       if (!p) return;
       const kind = typeof p.kind === "string" ? p.kind : "";
@@ -2714,6 +2913,7 @@ const apiRoutes: readonly WebRoute[] = [
           ...(text !== undefined ? { text } : {}),
           ...steerFields,
           ...(typeof p.queuedRunId === "string" ? { queuedRunId: p.queuedRunId } : {}),
+          ...(kind === "abort" && p.tree === true ? { tree: true } : {}),
         }),
       );
     },
@@ -2838,7 +3038,7 @@ const apiRoutes: readonly WebRoute[] = [
     path: "/api/webhooks",
     handle: async (c) => {
       const { res, user } = c;
-      return relay(res, await coreFetch("GET", `/v1/webhooks?viewer=${encodeURIComponent(user)}`));
+      return relayCore(res, "GET", `/v1/webhooks?viewer=${encodeURIComponent(user)}`);
     },
   },
   {
@@ -3016,7 +3216,7 @@ const apiRoutes: readonly WebRoute[] = [
           ) {
             return json(res, 400, {
               error: "unsupported_verification",
-              message: "verification requires a scheme (HMAC-SHA256, GitHub, Slack, or Stripe)",
+              message: "verification requires a scheme",
             });
           }
           verification = {
@@ -3060,12 +3260,6 @@ const apiRoutes: readonly WebRoute[] = [
           error: "action_required",
           message: "an action (the agent's instructions) is required",
         });
-      if (!["hmac-sha256", "github", "slack", "stripe"].includes(verification.scheme)) {
-        return json(res, 400, {
-          error: "unsupported_verification",
-          message: "choose HMAC-SHA256, GitHub, Slack, or Stripe signature verification",
-        });
-      }
       if (!verification.secret) {
         verification = { ...verification, secret: randomBytes(32).toString("hex") };
       }
@@ -3077,7 +3271,7 @@ const apiRoutes: readonly WebRoute[] = [
         verification,
         ...(filters ? { filters } : {}),
       });
-      return relay(res, await coreFetch("POST", "/v1/webhooks", reqBody));
+      return relayCore(res, "POST", "/v1/webhooks", reqBody);
     },
   },
   {
@@ -3307,31 +3501,20 @@ const routeRequest = async (req: IncomingMessage, res: ServerResponse) => {
     if (!external && !user) return json(res, 401, { error: "sign in" });
     const corePath = `/v1/${external ? "public-shares" : "shared-sessions"}/${match[2]}${match[3] ? `/files/${match[3]}` : ""}?${external ? "" : `viewer=${encodeURIComponent(user!)}&`}inline=${url.searchParams.get("inline") === "1" ? "1" : "0"}`;
     if (match[3]) {
-      const signedPath = withSourceAuthNonce(corePath, CORE_SIGNING_SECRET);
       const portalTok = external ? null : portalTokenStore.getStore();
-      const response = await fetch(`${CORE}${signedPath}`, {
-        headers: {
-          ...signedHeaders(CORE_SIGNING_SECRET, "GET", signedPath, ""),
-          ...(portalTok ? { [PORTAL_IDENTITY_HEADER]: portalTok } : {}),
+      return relayCoreDownload(res, {
+        origin: CORE,
+        secret: CORE_SIGNING_SECRET,
+        path: corePath,
+        headers: portalTok ? { [PORTAL_IDENTITY_HEADER]: portalTok } : {},
+        copyHeaders: ["content-type", "content-length", "content-disposition"],
+        responseHeaders: {
+          "cache-control": "no-store",
+          "referrer-policy": "no-referrer",
+          "x-content-type-options": "nosniff",
+          "content-security-policy": "default-src 'none'; sandbox",
         },
-        redirect: "manual",
       });
-      const headers: Record<string, string> = {
-        "cache-control": "no-store",
-        "referrer-policy": "no-referrer",
-        "x-content-type-options": "nosniff",
-        "content-security-policy": "default-src 'none'; sandbox",
-      };
-      for (const name of ["content-type", "content-length", "content-disposition"]) {
-        const value = response.headers.get(name);
-        if (value) headers[name] = value;
-      }
-      res.writeHead(response.status, headers);
-      if (!response.body) return res.end();
-      const stream = Readable.fromWeb(response.body as Parameters<typeof Readable.fromWeb>[0]);
-      res.on("close", () => stream.destroy());
-      stream.on("error", () => res.destroy());
-      return stream.pipe(res);
     }
     const result = await coreFetch("GET", corePath);
     const dev = vite && !external;
@@ -3413,23 +3596,34 @@ const routeRequest = async (req: IncomingMessage, res: ServerResponse) => {
   json(res, 404, { error: "not found" });
 };
 
-let adminModule: Promise<typeof import("../../admin/src/index.ts")> | undefined;
+function identityTenant(token: string | undefined): string | undefined {
+  return token && PORTAL_IDENTITY_SECRET
+    ? verifyPortalIdentity(token, PORTAL_IDENTITY_SECRET, Date.now())?.t
+    : undefined;
+}
+
+function inRequestTenant(
+  req: IncomingMessage,
+  res: ServerResponse,
+  token: string | undefined,
+  handle: () => Promise<void>,
+): Promise<void> {
+  const claimed = identityTenant(token);
+  const bound = async (): Promise<void> => {
+    const host = boundTenant();
+    if (claimed && host && claimed !== host) {
+      req.resume();
+      return json(res, 421, {
+        error: "tenant_mismatch",
+        message: "this sign-in belongs to a different tenant than this host",
+      });
+    }
+    return claimed ? withTenant(claimed, handle) : handle();
+  };
+  return inHostTenant(hostTenants, req, res, bound, claimed === undefined);
+}
 
 export const handler = async (req: IncomingMessage, res: ServerResponse) => {
-  const originalUrl = req.url ?? "/";
-  const path = originalUrl.split("?")[0]!;
-  if (process.env.ADMIN_ENABLED !== "0" && (path === "/admin" || path.startsWith("/admin/"))) {
-    req.url = originalUrl.slice("/admin".length) || "/";
-    if (req.url.startsWith("?")) req.url = `/${req.url}`;
-    try {
-      process.env.ADMIN_BASE_PATH ??= "/admin";
-      adminModule ??= import("../../admin/src/index.ts");
-      await (await adminModule).handler(req, res);
-    } finally {
-      req.url = originalUrl;
-    }
-    return;
-  }
   res.setHeader("strict-transport-security", "max-age=63072000; includeSubDomains");
   res.setHeader("referrer-policy", "no-referrer");
   res.setHeader("x-content-type-options", "nosniff");
@@ -3437,7 +3631,9 @@ export const handler = async (req: IncomingMessage, res: ServerResponse) => {
   const raw = req.headers[PORTAL_IDENTITY_HEADER];
   const token = Array.isArray(raw) ? raw[0] : raw;
   try {
-    await portalTokenStore.run(token, () => routeRequest(req, res));
+    await inRequestTenant(req, res, token, async () => {
+      await portalTokenStore.run(token, () => routeRequest(req, res));
+    });
   } catch (err) {
     if (err instanceof PayloadTooLargeError) {
       if (!res.headersSent) json(res, 413, { error: "payload_too_large", message: err.message });
@@ -3461,6 +3657,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   createVite(server)
     .then((v) => {
       vite = v;
+      drainOnSigterm(server, "web-ui");
       server.listen(PORT, () => {
         console.log(
           `[web-ui] surface on http://localhost:${PORT} → core ${CORE} (org ${ORG})${WEB_UI_DEV ? " [vite hmr]" : ""}`,

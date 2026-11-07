@@ -1,5 +1,7 @@
 import type { ProcessCredentialFiles } from "../credentials/execute-files.ts";
 import { createPgPool } from "../persistence/pg-pool.ts";
+import { TENANCY, tenantTables } from "../tenants/migrations.ts";
+import { claimAcrossTenants, rowTenant, type Claimed } from "../tenants/claim.ts";
 
 export type ProcessKind = "build" | "dev-server" | "background";
 
@@ -48,7 +50,7 @@ export interface ProcessRegistry {
   markStatus(processId: string, status: ProcessStatus): Promise<boolean>;
   credentialFiles(processId: string): Promise<ProcessCredentialFiles | null>;
   setCredentialFiles(processId: string, files: ProcessCredentialFiles | null): Promise<void>;
-  listExpired(now?: number): Promise<ProcessRecord[]>;
+  listExpired(now?: number): Promise<Array<Claimed<ProcessRecord>>>;
   delete(processId: string): Promise<void>;
   close?(): void;
 }
@@ -70,58 +72,6 @@ function newRecord(rec: NewProcessRecord, now: number): ProcessRecord {
   };
 }
 
-export function createMemoryProcessRegistry(): ProcessRegistry {
-  const rows = new Map<string, ProcessRecord>();
-  const credentialFiles = new Map<string, ProcessCredentialFiles>();
-  const view = (row: ProcessRecord): ProcessRecord => ({
-    ...row,
-    ...(credentialFiles.has(row.processId) ? { credentialsPending: true } : {}),
-  });
-  return {
-    async register(rec) {
-      const row = newRecord(rec, Date.now());
-      rows.set(row.processId, row);
-      if (rec.credentialFiles) credentialFiles.set(row.processId, rec.credentialFiles);
-      return { ...row };
-    },
-    async credentialFiles(processId) {
-      return credentialFiles.get(processId) ?? null;
-    },
-    async setCredentialFiles(processId, files) {
-      if (!files) credentialFiles.delete(processId);
-      else if (rows.has(processId)) credentialFiles.set(processId, files);
-    },
-    async get(processId) {
-      const row = rows.get(processId);
-      return row ? view(row) : null;
-    },
-    async listByScope(scopeId) {
-      return [...rows.values()].filter((r) => r.scopeId === scopeId).map(view);
-    },
-    async liveByScope(scopeId, now = Date.now()) {
-      return [...rows.values()]
-        .filter((r) => r.scopeId === scopeId && r.status === "running" && r.expiresAt > now)
-        .map((r) => ({ ...r }));
-    },
-    async listLive(now = Date.now()) {
-      return [...rows.values()].filter((r) => r.status === "running" && r.expiresAt > now).map((r) => ({ ...r }));
-    },
-    async markStatus(processId, status) {
-      const row = rows.get(processId);
-      if (!row) return false;
-      row.status = status;
-      return true;
-    },
-    async listExpired(now = Date.now()) {
-      return [...rows.values()].filter((r) => r.status === "running" && r.expiresAt <= now).map((r) => ({ ...r }));
-    },
-    async delete(processId) {
-      rows.delete(processId);
-      credentialFiles.delete(processId);
-    },
-  };
-}
-
 function pgRowToRecord(r: Record<string, unknown>): ProcessRecord {
   return {
     processId: r.process_id as string,
@@ -140,15 +90,22 @@ function pgRowToRecord(r: Record<string, unknown>): ProcessRecord {
 }
 
 export function createPostgresProcessRegistry(connectionString: string): ProcessRegistry {
-  const pg = createPgPool(connectionString, "processes/registry/0001", [
-    `CREATE TABLE IF NOT EXISTS process_sessions(
+  const pg = createPgPool(connectionString, [
+    ...TENANCY,
+    {
+      id: "processes/registry/0001",
+      statements: [
+        `CREATE TABLE IF NOT EXISTS process_sessions(
         process_id TEXT PRIMARY KEY, scope_id TEXT NOT NULL, kind TEXT NOT NULL,
         command TEXT NOT NULL, started_at BIGINT NOT NULL, expires_at BIGINT NOT NULL,
         status TEXT NOT NULL
       )`,
-    `ALTER TABLE process_sessions ADD COLUMN IF NOT EXISTS session_ref TEXT`,
-    `ALTER TABLE process_sessions ADD COLUMN IF NOT EXISTS run_id TEXT`,
-    `CREATE INDEX IF NOT EXISTS idx_proc_scope_status ON process_sessions(scope_id, status)`,
+        `ALTER TABLE process_sessions ADD COLUMN IF NOT EXISTS session_ref TEXT`,
+        `ALTER TABLE process_sessions ADD COLUMN IF NOT EXISTS run_id TEXT`,
+        `CREATE INDEX IF NOT EXISTS idx_proc_scope_status ON process_sessions(scope_id, status)`,
+      ],
+    },
+    ...tenantTables("processes/registry/0005-tenants", [{ table: "process_sessions", primaryKey: "process_id" }]),
   ]);
 
   const migration = {
@@ -168,14 +125,10 @@ export function createPostgresProcessRegistry(connectionString: string): Process
   pg.registerMigration(credentialFilesMigration);
   let ready: Promise<void> | undefined;
   const q: typeof pg.q = async (...args) => {
-    ready ??= pg
-      .migrate(migration)
-      .then(() => pg.migrate(purposeMigration))
-      .then(() => pg.migrate(credentialFilesMigration))
-      .catch((error) => {
-        ready = undefined;
-        throw error;
-      });
+    ready ??= pg.migrate(migration, purposeMigration, credentialFilesMigration).catch((error) => {
+      ready = undefined;
+      throw error;
+    });
     await ready;
     return pg.q(...args);
   };
@@ -238,8 +191,12 @@ export function createPostgresProcessRegistry(connectionString: string): Process
       return updated.length > 0;
     },
     async listExpired(now = Date.now()) {
-      const rows = await q("SELECT * FROM process_sessions WHERE status = 'running' AND expires_at <= $1", [now]);
-      return rows.map(pgRowToRecord);
+      const { rows } = await claimAcrossTenants(
+        pg,
+        "SELECT * FROM process_sessions WHERE status = 'running' AND expires_at <= $1",
+        [now],
+      );
+      return rows.map((row) => ({ ...pgRowToRecord(row), ...rowTenant(row) }));
     },
     async delete(processId) {
       await q("DELETE FROM process_sessions WHERE process_id = $1", [processId]);

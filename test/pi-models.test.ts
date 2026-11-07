@@ -4,10 +4,9 @@ import assert from "node:assert/strict";
 import {
   auxiliaryModelFor,
   auxiliaryModelForProvider,
-  defaultModelForHarness,
+  defaultModel,
   defaultModelForProvider,
   modelServiceable,
-  modelSupportedByHarness,
   onlyProvider,
   resolveModel,
   getRequiredModel,
@@ -53,55 +52,51 @@ test("unknown models are not silently accepted", () => {
   assert.throws(() => getRequiredModel("claude-not-a-real-model"), /Unsupported model/);
 });
 
-test("native harnesses reject cross-provider pins and choose their own defaults", () => {
-  assert.equal(modelSupportedByHarness("claude-opus-4-8", "claude"), true);
-  assert.equal(modelSupportedByHarness("gpt-5.6-sol", "claude"), false);
-  assert.equal(modelSupportedByHarness("claude-future-9", "claude"), true);
-  assert.equal(defaultModelForHarness("claude", "gpt-5.6-sol"), "claude-opus-5");
-});
-
 test("the default base model follows the providers a deployment can actually bill", () => {
   for (const provider of MODEL_PROVIDERS) {
     const only = onlyProvider(provider);
-    const chosen = defaultModelForHarness("pi", undefined, only);
+    const chosen = defaultModel(undefined, only);
     assert.equal(
       modelServiceable(chosen, only),
       true,
       `a ${provider}-only deployment must default to a model ${provider} can serve, got ${chosen}`,
     );
   }
-  assert.equal(defaultModelForHarness("pi", undefined, onlyProvider("openrouter")), "openrouter/auto");
-  assert.equal(defaultModelForHarness("pi", undefined, onlyProvider("openai")), "gpt-5.6-sol");
+  assert.equal(defaultModel(undefined, onlyProvider("openrouter")), "openrouter/auto");
+  assert.equal(defaultModel(undefined, onlyProvider("openai")), "gpt-6.1-sol");
+  assert.equal(
+    defaultModel(undefined, { anthropic: false, openai: false, openrouter: false, codexOAuth: true }),
+    "gpt-6.1-sol",
+  );
 });
 
 test("provider-blind callers and explicit pins keep the shipped default", () => {
-  assert.equal(defaultModelForHarness("pi"), "claude-opus-5");
-  assert.equal(defaultModelForHarness("pi", undefined, onlyProvider("anthropic")), "claude-opus-5");
+  assert.equal(defaultModel(), "claude-opus-5");
+  assert.equal(defaultModel(undefined, onlyProvider("anthropic")), "claude-opus-5");
   assert.equal(
-    defaultModelForHarness("pi", "claude-sonnet-5", onlyProvider("openrouter")),
+    defaultModel("claude-sonnet-5", onlyProvider("openrouter")),
     "claude-sonnet-5",
     "an explicit pin is never silently swapped — the mismatch is rejected at config load instead",
   );
   assert.equal(
-    defaultModelForHarness("pi", undefined, { anthropic: false, openai: false, openrouter: false }),
+    defaultModel(undefined, { anthropic: false, openai: false, openrouter: false }),
     "claude-opus-5",
     "with no provider at all the shipped default stands rather than an arbitrary pick",
   );
 });
 
-test("a provider that cannot serve a harness has no default model for it", () => {
-  assert.equal(defaultModelForProvider("pi", "openrouter"), "openrouter/auto");
-  assert.equal(defaultModelForProvider("claude", "anthropic"), "claude-opus-5");
-  assert.equal(defaultModelForProvider("claude", "openrouter"), undefined, "the Claude CLI runs no OpenRouter model");
+test("each provider has a default model", () => {
+  assert.equal(defaultModelForProvider("openrouter"), "openrouter/auto");
+  assert.equal(defaultModelForProvider("anthropic"), "claude-opus-5");
 });
 
 test("the curated catalog contains only current model families", () => {
   assert.deepEqual(
     SELECTABLE_BASE_MODELS.map((model) => model.id),
     [
+      "claude-opus-5-5",
       "claude-fable-5-1",
       "claude-fable-5",
-      "claude-opus-5-5",
       "claude-opus-5",
       "claude-opus-4-8",
       "claude-sonnet-5-5",
@@ -115,6 +110,7 @@ test("the curated catalog contains only current model families", () => {
       "gpt-6-astra-ultrafast",
       "gpt-6.1-sol",
       "gpt-6.1-sol-ultrafast",
+      "gpt-6.1-terra",
       "gpt-6-sol",
       "gpt-6-luna",
       "openrouter/auto",
@@ -278,7 +274,7 @@ test("personal models retain canonical endpoints when org endpoints are overridd
 });
 
 test("registered OpenAI clones retain exact model identity on the Codex subscription transport", () => {
-  for (const id of ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"]) {
+  for (const id of ["gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-sol", "gpt-6-luna"]) {
     const api = getRequiredModel(id);
     const subscription = getRequiredModel(codexSubscriptionModelId(id));
     assert.equal(subscription.id, `codex/${id}`);
@@ -291,4 +287,20 @@ test("registered OpenAI clones retain exact model identity on the Codex subscrip
   }
   assert.equal(resolveModel("codex/claude-opus-5"), undefined);
   assert.equal(resolveModel("codex/unregistered-model"), undefined);
+});
+
+test("gpt-6.1-terra pricing, context and fast mode match OpenAI's model page", () => {
+  const terra = getRequiredModel("gpt-6.1-terra");
+  assert.equal(terra.contextWindow, 1_050_000);
+  assert.equal(terra.maxTokens, 128_000);
+  assert.equal(modelSupportsFastMode("gpt-6.1-terra"), true);
+  assert.deepEqual(
+    {
+      input: terra.cost.input,
+      output: terra.cost.output,
+      cacheRead: terra.cost.cacheRead,
+      cacheWrite: terra.cost.cacheWrite,
+    },
+    { input: 1, output: 5, cacheRead: 0.05, cacheWrite: 1.25 },
+  );
 });

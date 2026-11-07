@@ -6,7 +6,6 @@ import {
   MAX_STAGE_BLOB_BYTES,
 } from "../../persistence/blob-transfer.ts";
 import { CAPABILITY_HEADER } from "../contract.ts";
-import { canonicalPayload } from "../../../plugins/chassis/src/source-auth-sign.ts";
 import { extendBodyDeadline, headerValue, pipeToResponse, sendJson, verifyOrReject } from "../http.ts";
 
 const STAGE_UPLOAD_DEADLINE_MS = 1_800_000;
@@ -48,7 +47,7 @@ async function authorizeBlob(ctx: BaseCtx, dir: BlobDir, blobId: string | null):
       res,
       secret,
       auth,
-      canonicalPayload(method, pathname + url.search, tail),
+      { method, path: pathname + url.search, body: tail },
       false,
       ctx.allowUnsignedSourceAuth,
     ))
@@ -72,7 +71,7 @@ async function putBlob(ctx: BaseCtx): Promise<void> {
   }
   const authz = await authorizeBlob(ctx, "write", null);
   if (!authz) return;
-  if (authz.via === "capability") extendBodyDeadline(req, STAGE_UPLOAD_DEADLINE_MS);
+  extendBodyDeadline(req, STAGE_UPLOAD_DEADLINE_MS);
   try {
     const info = await deps.blobTransfer.put(req, {
       maxBytes: authz.via === "capability" ? MAX_STAGE_BLOB_BYTES : MAX_BLOB_BYTES,
@@ -103,6 +102,6 @@ async function getBlob(ctx: BaseCtx): Promise<void> {
 }
 
 export const blobRoutes: ReadonlyArray<Route<BaseCtx>> = [
-  { method: "POST", path: "/v1/blobs", auth: "either", handle: putBlob },
+  { method: "POST", path: "/v1/blobs", actor: "system", auth: "either", handle: putBlob },
   { method: "GET", path: "/v1/blobs/:id", auth: "either", handle: getBlob },
 ];

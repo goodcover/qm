@@ -1,6 +1,7 @@
 import type { TeamStore } from "../teams/teams.ts";
+import type { CronScriptTrial } from "../cron/script.ts";
 import type { ExternalSlackPolicies } from "../resolution/external-slack.ts";
-import type { InviteMailer } from "../admin/invite-email.ts";
+import type { Mailer } from "../../plugins/chassis/src/resend.ts";
 import type { DeploymentInvitation } from "../deploy/email-access.ts";
 import type { AdmittedWork } from "../util/admitted-work.ts";
 import type { EventBus } from "../util/event-bus.ts";
@@ -17,33 +18,30 @@ import type {
   Principal,
   ScopeId,
   Session,
-  SessionEntry,
   TurnRequest,
   TurnResult,
   TurnRuntime,
 } from "../types.ts";
 import type { OutgoingAttachment } from "../types.ts";
-import type { SecurityScreenProbe } from "../security/security-screener.ts";
 import type { Readable } from "node:stream";
 import { type FileArtifact, type FileArtifactStore, type ListOwnedOptions } from "../files/file-artifact-store.ts";
 import type { IdentityService } from "../identity/identity-service.ts";
-import type { SessionStore, TranscriptEntry } from "../sessions/session-store.ts";
+import type { SessionStore, TranscriptItem } from "../sessions/session-store.ts";
+import type { Item } from "../sessions/items.ts";
 import { type Sandbox } from "../sandbox/sandbox.ts";
 import type { ProcessRegistry } from "../processes/process-registry.ts";
 import type { MonitorStore } from "../monitors/monitor-store.ts";
 import type { EngagedRegistry } from "../wake/engaged-registry.ts";
 import type { Orchestrator } from "../core/orchestrator.ts";
 import type { Run, RunDeliveryState, RunStore } from "../runs/run-store.ts";
-import type { GoalView, TurnStream } from "../runs/turn-stream.ts";
+import type { GoalView, ReasoningBlock, TurnStream } from "../runs/turn-stream.ts";
 import type { SessionStateBus, SessionStateEvent } from "../runs/session-state-bus.ts";
 import type { LedgerEventBus, OwnedLedgerEvent } from "../loops/ledger-events.ts";
 import type { SubscribeOptions } from "../util/event-bus.ts";
 import type { RunActivityEntry, RunActivityStore } from "../runs/run-activity-store.ts";
 import type { RunSignal, RunSignalStore } from "../runs/run-signal-store.ts";
-import type { ModelGateway } from "../model/model-gateway.ts";
-import type { ModelCredentialStore } from "../model/model-credential-store.ts";
+import type { CustomProviderStore, ModelCredentialStore } from "../model/model-credential-store.ts";
 import type { UserModelCredentialStore } from "../model/user-model-credential-store.ts";
-import type { CustomProviderStore } from "../model/custom-provider-store.ts";
 import type { McpServerStore } from "../mcp/mcp-server-store.ts";
 import type { McpToolService } from "../mcp/mcp-tool-service.ts";
 import type { AclStore } from "../acl/acl-store.ts";
@@ -70,18 +68,9 @@ import type {
   GroupMembership,
   RecipientResolution,
 } from "../directory/directory-store.ts";
-import type {
-  Cron,
-  CronFireLogEntry,
-  CronFireNote,
-  Delivery,
-  Destination,
-  RecipientConsent,
-  SurfaceContextQuery,
-  SurfaceContextRequest,
-  SurfaceContextResult,
-  Webhook,
-} from "../types.ts";
+import type { Delivery, Destination } from "../types.ts";
+import type { Cron, CronFireLogEntry, CronFireNote, Webhook } from "../triggers/types.ts";
+import type { SurfaceContextQuery, SurfaceContextRequest, SurfaceContextResult } from "../reach/reach.ts";
 import type {
   ActiveThread,
   CachedMessage,
@@ -93,6 +82,7 @@ import type {
 } from "../surface-cache/surface-cache.ts";
 import { type BotPolicy, type ChannelPolicy, type ChannelPolicyStore } from "../surface-cache/channel-policy-store.ts";
 import { type AmbientDecision } from "../surface-cache/ambient-judge.ts";
+import type { SurfaceRegistry } from "../surfaces/registry.ts";
 import type { AmbientJudgmentStore } from "../surface-cache/ambient-judgment-store.ts";
 import type { AckEmojiPickStore } from "../surface-cache/ack-emoji-pick-store.ts";
 import type { Deployment } from "../deploy/deploy-store.ts";
@@ -110,9 +100,9 @@ import { type DurableMap } from "../persistence/durable-map.ts";
 import type { AdvisoryLock } from "../persistence/advisory-lock.ts";
 import type { Environment, EnvironmentAttachment, EnvironmentStore } from "../environments/environment-store.ts";
 import type { ModelProviderAvailability } from "../model/pi-models.ts";
-import type { RuntimeChoice } from "../harness/harness.ts";
+import type { RuntimeChoice } from "../agent/agent.ts";
 import { type ReachOpts, type ReachResolution, type ReachTarget } from "../reach/reach.ts";
-import { type Project, type ProjectStore } from "../projects/project-store.ts";
+import { type Project, type ProjectIcon, type ProjectStore } from "../projects/project-store.ts";
 import type { SearchHit } from "../search/core-search.ts";
 
 interface DeploymentVersionView {
@@ -134,6 +124,7 @@ export interface DeploymentView {
   status: Deployment["status"];
   alwaysOn?: boolean;
   embedAncestors?: string[];
+  connectors?: string[];
   public: boolean;
   lastAccessAt?: number;
   createdAt?: number;
@@ -164,6 +155,7 @@ export function deploymentView(d: Deployment): DeploymentView {
     status: d.status,
     ...(d.alwaysOn ? { alwaysOn: true } : {}),
     ...(d.embedAncestors?.length ? { embedAncestors: d.embedAncestors } : {}),
+    ...(d.connectors ? { connectors: d.connectors } : {}),
     public: d.public === true,
     ...(d.lastAccessAt !== undefined ? { lastAccessAt: d.lastAccessAt } : {}),
     ...(versions[0] ? { createdAt: versions[0].createdAt } : {}),
@@ -183,6 +175,7 @@ interface ReachNowInput {
   attachments?: OutgoingAttachment[];
   react?: { messageTs: string; emoji: string };
   delete?: { messageTs: string };
+  edit?: { messageTs: string };
   currentDestination?: Destination;
 }
 export type ReachNowResult =
@@ -210,7 +203,16 @@ export type ProjectView = Project & {
 
 type ProjectViewMutation =
   | { status: "ok"; project: ProjectView; changed: boolean }
-  | { status: "not_found" | "forbidden" | "invalid_member" | "invalid_name" | "invalid_channel" | "channel_in_use" };
+  | {
+      status:
+        | "not_found"
+        | "forbidden"
+        | "invalid_member"
+        | "invalid_name"
+        | "invalid_icon"
+        | "invalid_channel"
+        | "channel_in_use";
+    };
 
 interface DeploymentGitUrl {
   url: string;
@@ -284,12 +286,13 @@ export interface App {
   listSessionApprovals(sessionId: string, viewer: string): Promise<PendingApproval[]>;
   pendingApprovalForThread(threadRef: string, viewer?: string): Promise<TurnResult | null>;
   subscribeRun(runId: string, listener: (event: RunStreamEvent) => void, onResync?: () => void): () => void;
-  syncRunStream(runId: string, offset: number): void;
+  syncRunStream(runId: string, offset: number, reasoning: Record<string, number>): void;
   getRun(
     runId: string,
     viewer?: string,
   ): Promise<{
     status: Run["status"];
+    attempt: number;
     result: TurnResult | null;
     input?: {
       runId: string;
@@ -310,11 +313,11 @@ export interface App {
     firstBlockClosed?: boolean;
     surfacePosted?: boolean;
     activity?: RunActivityEntry[];
+    reasoning?: ReasoningBlock[];
     startedAt: number | null;
     finishedAt: number | null;
   } | null>;
-  getRunToolEntries(runId: string, viewer?: string, afterSeq?: number): Promise<SessionEntry[]>;
-  stopConversation(threadRef: string, viewer?: string): Promise<boolean>;
+  getRunToolItems(runId: string, viewer?: string, afterSeq?: number): Promise<Item[]>;
   activeRunForThread(
     threadRef: string,
     viewer?: string,
@@ -328,36 +331,28 @@ export interface App {
   withdrawRun(runId: string, viewer?: string): Promise<{ withdrawn: boolean; reason?: string }>;
   signalRun(
     runId: string,
-    signal: RunSignal,
+    signal: RunSignal & { tree?: boolean },
     viewer?: string,
-  ): Promise<{ accepted: boolean; reason?: string; replayed?: boolean }>;
+  ): Promise<{ accepted: boolean; reason?: string; why?: string; queuedRunId?: string; replayed?: boolean }>;
   replayOrphanedRunSignals(runId: string): Promise<void>;
   getSession(
     sessionId: string,
     window?: TranscriptWindow,
-  ): Promise<{ session: Session; entries: TranscriptEntry[]; earlierEntries?: number; pins?: SessionPinView[] } | null>;
+  ): Promise<{ session: Session; items: TranscriptItem[]; earlierItems?: number; pins?: SessionPinView[] } | null>;
   getSessionForViewer(
     sessionId: string,
     principalId: string,
     window?: TranscriptWindow,
   ): Promise<{
     session: Session;
-    entries: TranscriptEntry[];
-    earlierEntries?: number;
+    items: TranscriptItem[];
+    earlierItems?: number;
     pins?: SessionPinView[];
     goal?: GoalView;
     runtime?: TurnRuntime;
   } | null>;
-  canViewSessionSnapshot(
-    sessionId: string,
-    principalId: string,
-    visibility: { minSeq: number; maxSeq: number; minCreatedAt: number; maxCreatedAt: number },
-  ): Promise<boolean>;
-  getSessionEntryForViewer(
-    sessionId: string,
-    principalId: string,
-    seq: number,
-  ): Promise<{ entry: SessionEntry } | null>;
+  canViewSessionSnapshot(sessionId: string, principalId: string): Promise<boolean>;
+  getSessionItemForViewer(sessionId: string, principalId: string, seq: number): Promise<{ item: Item } | null>;
   pinConversationItem(
     threadRef: string,
     addedBy: string,
@@ -366,6 +361,11 @@ export interface App {
   listConversationPins(threadRef: string, reader: string): Promise<SessionPinView[] | null>;
   unpinConversationItem(threadRef: string, pinId: string): Promise<boolean | null>;
   listSessions(principalId: string): Promise<Session[]>;
+  listSessionPage(principalId: string, query: SessionPageQuery): Promise<SessionPageResult>;
+  sideChats(principalId: string, sessionId: string): Promise<Session[] | null>;
+  expandSideChat(principalId: string, sessionId: string): Promise<Session | null>;
+  sessionChildren(principalId: string, sessionId: string): Promise<Session[] | null>;
+  sessionRow(principalId: string, ref: { id?: string; threadRef?: string }): Promise<Session | null>;
   searchResources(
     principalId: string,
     query: string,
@@ -391,6 +391,7 @@ export interface App {
   removeProjectMember(id: string, principalId: string, memberId: string): Promise<ProjectViewMutation>;
   setProjectSlackChannel(id: string, principalId: string, channel: string | null): Promise<ProjectViewMutation>;
   renameProject(id: string, principalId: string, name: string): Promise<ProjectViewMutation>;
+  setProjectIcon(id: string, principalId: string, icon: ProjectIcon | null): Promise<ProjectViewMutation>;
   updateSession(
     sessionId: string,
     principalId: string,
@@ -413,8 +414,8 @@ export interface App {
   forkSession(
     sessionId: string,
     principalId: string,
-    opts?: { upToSeq?: number },
-  ): Promise<{ session: Session; entries: SessionEntry[] } | null>;
+    opts?: { upToSeq?: number; sideChat?: { entrySeq: number; quote: string; occurrence: number } },
+  ): Promise<{ session: Session; items: Item[] } | null>;
   listFilesForViewer(principalId: string, opts?: ListOwnedOptions, inScope?: ScopeId): Promise<FileListPage>;
   uploadFileForViewer(
     principalId: string,
@@ -430,7 +431,7 @@ export interface App {
     claims: Pick<CapabilityClaims, "actorId" | "scopeId" | "scopeVersion" | "botActor" | "liveActor" | "members">,
   ): Promise<boolean>;
   openFileForViewer(id: string, principalId: string): Promise<OpenedFile | null>;
-  grant(g: Grant): Promise<void>;
+  grant(g: Grant, opts?: { notify?: boolean }): Promise<void>;
   revokeGrant(ownerScopeId: ScopeId, ref: string, granteeScopeId: ScopeId, revokedBy: string): Promise<void>;
   promoteSkill(id: string, targetScopeId: ScopeId, actorId: string, liveActor: boolean): Promise<Skill>;
   belongsToScope(principalId: string, scope: ScopeId): Promise<boolean>;
@@ -451,13 +452,13 @@ export interface App {
     scopeId: ScopeId,
     content: string,
     actorId: string,
-    opts?: { allowSharedScope?: boolean; expectedVersion?: number },
+    opts?: { allowSharedScope?: boolean; expectedVersion?: number; sessionId?: string },
   ): Promise<number>;
-  createCron(input: CreateCronInput): Promise<Cron>;
+  createCron(input: CreateCronInput, trial?: CronScriptTrial): Promise<Cron>;
   getCron(id: string): Promise<Cron | null>;
   listCrons(): Promise<Cron[]>;
   listCronsForViewer(principalId: string): Promise<{ owned: Cron[]; visible: VisibleCron[] }>;
-  updateCron(id: string, patch: CronPatch): Promise<Cron | null>;
+  updateCron(id: string, patch: CronPatch, trial?: CronScriptTrial): Promise<Cron | null>;
   deleteCron(id: string): Promise<void>;
   setCronEnabled(id: string, enabled: boolean): Promise<void>;
   setCronFireNote(id: string, note: CronFireNote): Promise<"applied" | "superseded" | "missing">;
@@ -466,15 +467,14 @@ export interface App {
   latestCronFireForThread(id: string, threadRef: string): Promise<CronFireLogEntry | undefined>;
   setCronRuntime(id: string, runtime: Exclude<Cron["runtime"], undefined>): Promise<Cron | null>;
   setCronDestination(id: string, destination: Destination | undefined): Promise<Cron | null>;
-  setCronRecipientConsent(id: string, recipientConsent: RecipientConsent): Promise<void>;
   createWebhook(input: CreateWebhookInput): Promise<Webhook>;
   getWebhook(id: string): Promise<Webhook | null>;
   listWebhookEvents(id: string, viewer: string): Promise<Array<WebhookEvent & { sessionId?: string }>>;
   listWebhooks(): Promise<Webhook[]>;
   setWebhookEnabled(id: string, enabled: boolean): Promise<void>;
   updateWebhook(id: string, patch: { action: string }): Promise<Webhook | null>;
-  setWebhookRecipientConsent(id: string, recipientConsent: RecipientConsent): Promise<void>;
   pendingDeliveries(type: string, claimMs?: number): Promise<Delivery[]>;
+  pendingDeliveriesAcrossTenants(type: string): Promise<Delivery[]>;
   enqueueDelivery(input: {
     destination: Destination;
     text: string;
@@ -487,6 +487,7 @@ export interface App {
   pendingContextRequests(source: string): Promise<SurfaceContextRequest[]>;
   fulfillContextRequest(id: string, outcome: { result?: SurfaceContextResult; error?: string }): Promise<boolean>;
   onContextRequestCreated(listener: (request: SurfaceContextRequest) => void): () => void;
+  surfaceMirrored(kind: string): boolean;
   ingestSurfaceEvents(
     events: IngestEvent[],
     surface?: string,
@@ -511,6 +512,7 @@ export interface App {
     opts?: { reason?: "messages" | "scheduled" },
   ): Promise<AmbientDecision>;
   ackDelivery(id: string, slackApiMs?: number): Promise<void>;
+  failDelivery(id: string, reason: string): Promise<Delivery | null>;
   ackDeliveryByKey(idempotencyKey: string): Promise<void>;
   setRunDeliveryState(runId: string, state: RunDeliveryState): Promise<boolean>;
   upsertDirectory(members: DirectoryMember[], syncedAt?: number): Promise<boolean>;
@@ -563,7 +565,7 @@ export interface App {
     patch: { description?: string; body?: string },
     opts?: { liveActor?: boolean },
   ): Promise<Skill | "trigger_blocked" | null>;
-  restoreOwnedSkill(id: string, principalId: string): Promise<Skill | null>;
+  restoreOwnedSkill(id: string, principalId: string): Promise<Skill | "exists" | null>;
   listSkillPacks(): Promise<SkillPack[]>;
   getSkillPack(id: string): Promise<SkillPack | null>;
   registerSkillPack(input: NewSkillPack): Promise<SkillPack>;
@@ -585,7 +587,7 @@ export interface App {
     id: string;
     liveActor?: boolean;
   }): Promise<"missing" | "forbidden" | "trigger_blocked" | "deleted">;
-  rollbackDeployment(id: string, version: number): Promise<void>;
+  rollbackDeployment(id: string, version: number, actor?: string): Promise<void>;
   archiveDeployment(id: string): Promise<void>;
   restoreDeployment(id: string, actorId?: string): Promise<Deployment>;
   canManageDeployment(idOrName: string, callerId: string, actingScopeId?: ScopeId): Promise<boolean>;
@@ -594,6 +596,7 @@ export interface App {
   setDeploymentAlwaysOn(id: string, alwaysOn: boolean): Promise<Deployment>;
   setDeploymentEmbedAncestors(id: string, embedAncestors: string[]): Promise<Deployment>;
   setDeploymentPublic(idOrName: string, isPublic: boolean, actor: { createdBy: string }): Promise<Deployment>;
+  setDeploymentConnectors(idOrName: string, connectors: string[], actor: { createdBy: string }): Promise<Deployment>;
   maintainDeployments(): Promise<number>;
   reachDeployment(id: string, principalId: string, opts?: ReachOptions): Promise<Reach>;
   deploymentLogsFor(
@@ -606,18 +609,24 @@ export interface App {
     grantee: ScopeId,
     permission: Permission | null,
     actor: { createdBy: string },
+    opts?: { notify?: boolean },
   ): Promise<DeploymentGrantee[]>;
   inviteToDeployment(
     idOrName: string,
     email: string,
     actorId: string,
+    opts?: { notify?: boolean },
   ): Promise<{
     grantees: DeploymentGrantee[];
     invitation: DeploymentInvitation;
   }>;
   deploymentGrantees(idOrName: string): Promise<DeploymentGrantee[]>;
   deploymentGitRepoPath(id: string): Promise<string | null>;
-  runDeploymentGitPush<T>(id: string, runReceivePack: () => Promise<{ result: T; ok: boolean }>): Promise<T>;
+  runDeploymentGitPush<T>(
+    id: string,
+    actor: string | undefined,
+    runReceivePack: () => Promise<{ result: T; ok: boolean }>,
+  ): Promise<T>;
   deploymentGitUrlFor(
     idOrName: string,
     principalId: string,
@@ -631,27 +640,29 @@ export interface App {
   attachScope(input: { scopeId: ScopeId; environmentId: string; actorId: string }): Promise<void>;
 }
 
+interface DeploymentGitPrincipals {
+  authorizes(deployment: Deployment, principalId: string, permission: "read" | "write"): Promise<boolean | undefined>;
+}
+
 export interface AppDeps {
   externalSlackPolicies?: ExternalSlackPolicies;
   admittedWork?: AdmittedWork;
   shutdown?: () => AbortSignal;
-  resourceSearch?: ResourceSearchStore;
+  resourceSearch: ResourceSearchStore;
   swarms?: SwarmService;
   identity: IdentityService;
   publicWebUrl?: string;
-  inviteMailer?: InviteMailer;
+  inviteMailer?: Mailer;
   sessions: SessionStore;
-  screenSecurity?: SecurityScreenProbe;
   orchestrator: Orchestrator;
   runs: RunStore;
-  leaseTtlMs: number;
   maxAttempts: number;
   runWaitMs?: number;
   turnStream?: TurnStream;
   runStreamEvents?: EventBus<RunStreamEvent>;
   runActivity?: RunActivityStore;
   signals?: RunSignalStore;
-  modelGateway: ModelGateway;
+  settleTreeWakes?: (root: Session) => Promise<void>;
   modelCredentials?: ModelCredentialStore;
   userModelCredentials?: UserModelCredentialStore;
   mcpServers?: McpServerStore;
@@ -667,7 +678,7 @@ export interface AppDeps {
   skillPacks?: SkillPackStore;
   skillFetcher?: SkillPackFetcher;
   skillBundles?: SkillBundleStore;
-  advisoryLock?: AdvisoryLock;
+  advisoryLock: AdvisoryLock;
   auditLog: AuditLog;
   config: ScopedConfigStore;
   crons: CronStore;
@@ -679,12 +690,13 @@ export interface AppDeps {
   projects?: ProjectStore;
   deploy: DeployService;
   deployAppsDomain?: string;
+  deploymentGitPrincipals?: DeploymentGitPrincipals;
   deploymentLayer?: DeploymentLayerRuntime;
   files: FileArtifactStore;
   approvals?: DurableMap<PendingApprovalRecord>;
   sessionStateBus?: SessionStateBus;
   ledgerEventBus?: LedgerEventBus;
-  contextRequests?: DurableMap<SurfaceContextRequest>;
+  contextRequests: DurableMap<SurfaceContextRequest>;
   environments?: EnvironmentStore;
   processes?: ProcessRegistry;
   monitors?: MonitorStore;
@@ -692,13 +704,13 @@ export interface AppDeps {
   reaperPoke?: () => void;
   engaged?: EngagedRegistry;
   surfaceCache?: SurfaceCache;
+  surfaces: SurfaceRegistry;
   channelPolicy?: ChannelPolicyStore;
   ambientJudge?: (systemPrompt: string, prompt: string, signal?: AbortSignal) => Promise<string | undefined>;
   ambientCursors?: DurableMap<{ lastJudgedTs: string; lastJudgedAt?: number }>;
   ambientJudgments?: AmbientJudgmentStore;
   ackEmojiPicks?: AckEmojiPickStore;
   judgeModelId?: () => string;
-  harnessId?: string;
   modelProviders?: ModelProviderAvailability;
   providerKeys?: ModelProviderAvailability;
   runtimeFallback?: RuntimeChoice;
@@ -712,6 +724,7 @@ export interface ContextSummary {
   sessionCount: number;
   lastActivityAt: number | null;
   project?: ProjectView;
+  groupMembers?: Array<{ principalId: string; displayName: string; avatarUrl?: string }>;
 }
 
 interface FileListItem {
@@ -777,6 +790,45 @@ export function toFileItem(a: FileArtifact): FileListItem {
   };
 }
 
+export class SoulUpdateDeniedError extends Error {
+  constructor() {
+    super("not authorized to update SOUL for this scope");
+    this.name = "SoulUpdateDeniedError";
+  }
+}
+
+export class SideChatAnchorError extends Error {
+  constructor() {
+    super("sideChat needs a nonempty quote and an entrySeq inside the forked range");
+    this.name = "SideChatAnchorError";
+  }
+}
+
+export class SoulVersionConflictError extends Error {
+  constructor() {
+    super("Guidance changed; read it and retry the edit.");
+    this.name = "SoulVersionConflictError";
+  }
+}
+
 export const CONTEXT_REQUEST_EXPIRY_MS = 2 * 60_000;
 
 export const STALE_LEASE_GRACE_MS = 30_000;
+
+interface SessionPageQuery {
+  limit: number;
+  before?: { activity: number; id: string };
+  status?: SessionPageStatus;
+  surface?: string;
+  scopeId?: ScopeId;
+  titleQuery?: string;
+}
+
+export type SessionPageStatus = "active" | "archived" | "waiting";
+
+interface SessionPageResult {
+  sessions: Session[];
+  pinned?: Session[];
+  next: { activity: number; id: string } | null;
+  hasArchived?: boolean;
+}

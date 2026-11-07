@@ -1,6 +1,6 @@
 import type { EgressPolicy } from "../types.ts";
 
-function normalizeHost(host: string): string {
+export function normalizeHost(host: string): string {
   const s = host
     .trim()
     .toLowerCase()

@@ -1,15 +1,16 @@
 import { createHash } from "node:crypto";
-import { createNoopAdvisoryLock, type AdvisoryLock } from "../persistence/advisory-lock.ts";
+import type { AdvisoryLock } from "../persistence/advisory-lock.ts";
 import type { DurableMap } from "../persistence/durable-map.ts";
 import type { ScopeId } from "../types.ts";
 import {
+  foreignSkillCollision,
   safeSkillFilePath,
   type Skill,
   type SkillFile,
   type SkillManifest,
   type SkillStore,
 } from "../skills/skill-store.ts";
-import { foreignSkillCollision, parseSeedSkill, sameManifest, upsertSeedSkill } from "../skills/seed.ts";
+import { parseSeedSkill, sameManifest, upsertSeedSkill } from "../skills/seed.ts";
 import {
   bundleFilePaths,
   detectPathCollisions,
@@ -20,6 +21,7 @@ import {
 import type { SkillBundleStore } from "../skills/skill-bundle-store.ts";
 import { createKeyedQueue, sleep } from "../util/async.ts";
 import { errMessage } from "../util/errors.ts";
+import { isInstallTenant } from "../tenants/context.ts";
 import { parseToolDescriptor, type ToolDescriptor } from "./deployment-layer.ts";
 import {
   declaredInstallFiles,
@@ -62,7 +64,6 @@ export interface DeploymentLayerStore {
   hydrate(): Promise<StoredDeploymentLayer | null>;
   get(): Promise<StoredDeploymentLayer | null>;
   put(bundle: DeploymentLayerBundle, updatedBy: string): Promise<StoredDeploymentLayer>;
-  durable: boolean;
   isApplied(contentHash: string): Promise<boolean>;
   live(): {
     source: "durable" | "filesystem" | "none";
@@ -91,20 +92,6 @@ const pathOrder = (a: DeploymentLayerFile, b: DeploymentLayerFile): number => {
   return 0;
 };
 
-function hasLoneSurrogate(value: string): boolean {
-  for (let i = 0; i < value.length; i++) {
-    const code = value.charCodeAt(i);
-    if (code >= 0xd800 && code <= 0xdbff) {
-      const next = value.charCodeAt(i + 1);
-      if (!(next >= 0xdc00 && next <= 0xdfff)) return true;
-      i++;
-    } else if (code >= 0xdc00 && code <= 0xdfff) {
-      return true;
-    }
-  }
-  return false;
-}
-
 function normalizedBundle(input: DeploymentLayerBundle): DeploymentLayerBundle {
   if (input.contract !== 1 || !Array.isArray(input.tools) || !Array.isArray(input.skills)) {
     throw new Error("deployment layer requires contract: 1, tools[], and skills[]");
@@ -121,7 +108,7 @@ function normalizedBundle(input: DeploymentLayerBundle): DeploymentLayerBundle {
             `deployment layer ${kind} entry contains a NUL character, which the store cannot persist: ${file.path}`,
           );
         }
-        if (hasLoneSurrogate(file.path) || hasLoneSurrogate(file.content)) {
+        if (!file.path.isWellFormed() || !file.content.isWellFormed()) {
           throw new Error(
             `deployment layer ${kind} entry contains an unpaired Unicode surrogate, which the store cannot persist: ${file.path}`,
           );
@@ -267,11 +254,10 @@ export function createDeploymentLayerStore(opts: {
   skills: SkillStore;
   skillBundles?: SkillBundleStore;
   scopeId: ScopeId;
-  seedFallback?: () => Promise<unknown>;
-  durable?: boolean;
+  seedFallback?: () => Promise<boolean>;
   now?: () => number;
   retryDelaysMs?: readonly number[];
-  advisoryLock?: AdvisoryLock;
+  advisoryLock: AdvisoryLock;
   auditPersisted?: (record: StoredDeploymentLayer) => Promise<void>;
 }): DeploymentLayerStore {
   const now = opts.now ?? Date.now;
@@ -280,7 +266,7 @@ export function createDeploymentLayerStore(opts: {
   let failedHash: string | null = null;
   let seeded = false;
   const queue = createKeyedQueue<string>();
-  const advisoryLock = opts.advisoryLock ?? createNoopAdvisoryLock();
+  const advisoryLock = opts.advisoryLock;
   const withFleetLock = <T>(fn: () => Promise<T>): Promise<T> => advisoryLock.withLock(SKILL_MATERIALIZATION_LOCK, fn);
 
   const retrying = async <T>(fn: () => Promise<T>): Promise<T> => {
@@ -436,10 +422,8 @@ export function createDeploymentLayerStore(opts: {
     for (const revision of pending) {
       try {
         await retrying(() => opts.auditPersisted!({ ...record, ...revision }));
-        if (!opts.backing.update)
-          throw new Error("deployment layer backing store must support atomic audit reconciliation");
         await retrying(async () => {
-          const updated = await opts.backing.update!(CURRENT, (current) => ({
+          const updated = await opts.backing.update(CURRENT, (current) => ({
             ...current,
             pendingAudits: (current.pendingAudits ?? []).filter((entry) => entry.version !== revision.version),
           }));
@@ -461,15 +445,13 @@ export function createDeploymentLayerStore(opts: {
     } catch (error) {
       reportApplyFailure(record, error);
       if (!(error instanceof DeploymentLayerMutationError) && opts.seedFallback && !seeded) {
-        await opts.seedFallback();
-        seeded = true;
+        seeded = await opts.seedFallback();
       }
     }
     return record;
   };
 
-  return {
-    durable: opts.durable ?? false,
+  const store: DeploymentLayerStore = {
     isApplied: async (hash) => {
       if (appliedHash !== hash) return false;
       try {
@@ -497,8 +479,8 @@ export function createDeploymentLayerStore(opts: {
             return applyForHydrate(record);
           }
           if (opts.seedFallback && !seeded) {
-            await opts.seedFallback();
-            seeded = true;
+            seeded = await opts.seedFallback();
+            if (!seeded) return null;
             let appeared: StoredDeploymentLayer | null = null;
             try {
               appeared = await retrying(() => opts.backing.get(CURRENT));
@@ -562,7 +544,12 @@ export function createDeploymentLayerStore(opts: {
           }
           for (const [path, owner] of await activeBundleClaims(existing)) claimed.set(path, owner);
           for (const manifest of manifests) {
-            const clash = foreignSkillCollision(existing, opts.scopeId, manifest.name, LAYER_CREATED_BY);
+            const clash = foreignSkillCollision(
+              existing,
+              opts.scopeId,
+              manifest.name,
+              (skill) => skill.createdBy === LAYER_CREATED_BY,
+            );
             if (clash) {
               throw new DeploymentLayerValidationError(
                 `deployment layer skill "${manifest.name}" collides with an existing skill created by ${clash.createdBy} — rename it or remove the colliding skill`,
@@ -585,7 +572,6 @@ export function createDeploymentLayerStore(opts: {
           ];
           let record = await opts.backing.putIfAbsent(CURRENT, candidate);
           if (record.contentHash !== hash) {
-            if (!opts.backing.update) throw new Error("deployment layer backing store must support atomic updates");
             const updated = await opts.backing.update(CURRENT, (current) => {
               if (current.contentHash === hash) return current;
               const version = current.version + 1;
@@ -616,5 +602,17 @@ export function createDeploymentLayerStore(opts: {
           return record;
         });
       }),
+  };
+  return {
+    isApplied: (hash) => (isInstallTenant() ? store.isApplied(hash) : Promise.resolve(false)),
+    live: () => (isInstallTenant() ? store.live() : { source: "none", contentHash: null, resolved: null }),
+    hydrate: () => (isInstallTenant() ? store.hydrate() : Promise.resolve(null)),
+    get: () => (isInstallTenant() ? store.get() : Promise.resolve(null)),
+    put: (bundle, updatedBy) =>
+      isInstallTenant()
+        ? store.put(bundle, updatedBy)
+        : Promise.reject(
+            new DeploymentLayerValidationError("Only the deployment's own tenant can store a deployment layer"),
+          ),
   };
 }

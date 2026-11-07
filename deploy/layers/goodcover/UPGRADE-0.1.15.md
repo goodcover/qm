@@ -1,5 +1,9 @@
 # Goodcover v0.1.15 source candidate
 
+This is the record of the 0.1.15 rollout, which production now runs. Some settings
+it lists, such as `HARNESS`, no longer exist in the current source. For the current
+candidate, see [UPGRADE-0.1.16.md](UPGRADE-0.1.16.md).
+
 The source target is upstream `7417aa2a3f917cf97406914897078ae3b273e173`.
 This source sync does not authorize production rollout. Land it with a merge
 commit or ancestry-preserving fast-forward; never squash or rebase it.

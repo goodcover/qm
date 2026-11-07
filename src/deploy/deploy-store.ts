@@ -1,16 +1,17 @@
 import { randomUUID } from "node:crypto";
 import type { ScopeId } from "../types.ts";
-import { createMemoryMap, type DurableMap } from "../persistence/durable-map.ts";
+import type { DurableMap } from "../persistence/durable-map.ts";
+import type { Claimed } from "../tenants/claim.ts";
 import type { PgPool } from "../persistence/pg-pool.ts";
-import { swallow } from "../util/errors.ts";
 import {
   createDeployGitStore,
   type DeployGitDiff,
   type DeployGitInputFile,
-  type DeployGitStore,
   type DeployGitStoreOptions,
   type DeployGitTreeFile,
 } from "./deploy-git-store.ts";
+import { TENANCY, createIfParentTenantKeyed, tenantTables } from "../tenants/migrations.ts";
+import { durableMapTenancy } from "../persistence/durable-map.ts";
 
 export interface DeploymentVersion {
   version: number;
@@ -69,6 +70,7 @@ export interface Deployment {
 
   alwaysOn?: boolean;
   embedAncestors?: string[];
+  connectors?: string[];
   public?: true;
   lastAccessAt?: number;
   appliedVersion?: number;
@@ -103,6 +105,7 @@ export interface DeployStore {
   get(id: string): Promise<Deployment | null>;
   getByName(name: string): Promise<Deployment | null>;
   list(): Promise<Deployment[]>;
+  acrossTenants(): Promise<Array<Claimed<Deployment>>>;
   setCurrentVersion(id: string, version: number): Promise<void>;
   setVersionImage(id: string, version: number, image: string): Promise<void>;
   setStatus(id: string, status: DeploymentStatus): Promise<void>;
@@ -112,12 +115,14 @@ export interface DeployStore {
   setDisplayName(id: string, displayName: string | undefined): Promise<void>;
   setAlwaysOn(id: string, alwaysOn: boolean): Promise<void>;
   setEmbedAncestors(id: string, embedAncestors: string[]): Promise<void>;
+  setConnectors(id: string, connectors: string[] | undefined): Promise<void>;
   setPublic(id: string, isPublic: boolean): Promise<void>;
   setDefaultAudience(id: string, snapshot: DefaultAudienceSnapshot): Promise<void>;
   setAppliedVersion(id: string, version: number): Promise<void>;
   touch(id: string, at: number): Promise<void>;
   versionOf(id: string, version: number): Promise<DeploymentVersion | null>;
   treeOf(id: string, version: number): Promise<DeployGitTreeFile[] | null>;
+  commitTreeOf(id: string, commit: string): Promise<DeployGitTreeFile[]>;
   filesOf(id: string, version: number, paths?: string[]): Promise<DeployGitInputFile[] | null>;
   diffVersions(id: string, fromVersion: number | undefined, toVersion: number): Promise<DeployGitDiff | null>;
   bundleOf(id: string, version: number): Promise<Uint8Array | null>;
@@ -126,9 +131,9 @@ export interface DeployStore {
 }
 
 export interface DeployStoreBackings {
-  deployments?: DurableMap<Deployment>;
+  deployments: DurableMap<Deployment>;
   git?: DeployGitStoreOptions;
-  pg?: PgPool;
+  pg: PgPool;
   touchDebounceMs?: number;
 }
 
@@ -137,28 +142,6 @@ const versionRef = (version: number): string => `refs/versions/${version}`;
 const NAME_INDEX = "deployments_name_unique";
 const TOUCH_DEBOUNCE_MS = 60_000;
 
-function normalizeBackings(backing?: DurableMap<Deployment> | DeployStoreBackings): {
-  deployments: DurableMap<Deployment>;
-  git: DeployGitStore;
-  pg?: PgPool;
-  touchDebounceMs: number;
-} {
-  if (!backing)
-    return {
-      deployments: createMemoryMap<Deployment>(),
-      git: createDeployGitStore(),
-      touchDebounceMs: TOUCH_DEBOUNCE_MS,
-    };
-  if ("get" in backing && "put" in backing)
-    return { deployments: backing, git: createDeployGitStore(), touchDebounceMs: TOUCH_DEBOUNCE_MS };
-  return {
-    deployments: backing.deployments ?? createMemoryMap<Deployment>(),
-    git: createDeployGitStore(backing.git),
-    ...(backing.pg ? { pg: backing.pg } : {}),
-    touchDebounceMs: backing.touchDebounceMs ?? TOUCH_DEBOUNCE_MS,
-  };
-}
-
 interface DeployAccess {
   readOne(id: string): Promise<number | null>;
   readAll(): Promise<Map<string, number>>;
@@ -166,22 +149,32 @@ interface DeployAccess {
   findByName?(name: string): Promise<Deployment | null>;
 }
 
-function createMemoryDeployAccess(deployments: DurableMap<Deployment>): DeployAccess {
-  const accessAt = new Map<string, number>();
-  return {
-    async readOne(id) {
-      return accessAt.get(id) ?? null;
-    },
-    async readAll() {
-      return new Map(accessAt);
-    },
-    async write(id, at) {
-      if (!(await deployments.get(id))) return false;
-      accessAt.set(id, Math.max(accessAt.get(id) ?? 0, at));
-      return true;
-    },
-  };
-}
+const NAME_LOOKUP = {
+  id: "durable-map/deployments/0011-access-tenants-name-lookup",
+  statements: [
+    `CREATE INDEX CONCURRENTLY IF NOT EXISTS deployments_name_lookup ON deployments ((json->>'name')) WHERE json->>'name' IS NOT NULL`,
+  ],
+};
+
+const ACCESS_TENANCY = tenantTables(
+  "durable-map/deployments/0011-access-tenants",
+  [{ table: "deployment_access", primaryKey: "id" }],
+  {
+    foreignKeys: [
+      {
+        table: "deployment_access",
+        name: "deployment_access_id_fkey",
+        columns: "id",
+        references: "deployments(tenant_id, id)",
+        onDelete: "CASCADE",
+      },
+    ],
+    after: [
+      `DROP INDEX IF EXISTS ${NAME_INDEX}`,
+      `CREATE UNIQUE INDEX ${NAME_INDEX} ON deployments (tenant_id, (json->>'name')) WHERE json->>'name' IS NOT NULL`,
+    ],
+  },
+);
 
 function createPgDeployAccess(pg: PgPool): DeployAccess {
   const migration = {
@@ -194,24 +187,25 @@ function createPgDeployAccess(pg: PgPool): DeployAccess {
       )`,
     ],
   };
-  pg.registerMigration(migration);
+  const preKeyed = createIfParentTenantKeyed(
+    "deploy/access/0000-tenant-keyed-deployments",
+    "deployments",
+    "deployment_access",
+    "CREATE TABLE deployment_access (id TEXT NOT NULL, last_access_at BIGINT NOT NULL)",
+  );
+  const migrations = [
+    ...TENANCY,
+    preKeyed,
+    migration,
+    ...durableMapTenancy("deployments"),
+    ...ACCESS_TENANCY,
+    NAME_LOOKUP,
+  ];
+  for (const definition of migrations) pg.registerMigration(definition);
   let readyP: Promise<void> | null = null;
   function ready(): Promise<void> {
     if (!readyP) {
-      readyP = (async () => {
-        await pg.migrate(migration);
-        await pg
-          .q(
-            `CREATE UNIQUE INDEX IF NOT EXISTS ${NAME_INDEX}
-             ON deployments ((json->>'name')) WHERE json->>'name' IS NOT NULL`,
-          )
-          .catch((e) =>
-            swallow(
-              "deploy-store: could not create unique name index on deployments (concurrent boot, or duplicate names)",
-              e,
-            ),
-          );
-      })().catch((e) => {
+      readyP = pg.migrate(...migrations).catch((e) => {
         readyP = null;
         throw e;
       });
@@ -234,7 +228,7 @@ function createPgDeployAccess(pg: PgPool): DeployAccess {
       const res = await pg.query(
         `INSERT INTO deployment_access (id, last_access_at)
          SELECT d.id, $2::bigint FROM deployments d WHERE d.id = $1
-         ON CONFLICT (id) DO UPDATE SET last_access_at = GREATEST(deployment_access.last_access_at, EXCLUDED.last_access_at)`,
+         ON CONFLICT (tenant_id, id) DO UPDATE SET last_access_at = GREATEST(deployment_access.last_access_at, EXCLUDED.last_access_at)`,
         [id, at],
       );
       return res.rowCount > 0;
@@ -257,9 +251,11 @@ function isNameConflict(e: unknown): boolean {
   return err?.code === "23505" && err?.constraint === NAME_INDEX;
 }
 
-export function createDeployStore(backing?: DurableMap<Deployment> | DeployStoreBackings): DeployStore {
-  const { deployments: backingMap, git, pg, touchDebounceMs } = normalizeBackings(backing);
-  const access = pg ? createPgDeployAccess(pg) : createMemoryDeployAccess(backingMap);
+export function createDeployStore(backing: DeployStoreBackings): DeployStore {
+  const backingMap = backing.deployments;
+  const git = createDeployGitStore(backing.git);
+  const touchDebounceMs = backing.touchDebounceMs ?? TOUCH_DEBOUNCE_MS;
+  const access = createPgDeployAccess(backing.pg);
   const lastTouch = new Map<string, number>();
 
   function withAccess(d: Deployment, at: number | null | undefined): Deployment {
@@ -381,6 +377,9 @@ export function createDeployStore(backing?: DurableMap<Deployment> | DeployStore
       const [ds, accessAt] = await Promise.all([backingMap.all(), access.readAll()]);
       return ds.map((d) => withAccess(d, accessAt.get(d.id)));
     },
+    async acrossTenants() {
+      return (await backingMap.acrossTenants()).map(({ tenantId, value }) => ({ ...value, tenantId }));
+    },
     async setCurrentVersion(id, version) {
       const d = await backingMap.get(id);
       if (!d) return;
@@ -439,6 +438,9 @@ export function createDeployStore(backing?: DurableMap<Deployment> | DeployStore
     async setEmbedAncestors(id, embedAncestors) {
       await backingMap.merge(id, { embedAncestors } as Partial<Deployment>);
     },
+    async setConnectors(id, connectors) {
+      await backingMap.merge(id, { connectors });
+    },
     async setPublic(id, isPublic) {
       await backingMap.merge(id, { public: isPublic ? true : undefined });
     },
@@ -470,6 +472,7 @@ export function createDeployStore(backing?: DurableMap<Deployment> | DeployStore
       const v = (await backingMap.get(id))?.versions.find((x) => x.version === version);
       return v?.commit ? git.treeOf(id, v.commit) : null;
     },
+    commitTreeOf: (id, commit) => git.treeOf(id, commit),
     async filesOf(id, version, paths) {
       const v = (await backingMap.get(id))?.versions.find((x) => x.version === version);
       return v?.commit ? git.filesOf(id, v.commit, paths) : null;
