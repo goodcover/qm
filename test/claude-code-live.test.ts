@@ -11,6 +11,8 @@ import { buildApp } from "./support/build-app.ts";
 import { testConfig } from "./support/test-config.ts";
 
 const TOKEN_FILE = process.env.CLAUDE_CODE_LIVE_TOKEN_FILE;
+const ANTHROPIC_HOSTS = ["anthropic.com", "claude.ai", "claude.com"];
+const LIMIT_LOG = "[claude-code] subscription limit ";
 const MODEL_ID = process.env.CLAUDE_CODE_LIVE_MODEL ?? "claude-code/claude-sonnet-5";
 
 async function accountEvidence(token: string): Promise<Record<string, unknown>> {
@@ -41,17 +43,19 @@ test(
     const realFetch = globalThis.fetch;
     const direct: string[] = [];
     t.mock.method(globalThis, "fetch", (input: string | URL | Request, init?: RequestInit) => {
-      const url = String(input instanceof Request ? input.url : input);
-      if (/anthropic\.com|claude\.ai|claude\.com/.test(new URL(url).hostname)) {
-        direct.push(new URL(url).hostname);
+      const host = new URL(String(input instanceof Request ? input.url : input)).hostname;
+      if (ANTHROPIC_HOSTS.some((suffix) => host === suffix || host.endsWith(`.${suffix}`))) {
+        direct.push(host);
         throw new Error("QM must not call Anthropic directly in this check");
       }
       return realFetch(input, init);
     });
     const evidence: string[] = [];
+    const limits: Array<Record<string, unknown>> = [];
     const logError = console.error.bind(console);
     t.mock.method(console, "error", (...args: unknown[]) => {
       const line = args.map(String).join(" ");
+      if (line.startsWith(LIMIT_LOG)) limits.push(JSON.parse(line.slice(LIMIT_LOG.length)) as Record<string, unknown>);
       if (line.startsWith("[claude-code]")) evidence.push(line.replaceAll(token, "<token>"));
       logError(...args);
     });
@@ -104,12 +108,9 @@ test(
       assert.ok(tools.includes("history"), "the model called a QM tool and QM ran it");
       assert.match(replies.at(-1) ?? "", /kiwi/i, "the resumed turn saw the first turn's tool call");
       assert.deepEqual(direct, [], "every Anthropic request came from the Claude Code child, none from QM");
+      assert.ok(limits.length > 0, "Claude reported subscription limits");
       assert.ok(
-        evidence.some((line) => line.includes("subscription limit")),
-        "Claude reported subscription limits",
-      );
-      assert.ok(
-        !evidence.some((line) => /"isUsingOverage":true|"overageInUse":true/.test(line)),
+        limits.every((limit) => limit.isUsingOverage !== true && limit.overageInUse !== true),
         "no request drew on extra usage",
       );
     } finally {

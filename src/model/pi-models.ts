@@ -20,7 +20,7 @@ import { MODEL_REGISTRY, type ModelEntry } from "./model-registry.ts";
 import { providerBaseUrl } from "./provider-endpoints.ts";
 import { type CustomRuntimeModel, isCustomModelId, resolveCustomModel } from "./custom-providers.ts";
 import type { ProviderKeys } from "./model-runtime.ts";
-import { CLAUDE_CODE_PREFIX, CLAUDE_CODE_PROVIDER } from "./claude-subscription.ts";
+import { CLAUDE_CODE_PREFIX, CLAUDE_CODE_PROVIDER, claudeCodeNativeId } from "./claude-subscription.ts";
 
 const getModel = getBuiltinModel as unknown as (provider: string, id: string) => Model<Api> | undefined;
 
@@ -231,7 +231,7 @@ export function modelRequestOverrides(id: string): ModelEntry["request"] {
 
 export function resolveBuiltinModel(id: string): PiModel | undefined {
   if (id.startsWith(CLAUDE_CODE_PREFIX)) {
-    const native = resolveBuiltinModel(id.slice(CLAUDE_CODE_PREFIX.length));
+    const native = resolveBuiltinModel(claudeCodeNativeId(id));
     if (native?.provider !== "anthropic") return undefined;
     return {
       ...native,
@@ -332,6 +332,10 @@ export function auxiliaryModelForProvider(provider: string): string | undefined 
 export function auxiliaryModelFor(baseModelId: string): string {
   const provider = resolveModel(baseModelId)?.provider;
   if (!provider) return baseModelId;
+  if (provider === CLAUDE_CODE_PROVIDER) {
+    const native = auxiliaryModelForProvider("anthropic");
+    return native && resolveModel(CLAUDE_CODE_PREFIX + native) ? CLAUDE_CODE_PREFIX + native : baseModelId;
+  }
   return auxiliaryModelForProvider(provider) ?? baseModelId;
 }
 
@@ -442,7 +446,7 @@ export const FAST_MODE_MODEL_IDS: readonly string[] = MODEL_REGISTRY.filter((m) 
 
 export function defaultInteractiveThinkingLevel(model: Pick<PiModel, "api" | "provider">): string {
   const provider = String(model.provider ?? model.api ?? "").toLowerCase();
-  return provider.includes("anthropic") ? "low" : "auto";
+  return provider.includes("anthropic") || provider === CLAUDE_CODE_PROVIDER ? "low" : "auto";
 }
 
 export const DEFAULT_AGENT_INPUT_USD_PER_MTOK = 5;

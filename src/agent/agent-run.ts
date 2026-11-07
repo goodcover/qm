@@ -3,8 +3,8 @@ import {
   applyFastSpeed,
   buildModelRuntime,
   piUsageToCallUsage,
-  providerKey,
   wantsFastMode,
+  withModelRuntime,
   withRequestHeaders,
   type ProviderKeys,
   type QmModelRuntime,
@@ -79,7 +79,7 @@ import {
   type ModelGatewayTransportConfig,
   type ModelRequestPurpose,
 } from "../model/provider-endpoints.ts";
-import { modelBilling, routeLabel, servedBySubscription, type ModelRoute } from "../model/model-route.ts";
+import { modelBilling, routeKeys, routeLabel, servedBySubscription, type ModelRoute } from "../model/model-route.ts";
 import {
   type Agent,
   type CompactInput,
@@ -874,7 +874,7 @@ export function createAgent(opts?: AgentOptions): Agent {
   const routeFor = async (requestedId: string, personalKeys?: ProviderKeys): Promise<ModelRoute> => {
     const modelId = personalKeys ? personalModelId(requestedId, personalKeys) : requestedId;
     const model = requiredModel(modelId, !personalKeys);
-    const keys = personalKeys ?? (await resolveProviderKeys());
+    const keys = routeKeys(model, personalKeys ?? (await resolveProviderKeys()));
     const gateway = personalKeys ? undefined : modelGateway;
     return {
       modelId,
@@ -885,7 +885,7 @@ export function createAgent(opts?: AgentOptions): Agent {
     };
   };
   const servable = (route: ModelRoute): ModelRoute | undefined =>
-    route.billing === "model_gateway" || providerKey(route.keys, String(route.model.provider)) ? route : undefined;
+    route.billing === "model_gateway" || route.keys[String(route.model.provider)] ? route : undefined;
   const sessionRoute = (session: Pick<CompactInput, "runtime" | "providerKeys">) =>
     routeFor(session.runtime?.modelId ?? baseModelId(), session.providerKeys);
   const utilityRoute = async (modelId?: string) =>
@@ -1682,21 +1682,17 @@ export function createAgent(opts?: AgentOptions): Agent {
     },
 
     async compactHistory(input: CompactInput): Promise<string> {
-      const summarize = async (route: ModelRoute) => {
-        const runtime = await buildModelRuntime(route.keys, route.gateway, "compaction");
-        try {
-          return await summarizeHistory(input.history, route.model, (summaryModel, context, options) => {
+      const summarize = (route: ModelRoute) =>
+        withModelRuntime(route.keys, route.gateway, "compaction", (runtime) =>
+          summarizeHistory(input.history, route.model, (summaryModel, context, options) => {
             input.recordModelCall({
               model: route.modelId,
               inputTokens: countTokens(context.systemPrompt ?? "") + countTokens(JSON.stringify(context.messages)),
               entryCount: input.history.length,
             });
             return runtime.streamSimple(summaryModel, context, options);
-          });
-        } finally {
-          await runtime.close();
-        }
-      };
+          }),
+        );
       const primary = servable(await sessionRoute(input));
       if (!primary)
         throw new Error(`no configured credential can serve ${input.runtime?.modelId ?? baseModelId()} for a summary`);
@@ -1784,14 +1780,13 @@ export function createAgent(opts?: AgentOptions): Agent {
       const route = await utilityRoute();
       if (!route) return undefined;
       const prompt = `Candidates: ${candidates.join(", ")}\n\nMessage: ${text.slice(0, 2000)}`;
-      const runtime = await buildModelRuntime(route.keys, route.gateway, "ack_emoji");
-      const reply = await runtime
-        .completeSimple(
+      const reply = await withModelRuntime(route.keys, route.gateway, "ack_emoji", (runtime) =>
+        runtime.completeSimple(
           route.model,
           { systemPrompt: ACK_EMOJI_PROMPT, messages: [{ role: "user", content: prompt, timestamp: Date.now() }] },
           { maxTokens: 64, signal: AbortSignal.timeout(2_000) },
-        )
-        .finally(() => runtime.close());
+        ),
+      );
       if (reply.stopReason === "error") throw providerTurnError(reply);
       const raw = reply.content.find((block) => block.type === "text")?.text;
       if (!raw) return undefined;

@@ -12,6 +12,7 @@ import {
 import type { AssistantMessage, Message } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { buildModelRuntime, type ProviderKeys } from "../../src/model/model-runtime.ts";
+import { routeKeys } from "../../src/model/model-route.ts";
 import { resolveModel } from "../../src/model/pi-models.ts";
 
 export const CLAUDE_CODE_TEST_SYSTEM =
@@ -42,7 +43,8 @@ export async function claudeCodeSession(
   modelId = "claude-code/claude-sonnet-5",
 ): Promise<{ session: AgentSession; close: () => Promise<void> }> {
   const dir = mkdtempSync(join(tmpdir(), "claude-code-session-test-"));
-  const runtime = await buildModelRuntime(keys);
+  const model = resolveModel(modelId)!;
+  const runtime = await buildModelRuntime(routeKeys(model, keys));
   const settingsManager = SettingsManager.inMemory({}, { projectTrusted: false });
   const resourceLoader = new DefaultResourceLoader({
     cwd: dir,
@@ -58,7 +60,7 @@ export async function claudeCodeSession(
   });
   await resourceLoader.reload();
   const { session } = await createAgentSession({
-    model: resolveModel(modelId)!,
+    model,
     modelRuntime: runtime,
     resourceLoader,
     settingsManager,

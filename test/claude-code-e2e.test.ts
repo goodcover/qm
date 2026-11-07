@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { buildApp } from "./support/build-app.ts";
 import { testConfig } from "./support/test-config.ts";
-import { installFakeClaudeCode, processAlive, type FakeRequest } from "./support/fake-claude-code.ts";
+import { installFakeClaudeCode, type FakeRequest } from "./support/fake-claude-code.ts";
 
 const COMPANY_TOKEN = "sk-ant-oat01-company-claude-code-e2e";
 const MODEL_ID = "claude-code/claude-sonnet-5";
@@ -56,8 +56,6 @@ test("a QM turn on claude-code serves QM's real prompt and tools, records usage,
     );
 
     const call = fake.calls.find((c) => c.options.mcpServers)!;
-    const system = String(call.options.systemPrompt);
-    assert.ok(system.length > 2_000 && system.includes("QM"), "QM's composed system prompt, not Claude Code's");
     assert.ok(requests[0]!.tools.includes("mcp__qm__history") && requests[0]!.tools.includes("mcp__qm__execute"));
     assert.ok(
       requests[0]!.tools.every((name) => name.startsWith("mcp__qm__")),
@@ -65,12 +63,16 @@ test("a QM turn on claude-code serves QM's real prompt and tools, records usage,
     );
     assert.equal((call.options.env as Record<string, string>).CLAUDE_CODE_OAUTH_TOKEN, COMPANY_TOKEN);
     assert.ok(!call.options.resume, "the first turn has no prior history");
-    assert.ok(!processAlive(call.child));
 
     const records = await built.sessions.listLlmRequests(session!.id);
     const turnRecords = records.filter((record) => record.model === MODEL_ID && record.turnSeq !== null);
     assert.equal(turnRecords.length, 2, "both model calls of the turn are recorded");
     assert.equal(turnRecords.at(-1)?.usage?.input, 40);
+    assert.equal(
+      (turnRecords[0]!.promptEnvelope as { system?: string }).system,
+      call.options.systemPrompt,
+      "Claude Code received exactly the system prompt QM recorded for the request",
+    );
 
     const second = await turn(built, "claude-code-e2e", { text: "again" });
     const again = await built.runs.waitFor(second.runId!, 20_000);
@@ -79,10 +81,10 @@ test("a QM turn on claude-code serves QM's real prompt and tools, records usage,
     assert.ok(resumed, "the second turn resumes an imported transcript");
     const flat = JSON.stringify(resumed.history);
     assert.ok(flat.includes("mcp__qm__history") && flat.includes("tool_result") && flat.includes("pong 2"));
-    assert.equal(String(resumed.options.systemPrompt).length > 2_000, true);
   } finally {
     await built.runtime.stop();
   }
+  assert.deepEqual(await fake.leftovers(), []);
 });
 
 test("under the strict posture a Claude Code tool call pauses for QM approval and resumes after it", async (t) => {
@@ -106,10 +108,7 @@ test("under the strict posture a Claude Code tool call pauses for QM approval an
       ["needs_approval"],
       "the only history result before approval is QM's approval boundary",
     );
-    assert.ok(
-      !processAlive(fake.calls[0]!.child) && fake.calls[0]!.closed,
-      "the parked Claude Code query ended with the turn",
-    );
+    assert.deepEqual(await fake.leftovers(), [], "the parked Claude Code query ended with the turn");
 
     const approved = await turn(built, "claude-code-approval-e2e", {
       approval: { requestId: pending[0]!.requestId, approved: true },

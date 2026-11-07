@@ -27,6 +27,12 @@ export function modelBilling(viaGateway: boolean, personal: boolean, subscriptio
   return subscription ? "org_subscription" : "org_key";
 }
 
+export function routeKeys(model: Model<Api>, keys: ProviderKeys): ProviderKeys {
+  return model.provider === CLAUDE_CODE_PROVIDER && keys.anthropic
+    ? { ...keys, [CLAUDE_CODE_PROVIDER]: keys.anthropic }
+    : keys;
+}
+
 export function servedBySubscription(model: Model<Api>, keys: ProviderKeys): boolean {
   return (
     model.provider === CODEX_SUBSCRIPTION_PROVIDER ||

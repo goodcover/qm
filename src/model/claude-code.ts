@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type {
@@ -19,8 +19,11 @@ import { createSession, type ContentBlock, type Message as TranscriptMessage } f
 import {
   calculateCost,
   createAssistantMessageEventStream,
+  EventStream,
+  parseStreamingJson,
   type Api,
   type AssistantMessage,
+  type AssistantMessageDiagnostic,
   type AssistantMessageEventStream,
   type Context,
   type ImageContent,
@@ -29,22 +32,27 @@ import {
   type ProviderErrorInfo,
   type SimpleStreamOptions,
   type TextContent,
-  type Tool,
   type ToolCall,
   type ToolResultMessage,
   type Usage,
 } from "@earendil-works/pi-ai";
 import { transformMessages } from "@earendil-works/pi-ai/api/transform-messages";
-import { CLAUDE_CODE_PREFIX, isClaudeSubscriptionToken } from "./claude-subscription.ts";
+import { MAX_TOOL_RESULT_CHARS } from "../agent/agent-tools/record.ts";
+import { asError, errMessage, swallow } from "../util/errors.ts";
+import { claudeCodeNativeId, isClaudeSubscriptionToken } from "./claude-subscription.ts";
+import { zeroUsage } from "./model-runtime.ts";
+import { providerBaseUrl } from "./provider-endpoints.ts";
 
 const SERVER = "qm";
 const TOOL_PREFIX = `mcp__${SERVER}__`;
+const ANTHROPIC_TOOL_NAME_LIMIT = 64;
 const TOOL_USE_ID = "claudecode/toolUseId";
 const CLIENT_APP = "qm/claude-code-provider";
-const EXIT_GRACE_MS = 5_000;
+const WORK_DIR = join(tmpdir(), "qm-claude-code-cwd");
+const HOST_MANAGED_SETTINGS = ["managed-settings.json", "managed-settings.d", "managed-mcp.json"].map((name) =>
+  join("/etc/claude-code", name),
+);
 const RESUMED_AT_TOOL_RESULTS = "[system] The run resumed after the tool results above. Continue the task.";
-const ACCEPTED_KEY_SOURCES = new Set(["none", "oauth"]);
-const CLAUDE_CODE_MCP_DESCRIPTION_LIMIT = 4096;
 
 const EFFORT: Record<string, EffortLevel> = {
   minimal: "low",
@@ -54,36 +62,39 @@ const EFFORT: Record<string, EffortLevel> = {
   xhigh: "xhigh",
   max: "max",
 };
+const EFFORT_LEVELS = new Set<string>(Object.values(EFFORT));
 
-const ERROR_TYPES: Record<SDKAssistantMessageError, { type: string; status: number }> = {
-  authentication_failed: { type: "authentication_error", status: 401 },
-  oauth_org_not_allowed: { type: "permission_error", status: 403 },
-  account_on_hold: { type: "permission_error", status: 403 },
-  verification_required: { type: "permission_error", status: 403 },
-  cloud_credential_error: { type: "authentication_error", status: 401 },
-  billing_error: { type: "billing_error", status: 400 },
-  rate_limit: { type: "rate_limit_error", status: 429 },
-  overloaded: { type: "overloaded_error", status: 529 },
-  invalid_request: { type: "invalid_request_error", status: 400 },
-  max_output_tokens: { type: "invalid_request_error", status: 400 },
-  model_not_found: { type: "not_found_error", status: 404 },
-  server_error: { type: "api_error", status: 500 },
-  unknown: { type: "api_error", status: 500 },
+const ERROR_TYPES: Record<SDKAssistantMessageError, string> = {
+  authentication_failed: "authentication_error",
+  cloud_credential_error: "authentication_error",
+  oauth_org_not_allowed: "permission_error",
+  account_on_hold: "permission_error",
+  verification_required: "permission_error",
+  billing_error: "invalid_request_error",
+  invalid_request: "invalid_request_error",
+  max_output_tokens: "invalid_request_error",
+  rate_limit: "rate_limit_error",
+  overloaded: "overloaded_error",
+  model_not_found: "not_found_error",
+  server_error: "api_error",
+  unknown: "api_error",
 };
 
-export function claudeCodeEnv(token: string, home: string): Record<string, string> {
+export function claudeCodeEnv(token: string, home: string, longestToolDescription = 0): Record<string, string> {
   return {
     PATH: "/usr/local/bin:/usr/bin:/bin",
     HOME: home,
     CLAUDE_CONFIG_DIR: home,
-    TMPDIR: home,
     CLAUDE_CODE_OAUTH_TOKEN: token,
     CLAUDE_AGENT_SDK_CLIENT_APP: CLIENT_APP,
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
     ENABLE_CLAUDEAI_MCP_SERVERS: "0",
-    DISABLE_AUTO_COMPACT: "1",
+    DISABLE_COMPACT: "1",
     CLAUDE_CODE_SILENT_TURN_REMINDER: "0",
+    CLAUDE_CODE_TOTAL_TOKENS_REMINDER: "off",
     CLAUDE_CODE_RESUME_INTERRUPTED_TURN_MAX_AGE_MS: "1",
+    MAX_MCP_OUTPUT_TOKENS: String(MAX_TOOL_RESULT_CHARS),
+    ...(longestToolDescription ? { CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH: String(longestToolDescription) } : {}),
   };
 }
 
@@ -95,30 +106,17 @@ class ClaudeCodeFailure extends Error {
   }
 }
 
-class InputQueue implements AsyncIterable<SDKUserMessage> {
-  private items: SDKUserMessage[] = [];
-  private wake: (() => void) | undefined;
-  private ended = false;
-  push(message: SDKUserMessage): void {
-    this.items.push(message);
-    this.wake?.();
-  }
-  end(): void {
-    this.ended = true;
-    this.wake?.();
-  }
-  async *[Symbol.asyncIterator](): AsyncIterator<SDKUserMessage> {
-    for (;;) {
-      const next = this.items.shift();
-      if (next) {
-        yield next;
-        continue;
-      }
-      if (this.ended) return;
-      await new Promise<void>((resolve) => (this.wake = resolve));
-      this.wake = undefined;
-    }
-  }
+interface ServedTool {
+  name: string;
+  description: string;
+  input_schema: unknown;
+}
+
+interface ClaudeCodeRequest {
+  model: string;
+  system: string;
+  messages: TranscriptMessage[];
+  tools: ServedTool[];
 }
 
 interface Step {
@@ -135,7 +133,7 @@ interface Step {
 interface Live {
   query?: Query;
   model: Model<Api>;
-  input: InputQueue;
+  input: EventStream<SDKUserMessage, void>;
   served: Map<string, string>;
   waiting: Map<string, (result: CallToolResult) => void>;
   ready: Map<string, CallToolResult>;
@@ -144,7 +142,9 @@ interface Live {
   awaiting: string[];
   failure?: Error;
   apiError?: { kind: SDKAssistantMessageError; text: string };
+  limits: AssistantMessageDiagnostic[];
   child?: ChildProcess;
+  exit?: string;
   exited: Promise<void>;
   markExited: () => void;
   dir: string;
@@ -157,32 +157,26 @@ interface ClaudeCodeConnection {
   close(): Promise<void>;
 }
 
-function emptyUsage(): Usage {
+function newStep(stream: AssistantMessageEventStream, model: Model<Api>): Step {
   return {
-    input: 0,
-    output: 0,
-    cacheRead: 0,
-    cacheWrite: 0,
-    totalTokens: 0,
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    stream,
+    output: {
+      role: "assistant",
+      content: [],
+      api: model.api,
+      provider: model.provider,
+      model: model.id,
+      usage: zeroUsage(),
+      stopReason: "stop",
+      timestamp: Date.now(),
+    },
+    started: false,
+    open: new Map(),
+    json: new Map(),
+    calls: [],
+    billed: zeroUsage(),
+    current: zeroUsage(),
   };
-}
-
-function newOutput(model: Model<Api>): AssistantMessage {
-  return {
-    role: "assistant",
-    content: [],
-    api: model.api,
-    provider: model.provider,
-    model: model.id,
-    usage: emptyUsage(),
-    stopReason: "stop",
-    timestamp: Date.now(),
-  };
-}
-
-function nativeModelId(model: Model<Api>): string {
-  return model.id.startsWith(CLAUDE_CODE_PREFIX) ? model.id.slice(CLAUDE_CODE_PREFIX.length) : model.id;
 }
 
 function toolCallId(id: string): string {
@@ -198,7 +192,7 @@ function imageBlock(image: ImageContent): ContentBlock {
 }
 
 function textBlocks(text: string): ContentBlock[] {
-  return text ? [{ type: "text", text }] : [];
+  return text.trim() ? [{ type: "text", text }] : [];
 }
 
 function userBlocks(content: string | (TextContent | ImageContent)[]): ContentBlock[] {
@@ -206,34 +200,27 @@ function userBlocks(content: string | (TextContent | ImageContent)[]): ContentBl
   return content.flatMap((block) => (block.type === "text" ? textBlocks(block.text) : [imageBlock(block)]));
 }
 
-function resultBlocks(result: ToolResultMessage): ContentBlock[] {
-  return result.content.map((block) =>
-    block.type === "text" ? { type: "text", text: block.text } : imageBlock(block),
-  );
-}
-
-function assistantBlocks(message: AssistantMessage): ContentBlock[] {
+function messageBlocks(message: Message): ContentBlock[] {
+  if (message.role === "user") return userBlocks(message.content);
+  if (message.role === "toolResult")
+    return [
+      {
+        type: "tool_result",
+        tool_use_id: message.toolCallId,
+        content: message.content.map((block) =>
+          block.type === "text" ? { type: "text", text: block.text } : imageBlock(block),
+        ),
+        ...(message.isError ? { is_error: true } : {}),
+      },
+    ];
   return message.content.flatMap((block): ContentBlock[] => {
-    if (block.type === "text") return block.text ? [{ type: "text", text: block.text }] : [];
+    if (block.type === "text") return textBlocks(block.text);
     if (block.type === "thinking")
       return block.thinkingSignature && !block.redacted
         ? [{ type: "thinking", thinking: block.thinking, signature: block.thinkingSignature }]
         : [];
     return [{ type: "tool_use", id: block.id, name: TOOL_PREFIX + block.name, input: block.arguments }];
   });
-}
-
-function messageBlocks(message: Message): ContentBlock[] {
-  if (message.role === "assistant") return assistantBlocks(message);
-  if (message.role === "user") return userBlocks(message.content);
-  return [
-    {
-      type: "tool_result",
-      tool_use_id: message.toolCallId,
-      content: resultBlocks(message),
-      ...(message.isError ? { is_error: true } : {}),
-    },
-  ];
 }
 
 function claudeCodeTranscript(history: readonly Message[]): TranscriptMessage[] {
@@ -249,16 +236,15 @@ function claudeCodeTranscript(history: readonly Message[]): TranscriptMessage[] 
   return out;
 }
 
-interface ClaudeCodeRequest {
-  model: string;
-  system: string;
-  messages: TranscriptMessage[];
-  tools: { name: string; description: string; input_schema: unknown }[];
-}
-
 function isRequest(value: unknown): value is ClaudeCodeRequest {
   const request = value as Partial<ClaudeCodeRequest> | null;
-  return !!request && typeof request === "object" && Array.isArray(request.messages);
+  return (
+    !!request &&
+    typeof request.model === "string" &&
+    typeof request.system === "string" &&
+    Array.isArray(request.messages) &&
+    Array.isArray(request.tools)
+  );
 }
 
 function splitPrompt(messages: readonly TranscriptMessage[]): {
@@ -276,9 +262,12 @@ function splitPrompt(messages: readonly TranscriptMessage[]): {
 }
 
 function userMessage(content: ContentBlock[]): SDKUserMessage {
+  const [first, ...rest] = content;
+  const literal =
+    first?.type === "text" && first.text.startsWith("/") ? [{ ...first, text: `\n${first.text}` }, ...rest] : content;
   return {
     type: "user",
-    message: { role: "user", content: content as Exclude<SDKUserMessage["message"]["content"], string> },
+    message: { role: "user", content: literal as Exclude<SDKUserMessage["message"]["content"], string> },
     parent_tool_use_id: null,
   };
 }
@@ -294,30 +283,30 @@ function mcpResult(result: ToolResultMessage): CallToolResult {
   };
 }
 
-function unservable(tools: readonly Tool[]): string[] {
+function unservable(tools: readonly ServedTool[]): string[] {
   return tools.flatMap((tool) => {
-    const schema = tool.parameters as Record<string, unknown>;
+    const schema = tool.input_schema as Record<string, unknown>;
     if (schema.type !== "object" || ["anyOf", "oneOf", "allOf"].some((key) => key in schema))
       return [`${tool.name} (its parameters are not a plain object schema)`];
-    return tool.description.length > CLAUDE_CODE_MCP_DESCRIPTION_LIMIT
-      ? [`${tool.name} (Claude Code truncates tool descriptions over ${CLAUDE_CODE_MCP_DESCRIPTION_LIMIT} characters)`]
+    return tool.name.length > ANTHROPIC_TOOL_NAME_LIMIT
+      ? [`${tool.name} (longer than the ${ANTHROPIC_TOOL_NAME_LIMIT}-character tool name limit)`]
       : [];
   });
 }
 
-function toolServer(tools: readonly Tool[], live: Live) {
+function toolServer(tools: readonly ServedTool[], live: Live) {
   const server = new McpServer({ name: SERVER, version: "1.0.0" }, { capabilities: { tools: {} } });
-  const names = new Set(tools.map((tool) => tool.name));
   server.server.setRequestHandler(ListToolsRequestSchema, () => ({
     tools: tools.map((tool) => ({
-      name: tool.name,
+      name: tool.name.slice(TOOL_PREFIX.length),
       description: tool.description,
-      inputSchema: tool.parameters as { type: "object" },
+      inputSchema: tool.input_schema as { type: "object" },
     })),
   }));
   server.server.setRequestHandler(CallToolRequestSchema, (request) => {
     const id = request.params._meta?.[TOOL_USE_ID];
-    if (!names.has(request.params.name)) throw new Error(`QM does not serve a tool named ${request.params.name}`);
+    if (!live.served.has(TOOL_PREFIX + request.params.name))
+      throw new Error(`QM does not serve a tool named ${request.params.name}`);
     if (typeof id !== "string") throw new Error(`${request.params.name}: tools/call is missing its tool_use id`);
     const ready = live.ready.get(id);
     if (ready) {
@@ -339,6 +328,13 @@ function deliver(live: Live, id: string, result: CallToolResult): void {
   waiting(result);
 }
 
+function effortFor(model: Model<Api>, reasoning: string | undefined): EffortLevel | undefined {
+  if (!reasoning) return undefined;
+  const mapped = model.thinkingLevelMap?.[reasoning as keyof NonNullable<Model<Api>["thinkingLevelMap"]>];
+  if (mapped === null) return undefined;
+  return typeof mapped === "string" && EFFORT_LEVELS.has(mapped) ? (mapped as EffortLevel) : EFFORT[reasoning];
+}
+
 function started(step: Step): void {
   if (step.started) return;
   step.started = true;
@@ -351,6 +347,7 @@ function settleUsage(step: Step, model: Model<Api>): void {
   usage.output = step.billed.output + step.current.output;
   usage.cacheRead = step.billed.cacheRead + step.current.cacheRead;
   usage.cacheWrite = step.billed.cacheWrite + step.current.cacheWrite;
+  usage.cacheWrite1h = (step.billed.cacheWrite1h ?? 0) + (step.current.cacheWrite1h ?? 0);
   usage.totalTokens = usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
   usage.cost = calculateCost(model, usage);
 }
@@ -367,7 +364,7 @@ function endStep(live: Live, reason: "stop" | "length" | "toolUse"): void {
 
 function failStep(step: Step, error: Error, aborted: boolean): void {
   step.output.stopReason = aborted ? "aborted" : "error";
-  step.output.errorMessage = error.message;
+  step.output.errorMessage = errMessage(error);
   if (error instanceof ClaudeCodeFailure) step.output.providerError = error.providerError;
   step.stream.push({ type: "error", reason: aborted ? "aborted" : "error", error: step.output });
   step.stream.end();
@@ -381,13 +378,19 @@ function onStreamEvent(live: Live, event: Record<string, unknown> & { type: stri
   if (event.type === "message_start") {
     step.open.clear();
     step.json.clear();
-    const usage = (event.message as { usage?: Record<string, number | undefined> }).usage ?? {};
+    const usage =
+      (
+        event.message as {
+          usage?: Record<string, number | undefined> & { cache_creation?: { ephemeral_1h_input_tokens?: number } };
+        }
+      ).usage ?? {};
     step.current = {
-      ...emptyUsage(),
+      ...zeroUsage(),
       input: usage.input_tokens ?? 0,
       output: usage.output_tokens ?? 0,
       cacheRead: usage.cache_read_input_tokens ?? 0,
       cacheWrite: usage.cache_creation_input_tokens ?? 0,
+      cacheWrite1h: usage.cache_creation?.ephemeral_1h_input_tokens ?? 0,
     };
     settleUsage(step, live.model);
     return;
@@ -440,7 +443,9 @@ function onStreamEvent(live: Live, event: Record<string, unknown> & { type: stri
     } else if (delta.type === "signature_delta" && block.type === "thinking") {
       block.thinkingSignature = (block.thinkingSignature ?? "") + (delta.signature ?? "");
     } else if (delta.type === "input_json_delta" && block.type === "toolCall") {
-      step.json.set(index, (step.json.get(index) ?? "") + (delta.partial_json ?? ""));
+      const json = (step.json.get(index) ?? "") + (delta.partial_json ?? "");
+      step.json.set(index, json);
+      block.arguments = parseStreamingJson(json);
       step.stream.push({ type: "toolcall_delta", contentIndex: at, delta: delta.partial_json ?? "", partial: output });
     }
     return;
@@ -452,8 +457,7 @@ function onStreamEvent(live: Live, event: Record<string, unknown> & { type: stri
     else if (block.type === "thinking")
       step.stream.push({ type: "thinking_end", contentIndex: at, content: block.thinking, partial: output });
     else if (block.type === "toolCall") {
-      const json = step.json.get(index) ?? "";
-      block.arguments = live.inputs.get(block.id) ?? (json ? (JSON.parse(json) as Record<string, unknown>) : {});
+      block.arguments = live.inputs.get(block.id) ?? parseStreamingJson(step.json.get(index));
       step.calls.push(block.id);
       step.stream.push({ type: "toolcall_end", contentIndex: at, toolCall: block, partial: output });
     }
@@ -475,7 +479,7 @@ function onStreamEvent(live: Live, event: Record<string, unknown> & { type: stri
     for (const contentIndex of unfinished) output.content.splice(contentIndex, 1);
     step.open.clear();
     step.billed = { ...output.usage, cost: { ...output.usage.cost } };
-    step.current = emptyUsage();
+    step.current = zeroUsage();
     if (output.rawStopReason === "refusal") {
       live.step = undefined;
       failStep(step, new ClaudeCodeFailure("The model declined to continue (refusal)", { type: "refusal" }), false);
@@ -490,34 +494,46 @@ function onStreamEvent(live: Live, event: Record<string, unknown> & { type: stri
 
 function apiFailure(live: Live, text: string, status: number | null | undefined): ClaudeCodeFailure {
   const kind = live.apiError?.kind;
-  const mapped = kind ? ERROR_TYPES[kind] : undefined;
-  return new ClaudeCodeFailure(text || live.apiError?.text || "Claude Code reported an error", {
-    ...((status ?? mapped?.status) ? { status: status ?? mapped?.status } : {}),
-    ...(mapped ? { type: mapped.type } : {}),
-    ...(kind ? { code: kind } : {}),
+  return new ClaudeCodeFailure(text || live.apiError?.text || `Claude Code failed${kind ? ` (${kind})` : ""}`, {
+    ...(typeof status === "number" ? { status } : {}),
+    ...(kind ? { type: ERROR_TYPES[kind], code: kind } : {}),
   });
 }
 
-function fail(live: Live, error: Error): void {
-  live.failure ??= error;
-  const step = live.step;
-  live.step = undefined;
-  if (step) failStep(step, live.failure, false);
+function recordLimits(live: Live, step: Step): void {
+  if (live.limits.length) step.output.diagnostics = [...(step.output.diagnostics ?? []), ...live.limits.splice(0)];
 }
 
-function onMessage(live: Live, message: SDKMessage, servedNames: ReadonlySet<string>): void {
+function fail(live: Live, error: Error): void {
+  if (live.failure) swallow("claude-code: later failure", error);
+  else live.failure = error;
+  const step = live.step;
+  live.step = undefined;
+  if (step) failStep(step, live.failure ?? error, false);
+}
+
+function onMessage(live: Live, message: SDKMessage): void {
   if (message.type === "system" && message.subtype === "init") {
-    const foreign = message.tools.filter((name) => !servedNames.has(name));
-    if (foreign.length) throw new Error(`Claude Code exposed tools QM did not serve: ${foreign.join(", ")}`);
-    const missing = [...servedNames].filter((name) => !message.tools.includes(name));
-    if (missing.length) throw new Error(`Claude Code did not load these QM tools: ${missing.join(", ")}`);
-    if (!ACCEPTED_KEY_SOURCES.has(message.apiKeySource))
-      throw new Error(
+    const servers = message.mcp_servers.map((server) => `${server.name}=${server.status}`).join(", ");
+    const foreign = message.tools.filter((name) => !live.served.has(name));
+    const missing = [...live.served.keys()].filter((name) => !message.tools.includes(name));
+    if (foreign.length || missing.length)
+      throw new ClaudeCodeFailure(
+        `Claude Code's tools differ from QM's: extra [${foreign.join(", ")}], missing [${missing.join(", ")}], MCP servers [${servers}]`,
+        { type: "invalid_request_error" },
+      );
+    if (message.apiKeySource !== "none")
+      throw new ClaudeCodeFailure(
         `Claude Code reported API key source ${message.apiKeySource}; this route only uses a subscription login`,
+        { type: "permission_error" },
       );
     console.error(
       `[claude-code] query started cc=${message.claude_code_version} model=${message.model} apiKeySource=${message.apiKeySource} tools=${message.tools.length}`,
     );
+    return;
+  }
+  if (message.type === "system" && message.subtype !== "status") {
+    console.error(`[claude-code] ${message.subtype} ${JSON.stringify(message)}`);
     return;
   }
   if (message.type === "stream_event") {
@@ -539,11 +555,14 @@ function onMessage(live: Live, message: SDKMessage, servedNames: ReadonlySet<str
     return;
   }
   if (message.type === "rate_limit_event") {
-    console.error(`[claude-code] subscription limit ${JSON.stringify(message.rate_limit_info)}`);
-    if (message.rate_limit_info.isUsingOverage === true || message.rate_limit_info.overageInUse === true)
+    const info = message.rate_limit_info;
+    console.error(`[claude-code] subscription limit ${JSON.stringify(info)}`);
+    live.limits.push({ type: "claude_code_rate_limit", timestamp: Date.now(), details: { ...info } });
+    if (live.step) recordLimits(live, live.step);
+    if (info.isUsingOverage === true || info.overageInUse === true)
       throw new ClaudeCodeFailure(
         "Claude reported that this request is drawing on extra usage (overage); the claude-code route refuses metered usage",
-        { type: "billing_error", status: 400, code: "overage_in_use" },
+        { type: "invalid_request_error", code: "overage_in_use" },
       );
     return;
   }
@@ -554,7 +573,10 @@ function onMessage(live: Live, message: SDKMessage, servedNames: ReadonlySet<str
       endStep(live, live.step?.output.stopReason === "length" ? "length" : "stop");
       return;
     }
-    const text = message.subtype === "success" ? message.result : message.errors.join("\n");
+    const text =
+      message.subtype === "success"
+        ? message.result
+        : `${message.subtype}${message.terminal_reason ? ` (${message.terminal_reason})` : ""}: ${message.errors.join("; ")}`;
     fail(live, apiFailure(live, text, message.subtype === "success" ? message.api_error_status : undefined));
   }
 }
@@ -569,22 +591,16 @@ function spawnTracked(live: Live) {
     });
     live.child = child;
     child.stderr?.on("data", (data: Buffer) => console.error(`[claude-code] ${data.toString().trimEnd()}`));
-    child.once("exit", () => live.markExited());
-    child.once("error", () => live.markExited());
+    child.once("exit", (code, signal) => {
+      live.exit = `exit code ${code ?? "none"}, signal ${signal ?? "none"}`;
+      live.markExited();
+    });
+    child.once("error", (error) => {
+      live.exit = `spawn error: ${errMessage(error)}`;
+      live.markExited();
+    });
     return child as unknown as SpawnedProcess;
   };
-}
-
-async function stopChild(live: Live): Promise<void> {
-  const child = live.child;
-  if (!child) return live.markExited();
-  if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
-  const timer = setTimeout(() => child.kill("SIGKILL"), EXIT_GRACE_MS);
-  try {
-    await live.exited;
-  } finally {
-    clearTimeout(timer);
-  }
 }
 
 async function closeLive(live: Live, reason: string): Promise<void> {
@@ -601,10 +617,25 @@ async function closeLive(live: Live, reason: string): Promise<void> {
   try {
     live.query?.close();
   } catch (e) {
-    console.error(`[claude-code] closing the query failed: ${(e as Error).message}`);
+    swallow("claude-code: closing the query", e);
   }
-  await stopChild(live);
-  rmSync(live.dir, { recursive: true, force: true });
+  if (!live.child) live.markExited();
+  await live.exited;
+  try {
+    rmSync(live.dir, { recursive: true, force: true });
+  } catch (e) {
+    swallow("claude-code: removing the query directory", e);
+  }
+}
+
+function refusalFor(closed: boolean, token: string | undefined): string | undefined {
+  if (closed) return "This model runtime has been closed";
+  if (!isClaudeSubscriptionToken(token))
+    return "Claude Code models need a Claude subscription OAuth token; this route never uses a metered API key";
+  const baseUrl = providerBaseUrl("anthropic");
+  return baseUrl
+    ? `This deployment sends Anthropic traffic through ${baseUrl}, which Claude Code would bypass`
+    : undefined;
 }
 
 function continues(live: Live | undefined, messages: readonly Message[]): live is Live {
@@ -621,22 +652,7 @@ function continues(live: Live | undefined, messages: readonly Message[]): live i
 
 export function createClaudeCodeConnection(): ClaudeCodeConnection {
   let live: Live | undefined;
-
-  const attach = (target: Live, step: Step, messages: readonly Message[], signal: AbortSignal | undefined) => {
-    target.awaiting = [];
-    if (target.failure) {
-      failStep(step, target.failure, false);
-      return;
-    }
-    const last = messages.findLastIndex((message) => message.role === "assistant");
-    const tail = messages.slice(last + 1);
-    target.step = step;
-    bindAbort(target, signal);
-    const steer = tail.flatMap((message) => (message.role === "user" ? userBlocks(message.content) : []));
-    if (steer.length) target.input.push(userMessage(steer));
-    for (const message of tail)
-      if (message.role === "toolResult") deliver(target, message.toolCallId, mcpResult(message));
-  };
+  let connectionClosed = false;
 
   const bindAbort = (target: Live, signal: AbortSignal | undefined) => {
     if (!signal) return;
@@ -647,9 +663,24 @@ export function createClaudeCodeConnection(): ClaudeCodeConnection {
     signal.addEventListener("abort", () => void closeLive(target, "The run was aborted"), { once: true });
   };
 
+  const attach = (target: Live, step: Step, messages: readonly Message[], signal: AbortSignal | undefined) => {
+    target.awaiting = [];
+    if (target.failure) {
+      failStep(step, target.failure, false);
+      return;
+    }
+    const tail = messages.slice(messages.findLastIndex((message) => message.role === "assistant") + 1);
+    target.step = step;
+    recordLimits(target, step);
+    bindAbort(target, signal);
+    const steer = tail.flatMap((message) => (message.role === "user" ? userBlocks(message.content) : []));
+    if (steer.length) target.input.push(userMessage(steer));
+    for (const message of tail)
+      if (message.role === "toolResult") deliver(target, message.toolCallId, mcpResult(message));
+  };
+
   const start = async (
     model: Model<Api>,
-    context: Context,
     request: ClaudeCodeRequest,
     token: string,
     step: Step,
@@ -659,25 +690,33 @@ export function createClaudeCodeConnection(): ClaudeCodeConnection {
     const previous = live;
     live = undefined;
     if (previous) await closeLive(previous, "Superseded by a new request");
-    const tools = context.tools ?? [];
-    const lost = unservable(tools);
+    const managed = HOST_MANAGED_SETTINGS.filter((path) => existsSync(path));
+    if (managed.length)
+      throw new ClaudeCodeFailure(
+        `Host-wide Claude Code managed settings (${managed.join(", ")}) would apply to QM's queries; refusing to start Claude Code`,
+        { type: "permission_error" },
+      );
+    const lost = unservable(request.tools);
     if (lost.length)
-      throw new ClaudeCodeFailure(`Claude Code cannot receive these QM tools whole: ${lost.join("; ")}`, {
+      throw new ClaudeCodeFailure(`Claude Code cannot receive these QM tools: ${lost.join("; ")}`, {
         type: "invalid_request_error",
-        status: 400,
       });
     const dir = realpathSync(mkdtempSync(join(tmpdir(), "qm-claude-code-")));
-    const work = join(dir, "work");
-    mkdirSync(work);
+    mkdirSync(WORK_DIR, { recursive: true });
+    const work = realpathSync(WORK_DIR);
     let markExited!: () => void;
     const exited = new Promise<void>((resolve) => (markExited = resolve));
     const target: Live = {
       model,
-      input: new InputQueue(),
-      served: new Map(tools.map((tool) => [TOOL_PREFIX + tool.name, tool.name])),
+      input: new EventStream<SDKUserMessage, void>(
+        () => false,
+        () => undefined,
+      ),
+      served: new Map(request.tools.map((tool) => [tool.name, tool.name.slice(TOOL_PREFIX.length)])),
       waiting: new Map(),
       ready: new Map(),
       inputs: new Map(),
+      limits: [],
       step,
       awaiting: [],
       exited,
@@ -692,22 +731,17 @@ export function createClaudeCodeConnection(): ClaudeCodeConnection {
     const { history, prompt } = splitPrompt(request.messages);
     const sessionId = randomUUID();
     if (history.length) {
-      const session = createSession({
-        projectPath: work,
-        claudeDir: dir,
-        cwd: work,
-        model: nativeModelId(model),
-        sessionId,
-      });
+      const session = createSession({ projectPath: work, claudeDir: dir, cwd: work, model: request.model, sessionId });
       session.importMessages(history);
       session.save();
     }
-    const effort = reasoning ? EFFORT[reasoning] : undefined;
+    const effort = effortFor(model, reasoning);
+    const longest = Math.max(0, ...request.tools.map((tool) => tool.description.length));
     const options: Options = {
       cwd: work,
-      env: claudeCodeEnv(token, dir),
-      systemPrompt: context.systemPrompt ?? "",
-      model: nativeModelId(model),
+      env: claudeCodeEnv(token, dir, longest),
+      systemPrompt: request.system,
+      model: request.model,
       tools: [],
       allowedTools: [...target.served.keys()],
       permissionMode: "dontAsk",
@@ -716,7 +750,8 @@ export function createClaudeCodeConnection(): ClaudeCodeConnection {
       skills: [],
       settings: { autoMemoryEnabled: false },
       includePartialMessages: true,
-      ...(tools.length ? { mcpServers: { [SERVER]: toolServer(tools, target) } } : {}),
+      extraArgs: { "disable-slash-commands": null },
+      ...(request.tools.length ? { mcpServers: { [SERVER]: toolServer(request.tools, target) } } : {}),
       ...(history.length ? { resume: sessionId } : { sessionId }),
       ...(effort ? { effort } : {}),
       ...(!reasoning && model.reasoning && model.thinkingLevelMap?.off !== null
@@ -725,18 +760,20 @@ export function createClaudeCodeConnection(): ClaudeCodeConnection {
       spawnClaudeCodeProcess: spawnTracked(target),
     };
     const { query } = await import("@anthropic-ai/claude-agent-sdk");
-    if (target.closed) return;
+    if (target.closed || connectionClosed) return closeLive(target, "QM ended the turn");
     target.query = query({ prompt: target.input, options });
     target.input.push(userMessage(prompt));
-    const servedNames = new Set(target.served.keys());
     try {
       for await (const message of target.query) {
         if (target.closed) break;
-        onMessage(target, message, servedNames);
+        onMessage(target, message);
       }
-      if (!target.closed && !target.finished) throw new Error("Claude Code ended without a result");
+      if (!target.closed && !target.finished) {
+        await target.exited;
+        throw new Error(`Claude Code ended without a result (${target.exit ?? "process state unknown"})`);
+      }
     } catch (error) {
-      if (!target.closed) fail(target, error instanceof Error ? error : new Error(String(error)));
+      if (!target.closed) fail(target, asError(error));
     } finally {
       if (target.failure || target.finished) await closeLive(target, "The Claude Code query ended");
     }
@@ -745,33 +782,18 @@ export function createClaudeCodeConnection(): ClaudeCodeConnection {
   return {
     streamSimple(model, context, options) {
       const stream = createAssistantMessageEventStream();
-      const step: Step = {
-        stream,
-        output: newOutput(model),
-        started: false,
-        open: new Map(),
-        json: new Map(),
-        calls: [],
-        billed: emptyUsage(),
-        current: emptyUsage(),
-      };
+      const step = newStep(stream, model);
       const token = options?.apiKey;
-      if (!isClaudeSubscriptionToken(token)) {
+      const refusal = refusalFor(connectionClosed, token);
+      if (refusal) {
         queueMicrotask(() =>
-          failStep(
-            step,
-            new ClaudeCodeFailure(
-              "Claude Code models need a Claude subscription OAuth token; this route never uses a metered API key",
-              { type: "authentication_error", status: 401 },
-            ),
-            false,
-          ),
+          failStep(step, new ClaudeCodeFailure(refusal, { type: "authentication_error", status: 401 }), false),
         );
         return stream;
       }
       const messages = transformMessages(context.messages, model, toolCallId);
       const request: ClaudeCodeRequest = {
-        model: nativeModelId(model),
+        model: claudeCodeNativeId(model.id),
         system: context.systemPrompt ?? "",
         messages: claudeCodeTranscript(messages),
         tools: (context.tools ?? []).map((tool) => ({
@@ -783,25 +805,20 @@ export function createClaudeCodeConnection(): ClaudeCodeConnection {
       const continuing = continues(live, messages) ? live : undefined;
       void (async () => {
         const shaped = options?.onPayload ? await options.onPayload(request, model) : undefined;
+        if (shaped !== undefined && !isRequest(shaped))
+          throw new Error("QM's request hook returned a payload the claude-code route cannot send");
         if (continuing) attach(continuing, step, messages, options?.signal);
-        else
-          await start(
-            model,
-            context,
-            isRequest(shaped) ? shaped : request,
-            token!,
-            step,
-            options?.signal,
-            options?.reasoning,
-          );
+        else await start(model, shaped ?? request, token!, step, options?.signal, options?.reasoning);
       })().catch((error) => {
-        const failure = error instanceof Error ? error : new Error(String(error));
+        const failure = asError(error);
         if (live?.step === step) fail(live, failure);
         else if (!step.output.errorMessage) failStep(step, failure, false);
+        else swallow("claude-code: failure after the step ended", failure);
       });
       return stream;
     },
     async close() {
+      connectionClosed = true;
       const current = live;
       live = undefined;
       if (current) await closeLive(current, "QM ended the turn");

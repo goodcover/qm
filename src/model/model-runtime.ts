@@ -17,6 +17,7 @@ import {
 import { getServiceTierCostMultiplier } from "@earendil-works/pi-ai/api/openai-responses";
 import type { LlmCallUsage } from "../sessions/session-store.ts";
 import { CLAUDE_CODE_PROVIDER, claudeSubscriptionBetas } from "./claude-subscription.ts";
+import { routeKeys } from "./model-route.ts";
 import { createClaudeCodeConnection } from "./claude-code.ts";
 import { gatewayModelsJson, gatewayModelsVersion } from "./gateway-models.ts";
 import {
@@ -96,10 +97,6 @@ export interface ProviderKeys {
   [provider: string]: string | undefined;
 }
 
-export function providerKey(keys: ProviderKeys, provider: string): string | undefined {
-  return keys[provider === CLAUDE_CODE_PROVIDER ? "anthropic" : provider];
-}
-
 export type QmModelRuntime = ModelRuntime & { close(): Promise<void> };
 
 const customModelFiles = perTenant<{ cached?: { version: string; path: string | null } }>(() => ({}));
@@ -137,16 +134,15 @@ export async function buildModelRuntime(
     }));
   const modelsPath = customModelsPath();
   const runtime = await ModelRuntime.create({ credentials, modelsPath });
+  const claudeCode = createClaudeCodeConnection();
+  if (apiKeys[CLAUDE_CODE_PROVIDER])
+    runtime.registerProvider(CLAUDE_CODE_PROVIDER, {
+      api: CLAUDE_CODE_PROVIDER as Api,
+      streamSimple: claudeCode.streamSimple,
+    });
   for (const [provider, apiKey] of Object.entries(apiKeys)) {
     if (apiKey) await runtime.setRuntimeApiKey(provider, apiKey, { allowNetwork: false });
   }
-  const claudeCode = createClaudeCodeConnection();
-  runtime.registerProvider(CLAUDE_CODE_PROVIDER, {
-    api: CLAUDE_CODE_PROVIDER as Api,
-    streamSimple: claudeCode.streamSimple,
-  });
-  const claudeCodeKey = providerKey(apiKeys, CLAUDE_CODE_PROVIDER);
-  if (claudeCodeKey) await runtime.setRuntimeApiKey(CLAUDE_CODE_PROVIDER, claudeCodeKey, { allowNetwork: false });
   if (modelGateway) {
     const providers = new Set(
       Object.keys(modelGateway.models).flatMap((id) => {
@@ -201,7 +197,7 @@ export async function buildModelRuntime(
           ? codexProviderModelId(model.id)
           : (modelRequestOverrides(model.id)?.model ?? custom?.upstreamId ?? model.id);
       const unregistered = !custom && hasCustomModelPrefix(model.id);
-      const candidate = withRequestHeaders(model, true, false, providerKey(apiKeys, String(model.provider)));
+      const candidate = withRequestHeaders(model, true, false, apiKeys[String(model.provider)]);
       const passthrough = {
         ...retained(options),
         onPayload: async (payload: unknown) => {
@@ -262,9 +258,20 @@ export async function probeModel(
   fastMode = false,
   modelGateway?: ModelGatewayTransportConfig,
 ): Promise<void> {
-  const runtime = await buildModelRuntime(keys, modelGateway, "probe");
+  await withModelRuntime(routeKeys(model, keys), modelGateway, "probe", (runtime) =>
+    probeRuntime(runtime, model, signal, fastMode, modelGateway),
+  );
+}
+
+export async function withModelRuntime<T>(
+  keys: ProviderKeys,
+  modelGateway: ModelGatewayTransportConfig | undefined,
+  purpose: ModelRequestPurpose,
+  use: (runtime: QmModelRuntime) => Promise<T>,
+): Promise<T> {
+  const runtime = await buildModelRuntime(keys, modelGateway, purpose);
   try {
-    await probeRuntime(runtime, model, signal, fastMode, modelGateway);
+    return await use(runtime);
   } finally {
     await runtime.close();
   }

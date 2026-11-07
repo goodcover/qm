@@ -26,9 +26,10 @@ export interface FakeReply {
   thinking?: { text: string; signature: string };
   tools?: Array<{ id: string; name: string; input: Record<string, unknown> }>;
   callOrder?: "reverse";
-  error?: { kind: string; text: string; status: number };
+  error?: { kind: string; text: string; status?: number };
   rateLimit?: Record<string, unknown>;
-  hang?: boolean;
+  refusal?: boolean;
+  endWithoutResult?: boolean;
   usage?: { input: number; output: number; cacheRead?: number; cacheWrite?: number };
 }
 
@@ -46,6 +47,11 @@ export interface FakeCall {
 }
 
 type Model = (request: FakeRequest) => FakeReply | Promise<FakeReply>;
+
+function stopReason(reply: FakeReply): string {
+  if (reply.refusal) return "refusal";
+  return reply.tools?.length ? "tool_use" : "end_turn";
+}
 
 function streamEvents(id: string, reply: FakeReply): SDKMessage[] {
   const events: Array<Record<string, unknown>> = [];
@@ -80,8 +86,12 @@ function streamEvents(id: string, reply: FakeReply): SDKMessage[] {
   }
   if (reply.text !== undefined) {
     events.push({ type: "content_block_start", index, content_block: { type: "text", text: "" } });
-    for (const piece of reply.text.match(/.{1,7}/gs) ?? [""])
-      events.push({ type: "content_block_delta", index, delta: { type: "text_delta", text: piece } });
+    for (let at = 0; at < Math.max(reply.text.length, 1); at += 7)
+      events.push({
+        type: "content_block_delta",
+        index,
+        delta: { type: "text_delta", text: reply.text.slice(at, at + 7) },
+      });
     events.push({ type: "content_block_stop", index });
     index++;
   }
@@ -107,7 +117,7 @@ function streamEvents(id: string, reply: FakeReply): SDKMessage[] {
   }
   events.push({
     type: "message_delta",
-    delta: { stop_reason: reply.tools?.length ? "tool_use" : "end_turn" },
+    delta: { stop_reason: stopReason(reply) },
     usage: { output_tokens: usage.output },
   });
   events.push({ type: "message_stop" });
@@ -235,7 +245,11 @@ export function fakeClaudeCode(model: Model, tweak: Partial<Pick<FakeCall, "init
             uuid: randomUUID(),
             session_id: "fake",
           } as unknown as SDKMessage;
-        if (reply.hang) await new Promise(() => undefined);
+        if (reply.endWithoutResult) {
+          call.child?.kill("SIGKILL");
+          await new Promise((resolve) => call.child?.once("exit", resolve));
+          return;
+        }
         if (reply.error) {
           yield {
             type: "assistant",
@@ -249,7 +263,7 @@ export function fakeClaudeCode(model: Model, tweak: Partial<Pick<FakeCall, "init
             type: "result",
             subtype: "success",
             is_error: true,
-            api_error_status: reply.error.status,
+            ...(reply.error.status ? { api_error_status: reply.error.status } : {}),
             result: reply.error.text,
           } as unknown as SDKMessage;
           return;
@@ -303,6 +317,7 @@ export function fakeClaudeCode(model: Model, tweak: Partial<Pick<FakeCall, "init
     return Object.assign(generator, {
       close() {
         call.closed = true;
+        call.child?.kill("SIGTERM");
         void generator.return(undefined);
       },
       async interrupt() {},
@@ -321,7 +336,20 @@ export async function installFakeClaudeCode(
   const mocked = mock.module("@anthropic-ai/claude-agent-sdk", {
     namedExports: { ...real, query: fake.query },
   });
-  return { ...fake, restore: () => mocked.restore() };
+  return { ...fake, restore: () => mocked.restore(), leftovers: () => leftovers(fake.calls) };
+}
+
+export async function leftovers(calls: readonly FakeCall[]): Promise<string[]> {
+  const remaining = () =>
+    calls.flatMap((call, index) => {
+      const dir = String(call.options.env?.CLAUDE_CONFIG_DIR);
+      return [
+        ...(processAlive(call.child) ? [`query ${index}: process still running`] : []),
+        ...(existsSync(dir) ? [`query ${index}: ${dir} still exists`] : []),
+      ];
+    });
+  for (let i = 0; i < 100 && remaining().length; i++) await new Promise((resolve) => setTimeout(resolve, 20));
+  return remaining();
 }
 
 export function processAlive(child: ChildProcess | undefined): boolean {
