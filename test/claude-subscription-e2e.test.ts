@@ -54,6 +54,18 @@ function message(model: string, blocks: unknown[], stop: string): Response {
 
 type Seen = Array<{ headers: Headers; body: Record<string, unknown> }>;
 
+const ANTHROPIC_MIN_CLAUDE_CODE = "2.1.280";
+
+function versionRefusal(userAgent: string): Response | undefined {
+  const claimed = userAgent.split("claude-cli/")[1]?.split(" ")[0] ?? "0";
+  if (claimed.localeCompare(ANTHROPIC_MIN_CLAUDE_CODE, undefined, { numeric: true }) >= 0) return undefined;
+  const message = `Claude Code ${claimed} does not support this model; version ${ANTHROPIC_MIN_CLAUDE_CODE} or newer is required. Run 'claude update', or update the Claude desktop app, then try again.`;
+  return new Response(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message } }), {
+    status: 400,
+    headers: { "content-type": "application/json" },
+  });
+}
+
 function fakeAnthropic(t: TestContext): Seen {
   const seen: Seen = [];
   const realFetch = globalThis.fetch;
@@ -64,6 +76,8 @@ function fakeAnthropic(t: TestContext): Seen {
     const raw = input instanceof Request ? await input.text() : String(init?.body ?? "{}");
     const body = JSON.parse(raw) as Record<string, unknown>;
     seen.push({ headers, body });
+    const refused = headers.get("authorization") ? versionRefusal(headers.get("user-agent") ?? "") : undefined;
+    if (refused) return refused;
     const messages = body.messages as Array<{ role: string; content: unknown }>;
     const system = JSON.stringify(body.system ?? "");
     const model = String(body.model);
