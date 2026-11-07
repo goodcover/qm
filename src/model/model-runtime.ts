@@ -16,7 +16,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { getServiceTierCostMultiplier } from "@earendil-works/pi-ai/api/openai-responses";
 import type { LlmCallUsage } from "../sessions/session-store.ts";
-import { claudeSubscriptionBetas } from "./claude-subscription.ts";
+import { claudeSubscriptionBetas, claudeSubscriptionHeaders } from "./claude-subscription.ts";
 import { gatewayModelsJson, gatewayModelsVersion } from "./gateway-models.ts";
 import {
   customModelsJson,
@@ -337,7 +337,6 @@ export function withRequestHeaders(model: Model<Api>, direct: boolean, fast: boo
   const api = String((model as { api?: unknown }).api ?? "").toLowerCase();
   if (api.startsWith("openai") || !direct) return model;
   const betas = [...(thinkingBindingApplies(model) ? [THINKING_BINDING_BETA] : []), ...(fast ? [FAST_MODE_BETA] : [])];
-  if (!betas.length) return model;
   const prior = model.headers?.["anthropic-beta"];
   const beta = [
     ...new Set([
@@ -346,7 +345,8 @@ export function withRequestHeaders(model: Model<Api>, direct: boolean, fast: boo
       ...betas,
     ]),
   ].join(",");
-  return { ...model, headers: { ...model.headers, "anthropic-beta": beta } };
+  const headers = { ...claudeSubscriptionHeaders(apiKey), ...(betas.length ? { "anthropic-beta": beta } : {}) };
+  return Object.keys(headers).length ? { ...model, headers: { ...model.headers, ...headers } } : model;
 }
 
 export function zeroUsage(): Usage {
