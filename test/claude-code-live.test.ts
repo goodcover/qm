@@ -13,6 +13,8 @@ import { testConfig } from "./support/test-config.ts";
 const TOKEN_FILE = process.env.CLAUDE_CODE_LIVE_TOKEN_FILE;
 const ANTHROPIC_HOSTS = ["anthropic.com", "claude.ai", "claude.com"];
 const LIMIT_LOG = "[claude-code] subscription limit ";
+const RETRY_LOG = "[claude-code] api_retry ";
+const MODEL_CALL_BUDGET = 8;
 const MODEL_ID = process.env.CLAUDE_CODE_LIVE_MODEL ?? CLAUDE_CODE_TEST_MODEL;
 
 async function accountEvidence(token: string): Promise<Record<string, unknown>> {
@@ -58,16 +60,20 @@ test(
     });
     const evidence: string[] = [];
     const limits: Array<Record<string, unknown>> = [];
+    const retries: string[] = [];
     const logError = console.error.bind(console);
     t.mock.method(console, "error", (...args: unknown[]) => {
       const line = args.map(String).join(" ");
       if (line.startsWith(LIMIT_LOG)) limits.push(JSON.parse(line.slice(LIMIT_LOG.length)) as Record<string, unknown>);
+      if (line.startsWith(RETRY_LOG)) retries.push(line);
       if (line.startsWith("[claude-code]")) evidence.push(line.replaceAll(token, "<token>"));
       logError(...args);
     });
 
     t.diagnostic(`account: ${JSON.stringify(await accountEvidence(token))}`);
-    const built = buildApp(testConfig({ anthropicApiKey: token, modelId: MODEL_ID }), { agent: undefined });
+    const built = buildApp(testConfig({ anthropicApiKey: token, modelId: MODEL_ID, memoryCapture: "off" }), {
+      agent: undefined,
+    });
     const ask = (text: string) =>
       built.app.turn({
         surface: "slack",
@@ -118,6 +124,12 @@ test(
       );
       assert.deepEqual(direct, [], "every Anthropic request came from the Claude Code child, none from QM");
       assert.ok(limits.length > 0, "Claude reported subscription limits");
+      assert.ok(
+        limits.length + retries.length <= MODEL_CALL_BUDGET,
+        `${limits.length} answered model calls and ${retries.length} retries stay within the approved budget`,
+      );
+      const turnStarts = records.filter((record) => record.model === MODEL_ID && record.step === 0);
+      assert.ok((turnStarts[1]?.usage?.cacheRead ?? 0) > 0, "the resumed turn read the first turn's prompt cache");
     } finally {
       await built.runtime.stop();
     }
