@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingHttpHeaders } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { mock, test, type TestContext } from "node:test";
-import { Type } from "typebox";
 import type { Options } from "@anthropic-ai/claude-agent-sdk";
 import type { Message } from "@earendil-works/pi-ai";
 import { sleep } from "../src/util/async.ts";
@@ -53,13 +53,14 @@ function systemText(call: Captured): string {
   return (call.body.system ?? []).map((block) => block.text).join("\n");
 }
 
+function withoutCacheMark({ cache_control: _cache, ...block }: Block): Block {
+  return block as Block;
+}
+
 function withoutCacheMarks(call: Captured): WireMessage[] {
   return (call.body.messages ?? []).map((message) => ({
     role: message.role,
-    content:
-      typeof message.content === "string"
-        ? message.content
-        : message.content.map(({ cache_control: _cache, ...block }) => block as Block),
+    content: typeof message.content === "string" ? message.content : message.content.map(withoutCacheMark),
   }));
 }
 
@@ -69,7 +70,7 @@ function conversation(call: Captured): Array<{ role: string; content: Block[] }>
     .map((message) => ({
       role: message.role,
       content: (typeof message.content === "string" ? [{ type: "text", text: message.content }] : message.content).map(
-        ({ cache_control: _cache, ...block }) => block as Block,
+        withoutCacheMark,
       ),
     }));
 }
@@ -89,13 +90,7 @@ function isTurn(call: Captured): boolean {
 
 function running(options: Options): boolean {
   const session = String(options.sessionId ?? options.resume);
-  return readdirSync("/proc").some((pid) => {
-    try {
-      return /^\d+$/.test(pid) && readFileSync(`/proc/${pid}/cmdline`, "utf8").includes(session);
-    } catch {
-      return false;
-    }
-  });
+  return spawnSync("ps", ["-Aww", "-o", "args="], { encoding: "utf8" }).stdout.includes(session);
 }
 
 async function mockMessagesApi(
@@ -344,10 +339,7 @@ test("another Claude Code session on the host cannot message a QM query", async 
     for await (const _message of query({ prompt: "send it", options: options as Options }));
   };
   const parkedTool = {
-    name: "lookup",
-    label: "Lookup",
-    description: "Look up one record by key.",
-    parameters: Type.Object({ key: Type.String() }),
+    ...lookupTool([]),
     async execute() {
       await sendFromPeer();
       return { content: [{ type: "text" as const, text: "record alpha" }], details: {} };
