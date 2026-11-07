@@ -33,7 +33,7 @@ async function accountEvidence(token: string): Promise<Record<string, unknown>> 
     const { subscriptionType, tokenSource, apiKeySource, apiProvider, organization } = await session.accountInfo();
     return { subscriptionType, tokenSource, apiKeySource, apiProvider, organizationPresent: Boolean(organization) };
   } finally {
-    session.close();
+    await session.return(undefined);
     rmSync(home, { recursive: true, force: true });
   }
 }
