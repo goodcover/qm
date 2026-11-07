@@ -649,6 +649,7 @@ function spawnTracked(live: Live) {
     child.stderr.on("data", (data: Buffer) => console.error(`[claude-code] ${data.toString().trimEnd()}`));
     child.once("exit", live.markExited);
     child.once("error", (error) => {
+      if (error.name === "AbortError") return;
       swallow("claude-code: the Claude Code process failed", error);
       if (child.pid === undefined) live.markExited();
     });
@@ -818,7 +819,7 @@ export function createClaudeCodeConnection({ gateway = false }: { gateway?: bool
       settingSources: [],
       strictMcpConfig: true,
       skills: [],
-      settings: { autoMemoryEnabled: false },
+      settings: { autoMemoryEnabled: false, crossSessionInbound: "refuse" },
       includePartialMessages: true,
       verbatimPrompts: true,
       extraArgs: { "disable-slash-commands": null },

@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingHttpHeaders } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { mock, test, type TestContext } from "node:test";
+import { Type } from "typebox";
 import type { Options } from "@anthropic-ai/claude-agent-sdk";
 import type { Message } from "@earendil-works/pi-ai";
 import { sleep } from "../src/util/async.ts";
@@ -97,7 +98,20 @@ function running(options: Options): boolean {
   });
 }
 
-async function mockMessagesApi(t: TestContext, { hang = false, headers = {}, alwaysCallTool = false } = {}) {
+async function mockMessagesApi(
+  t: TestContext,
+  {
+    hang = false,
+    headers = {},
+    alwaysCallTool = false,
+    other,
+  }: {
+    hang?: boolean;
+    headers?: Record<string, string>;
+    alwaysCallTool?: boolean;
+    other?: (call: Captured) => string;
+  } = {},
+) {
   const captured: Captured[] = [];
   const server = createServer((req, res) => {
     let raw = "";
@@ -117,7 +131,8 @@ async function mockMessagesApi(t: TestContext, { hang = false, headers = {}, alw
       if (hang) return;
       const model = String(call.body.model);
       res.writeHead(200, { "content-type": "text/event-stream", ...headers });
-      if (!isTurn(call)) return res.end(reply(model, { type: "text", text: "side request" }, "end_turn"));
+      if (!isTurn(call))
+        return res.end(other?.(call) ?? reply(model, { type: "text", text: "side request" }, "end_turn"));
       const result = lastUser({ messages: conversation(call) }).find((block) => block.type === "tool_result");
       if (!result || alwaysCallTool)
         return res.end(
@@ -276,4 +291,79 @@ test("Claude reporting extra usage in use stops the turn through the real binary
     `the query stops at the first overage report; only a request already in flight can follow it (saw ${api.captured.filter(isTurn).length})`,
   );
   assert.ok(cleanedUp(spawned));
+});
+
+test("another Claude Code session on the host cannot message a QM query", async (t) => {
+  const marker = "PEER-MESSAGE-4417";
+  let socket = "";
+  let senderSteps = 0;
+  const api = await mockMessagesApi(t, {
+    other: (call) => {
+      const model = String(call.body.model);
+      senderSteps += 1;
+      if (senderSteps === 1)
+        return reply(
+          model,
+          {
+            type: "tool_use",
+            id: "toolu_find",
+            name: "ToolSearch",
+            input: { query: "select:SendMessage", max_results: 1 },
+          },
+          "tool_use",
+        );
+      if (senderSteps === 2)
+        return reply(
+          model,
+          { type: "tool_use", id: "toolu_send", name: "SendMessage", input: { to: `uds:${socket}`, message: marker } },
+          "tool_use",
+        );
+      return reply(model, { type: "text", text: "sent" }, "end_turn");
+    },
+  });
+  const spawned = await pointClaudeCodeAt(t, api.url);
+  const senderHome = mkdtempSync(join(tmpdir(), "qm-peer-sender-"));
+  t.after(() => rmSync(senderHome, { recursive: true, force: true }));
+  const sendFromPeer = async () => {
+    const qmDir = String(spawned[0]!.env?.CLAUDE_CONFIG_DIR);
+    socket = join(
+      qmDir,
+      "cc-socks",
+      readdirSync(join(qmDir, "cc-socks")).find((name) => name.endsWith(".sock"))!,
+    );
+    const { query } = await import("@anthropic-ai/claude-agent-sdk");
+    const env = {
+      PATH: "/usr/local/bin:/usr/bin:/bin",
+      HOME: senderHome,
+      CLAUDE_CONFIG_DIR: senderHome,
+      CLAUDE_CODE_TMPDIR: senderHome,
+      CLAUDE_CODE_OAUTH_TOKEN: TOKEN,
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+    };
+    const options = { cwd: senderHome, env, settingSources: [], allowedTools: ["ToolSearch", "SendMessage"] };
+    for await (const _message of query({ prompt: "send it", options: options as Options }));
+  };
+  const parkedTool = {
+    name: "lookup",
+    label: "Lookup",
+    description: "Look up one record by key.",
+    parameters: Type.Object({ key: Type.String() }),
+    async execute() {
+      await sendFromPeer();
+      return { content: [{ type: "text" as const, text: "record alpha" }], details: {} };
+    },
+  };
+  const { session, close } = await claudeCodeSession({ anthropic: TOKEN }, [parkedTool]);
+  await session.prompt("Compare alpha");
+  await close();
+  const delivered = api.captured.find((call) => JSON.stringify(call.body.messages).includes("toolu_send"));
+  assert.ok(
+    delivered && JSON.stringify(delivered.body.messages).includes('\\"success\\":true'),
+    "the peer's send succeeded",
+  );
+  assert.ok(
+    api.captured.filter(isTurn).every((call) => !JSON.stringify(call.body).includes(marker)),
+    "the peer's message never reached QM's model request",
+  );
+  assert.ok(cleanedUp([spawned[0]!]));
 });
