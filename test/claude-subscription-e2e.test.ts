@@ -101,30 +101,6 @@ async function claudeCodeServing(t: TestContext) {
   return fake;
 }
 
-async function assertClaudeCodeTurn(
-  built: ReturnType<typeof buildApp>,
-  fake: Awaited<ReturnType<typeof claudeCodeServing>>,
-  seen: Seen,
-  runId: string,
-  token: string,
-  model: string,
-) {
-  await assertAnswered(built, runId);
-  const turnQueries = fake.calls.filter((call) => call.options.mcpServers);
-  assert.deepEqual(
-    turnQueries.map((call) => call.options.model),
-    [model],
-    "one Claude Code query served the tool step and the answer with the selected model",
-  );
-  for (const call of fake.calls)
-    assert.equal((call.options.env as Record<string, string>).CLAUDE_CODE_OAUTH_TOKEN, token);
-  assert.deepEqual(
-    seen.map((call) => call.body.model),
-    [],
-    "no company request went to the Anthropic API directly",
-  );
-}
-
 test("a personal Claude subscription turn runs end to end on Pi with OAuth bearer auth, including a tool round trip", async (t) => {
   const seen = fakeAnthropic(t);
 
@@ -186,7 +162,15 @@ test("a company Claude subscription credential serves company Claude turns throu
   const first = await turn("claude-company-keychain-e2e");
   built.runtime.start();
   try {
-    await assertClaudeCodeTurn(built, fake, seen, first.runId!, companyToken, "claude-opus-5-5");
+    await assertAnswered(built, first.runId!);
+    assert.deepEqual(
+      fake.calls.filter((call) => call.options.mcpServers).map((call) => call.options.model),
+      ["claude-opus-5-5"],
+      "one Claude Code query served the tool step and the answer with the selected model",
+    );
+    for (const call of fake.calls)
+      assert.equal((call.options.env as Record<string, string>).CLAUDE_CODE_OAUTH_TOKEN, companyToken);
+    assert.equal(seen.length, 0, "no company request went to the Anthropic API directly");
     await built.keychain!.remove(ownerId, credentialId);
     const turnQueries = () => fake.calls.filter((call) => call.options.mcpServers).length;
     const queries = turnQueries();

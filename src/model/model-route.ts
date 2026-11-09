@@ -28,9 +28,11 @@ export function modelBilling(viaGateway: boolean, personal: boolean, subscriptio
 }
 
 export function companyRouteKeys(keys: ProviderKeys): ProviderKeys {
-  return isClaudeSubscriptionToken(keys.anthropic) && !providerBaseUrl("anthropic")
-    ? { ...keys, [CLAUDE_CODE_KEY]: keys.anthropic }
-    : keys;
+  return {
+    ...keys,
+    [CLAUDE_CODE_KEY]:
+      isClaudeSubscriptionToken(keys.anthropic) && !providerBaseUrl("anthropic") ? keys.anthropic : undefined,
+  };
 }
 
 export function servedBySubscription(model: Model<Api>, keys: ProviderKeys): boolean {

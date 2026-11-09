@@ -312,25 +312,15 @@ test("a Claude subscription turn honors adaptive and provider-default effort and
   const agent = createAgent({ resolveProviderKeys: async () => ({ anthropic: "sk-ant-oat01-subscription" }) });
   await turn(agent, "claude-opus-5-5", { effortLevel: "adaptive" });
   await turn(agent, "claude-opus-5-5", { effortLevel: "default" });
-  const pisAdaptive = {
-    type: "adaptive",
-    display: "summarized",
-    block_binding: { prefix_mismatch_behavior: "drop_block" },
-  };
+  await turn(agent, "claude-sonnet-5", { effortLevel: "default" });
   assert.deepEqual(
-    claudeCode.calls.map((call) => [
-      (
-        JSON.parse((call.options.env as Record<string, string>).CLAUDE_CODE_EXTRA_BODY ?? "{}") as {
-          thinking?: unknown;
-        }
-      ).thinking,
-      call.options.effort,
-    ]),
+    claudeCode.calls.map((call) => [call.options.thinking?.type, call.options.effort]),
     [
-      [pisAdaptive, "high"],
-      [pisAdaptive, "high"],
+      ["adaptive", "high"],
+      ["adaptive", "high"],
+      ["disabled", "high"],
     ],
-    "the wire carries the thinking Pi's Anthropic provider sends for these levels, and the API's default effort",
+    "these levels send what the API applies when Pi omits the fields, not Claude Code's own defaults",
   );
   const fast = await turn(agent, "claude-opus-5-5", { fastMode: true }).then(
     () => assert.fail("fast mode is refused"),
@@ -338,7 +328,7 @@ test("a Claude subscription turn honors adaptive and provider-default effort and
   );
   assert.ok(fast instanceof ProviderTurnError);
   assert.match(fast.message, /extra usage/);
-  assert.equal(claudeCode.calls.length, 2, "no Claude Code query starts in fast mode");
+  assert.equal(claudeCode.calls.length, 3, "no Claude Code query starts in fast mode");
 });
 
 test("a company ChatGPT summary that fails never reaches a metered fallback", async () => {

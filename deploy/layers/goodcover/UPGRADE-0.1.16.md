@@ -25,15 +25,32 @@ guide once that backup is no longer needed for recovery.
   it expires.
   - Pi's direct path is kept for metered keys, for an `ANTHROPIC_BASE_URL` override, for
     models a model gateway carries, and for personal Claude accounts. Personal accounts
-    probably meet the same refusal there; whether to move them is an open owner decision.
+    probably meet the same refusal there; the owner decided on 2026-11-09 to keep them on
+    the direct path for now.
   - Fast mode is refused on this route, because on a subscription it draws on extra
     usage.
-  - QM refuses a query when the Claude account applies server-managed settings, or when
-    Claude Code runs a hook or loads a plugin or skill QM did not configure. An
-    `apiKeyHelper` or `SessionStart` hook from managed settings can still run once before
-    the refusal, so the login should have no server-managed settings.
-  - Each query is a Claude Code child process of about 110–250 MB, bounded only by
-    `WORKERS`, and the core image is about 310 MB larger.
+  - QM refuses a query when Claude Code reports any settings QM did not configure (local
+    managed policy or the Claude account's server-managed settings), and when it runs a
+    hook or loads a plugin or skill QM did not configure. An `apiKeyHelper` or
+    `SessionStart` hook from managed settings can still run once before the refusal, so
+    the login must stay on a Pro or Max plan, which has no server-managed settings. A
+    custom provider must not be named `claude-code` or `openai-codex`.
+  - Each query is a Claude Code child process of about 130–210 MB anonymous memory plus
+    about 125 MB shared, bounded only by `WORKERS` (default 16). At 16 concurrent Claude
+    turns that can exceed the core pod's 3 GiB limit, as on 0.1.15. The core image is about
+    310 MB larger.
+  - Every fresh query waits on Claude Code's own fetch of the account's settings. If that
+    endpoint is degraded, each query stalls for about 17–30 s and then proceeds.
+  - **Canary right after deploying the image that brings this route in.** Pre-merge live QA
+    was deferred to it by the owner.
+    - Run one company Claude (`claude-opus-5-5`) tool turn plus a follow-up turn. One Codex
+      turn on the org default must also complete, and a memory capture must be written.
+    - **Pass:** core logs `[claude-code] query started … apiKeySource=none`, and
+      `[claude-code] subscription limit …` with `"isUsingOverage":false`. There is no
+      `managed_settings` refusal, the follow-up turn reads the prompt cache, and the first
+      token arrives within about 3 s of `query started`.
+    - **Roll back** to the previous core image if any Codex turn fails, the core pod restarts or
+      is `OOMKilled`, or a Claude turn fails with `managed_settings` or a billing refusal.
 - **Admin UI.** The admin dashboard is folded into web-ui at `/settings`, and the
   separate admin plugin is gone.
 - **Credentials in shared conversations.** Upstream removed the owner credential

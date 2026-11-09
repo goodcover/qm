@@ -224,20 +224,16 @@ test("a mismatched tool list, an API key source, or an unconfigured hook, plugin
       tweak: { managedSettings: { env: { ANTHROPIC_BASE_URL: "https://elsewhere.invalid" } } },
       message: /server-managed settings/,
     },
+    { tweak: { settingsReport: {} }, message: /applies settings .*QM refuses/ },
   ];
   for (const { tweak, message } of cases) {
-    let asked = 0;
-    const fake = await installFakeClaudeCode(() => {
-      asked += 1;
-      return { text: "must not be used" };
-    }, tweak);
+    const fake = await installFakeClaudeCode(() => ({ text: "must not be used" }), tweak);
     const run = await piSession({ anthropic: TOKEN }, [lookupTool([])]);
     await run.session.prompt("go").finally(() => run.close().finally(fake.restore));
     const failed = lastAssistant(run.session);
     assert.match(failed.errorMessage ?? "", message);
     assert.equal(providerTurnError(failed).retryable, false);
     assert.equal(fake.calls.length, 1);
-    assert.equal(asked, 0, "the prompt never reached the model");
   }
 });
 

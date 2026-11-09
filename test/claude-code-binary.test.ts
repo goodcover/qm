@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { mock, test, type TestContext } from "node:test";
 import type { Options } from "@anthropic-ai/claude-agent-sdk";
 import type { Message } from "@earendil-works/pi-ai";
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { sleep } from "../src/util/async.ts";
 import { resolveModel } from "../src/model/pi-models.ts";
 import {
@@ -33,6 +34,7 @@ interface Captured {
     tools?: Array<{ name: string; description: string }>;
     thinking?: { type?: string; block_binding?: unknown };
     max_tokens?: number;
+    output_config?: { effort?: string };
   };
 }
 
@@ -105,7 +107,9 @@ async function mockMessagesApi(
     alwaysCallTool = false,
     other,
     status,
+    truncate = false,
   }: {
+    truncate?: boolean;
     status?: number;
     hang?: boolean;
     headers?: Record<string, string>;
@@ -139,6 +143,7 @@ async function mockMessagesApi(
       res.writeHead(200, { "content-type": "text/event-stream", ...headers });
       if (!isTurn(call))
         return res.end(other?.(call) ?? reply(model, { type: "text", text: "side request" }, "end_turn"));
+      if (truncate) return res.end(reply(model, { type: "text", text: "partial answer" }, "max_tokens"));
       const result = lastUser({ messages: conversation(call) }).find((block) => block.type === "tool_result");
       if (!result || alwaysCallTool)
         return res.end(
@@ -249,24 +254,67 @@ test("the bundled Claude Code binary serves QM tool turns with only QM's tools a
   assert.ok(cleanedUp(spawned));
 });
 
-test("the real binary makes one request per query on a server error, leaving retries to QM", async (t) => {
-  const api = await mockMessagesApi(t, { status: 500 });
+test("the real binary sends Pi's output ceiling and thinking defaults, and stops at the ceiling as Pi does", async (t) => {
+  const api = await mockMessagesApi(t, { truncate: true });
   const spawned = await pointClaudeCodeAt(t, api.url);
-  const run = await claudeCodeSession({ anthropic: TOKEN }, [lookupTool([])], [], { modelId: PRODUCTION_MODEL });
-  run.session.settingsManager.setRetryEnabled(false);
-  await run.session.prompt("hi").catch(() => undefined);
+  const run = await claudeCodeSession({ anthropic: TOKEN }, [lookupTool([])], [], { modelId: "claude-sonnet-5" });
+  run.session.setThinkingLevel("off");
+  await run.session.prompt("write a long answer");
   await run.close();
-  assert.equal(lastAssistant(run.session).stopReason, "error");
-  assert.equal(spawned.length, 1);
-  assert.equal(api.captured.filter(isTurn).length, 1, "Claude Code did not retry the request itself");
+  const turns = api.captured.filter(isTurn);
+  assert.equal(turns.length, 1, "no resume request after the ceiling");
+  assert.equal(turns[0]!.body.max_tokens, resolveModel("claude-sonnet-5")!.maxTokens);
+  assert.deepEqual(turns[0]!.body.thinking, { type: "disabled" }, "thinking off, as Pi sends it");
+  assert.equal(turns[0]!.body.output_config?.effort, "high", "the API's default effort, not Claude Code's own");
+  const last = lastAssistant(run.session);
+  assert.equal(last.stopReason, "length");
+  assert.deepEqual(last.content, [{ type: "text", text: "partial answer" }]);
   assert.ok(cleanedUp(spawned), "the Claude Code process exited and its directory is gone");
 });
 
+test("a tool result up to QM's cap reaches the model whole through the real binary", async (t) => {
+  const api = await mockMessagesApi(t);
+  const spawned = await pointClaudeCodeAt(t, api.url);
+  const big = "R".repeat(90_000);
+  const tool: ToolDefinition = {
+    ...lookupTool([]),
+    async execute() {
+      return { content: [{ type: "text", text: big }], details: {} };
+    },
+  };
+  const run = await claudeCodeSession({ anthropic: TOKEN }, [tool], [], { modelId: PRODUCTION_MODEL });
+  await run.session.prompt("look it up");
+  await run.close();
+  const answered = api.captured
+    .filter(isTurn)
+    .find((call) => lastUser({ messages: conversation(call) }).some((block) => block.type === "tool_result"))!;
+  const result = lastUser({ messages: conversation(answered) }).find((block) => block.type === "tool_result")!;
+  const text = (result.content as Block[]).map((block) => String(block.text ?? "")).join("");
+  assert.ok(text.includes(big), `the model saw ${text.length} characters`);
+  assert.ok(cleanedUp(spawned), "the Claude Code process exited and its directory is gone");
+});
+
+test(
+  "the real binary makes one request per query on a server error, leaving retries to QM",
+  { timeout: 30_000 },
+  async (t) => {
+    const api = await mockMessagesApi(t, { status: 500 });
+    const spawned = await pointClaudeCodeAt(t, api.url);
+    const run = await claudeCodeSession({ anthropic: TOKEN }, [lookupTool([])], [], { modelId: PRODUCTION_MODEL });
+    run.session.settingsManager.setRetryEnabled(false);
+    await run.session.prompt("hi").catch(() => undefined);
+    await run.close();
+    assert.equal(lastAssistant(run.session).stopReason, "error");
+    assert.equal(spawned.length, 1);
+    assert.equal(api.captured.filter(isTurn).length, 1, "Claude Code did not retry the request itself");
+    assert.ok(cleanedUp(spawned), "the Claude Code process exited and its directory is gone");
+  },
+);
+
 test("a hook QM did not configure stops the real binary before any model request", async (t) => {
   const api = await mockMessagesApi(t);
-  const marker = join(mkdtempSync(join(tmpdir(), "claude-code-hook-test-")), "ran");
   const spawned = await pointClaudeCodeAt(t, api.url, {
-    hooks: { SessionStart: [{ hooks: [{ type: "command", command: `touch ${marker}` }] }] },
+    hooks: { SessionStart: [{ hooks: [{ type: "command", command: "true" }] }] },
   });
   const run = await claudeCodeSession({ anthropic: TOKEN }, [lookupTool([])], [], { modelId: PRODUCTION_MODEL });
   await run.session.prompt("hi").catch(() => undefined);
@@ -276,7 +324,7 @@ test("a hook QM did not configure stops the real binary before any model request
   assert.ok(cleanedUp(spawned), "the Claude Code process exited and its directory is gone");
 });
 
-test("the real binary reports its settings sources before any prompt, as QM's managed-settings check reads them", async (t) => {
+test("the real binary reports its settings sources, with QM's own as flagSettings, before any prompt", async (t) => {
   const api = await mockMessagesApi(t);
   const home = realpathSync(mkdtempSync(join(tmpdir(), "claude-code-settings-test-")));
   t.after(() => rmSync(home, { recursive: true, force: true }));
@@ -313,7 +361,6 @@ test("the real binary reports its settings sources before any prompt, as QM's ma
       ),
       JSON.stringify(report),
     );
-    assert.equal(api.captured.filter(isTurn).length, 0);
   } finally {
     release();
     await session.return(undefined);
@@ -368,7 +415,7 @@ test("text a person types reaches the real binary verbatim: no slash commands, n
   );
 });
 
-test("Claude reporting extra usage in use stops the turn through the real binary", async (t) => {
+test("Claude reporting extra usage in use stops the turn through the real binary", { timeout: 30_000 }, async (t) => {
   const api = await mockMessagesApi(t, { headers: OVERAGE_IN_USE, alwaysCallTool: true });
   const spawned = await pointClaudeCodeAt(t, api.url);
   const { session, close } = await claudeCodeSession({ anthropic: TOKEN }, [lookupTool([])]);

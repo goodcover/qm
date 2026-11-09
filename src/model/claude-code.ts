@@ -60,7 +60,8 @@ const CLIENT_APP = "qm/claude-code-provider";
 const WORK_DIR = join(tmpdir(), "qm-claude-code-cwd");
 const RESUMED_AT_TOOL_RESULTS = "[system] The run resumed after the tool results above. Continue the task.";
 
-const QM_RESULT_CAP_AS_TOKENS = String(MAX_TOOL_RESULT_CHARS);
+const RESULT_SIZE_META = "anthropic/maxResultSizeChars";
+const QM_SETTINGS_SOURCE = "flagSettings";
 const NEVER_RESUME_INTERRUPTED_TURN_AGE_MS = "1";
 const THINKING_DISPLAY = "summarized";
 const API_DEFAULT_THINKING: WireThinking = { type: "disabled" };
@@ -92,6 +93,7 @@ function claudeCodeEnv(
   token: string,
   home: string,
   longestToolDescription: number,
+  maxOutputTokens: number,
   retention: CacheRetention | undefined,
 ): Record<string, string> {
   return {
@@ -103,12 +105,12 @@ function claudeCodeEnv(
     CLAUDE_AGENT_SDK_CLIENT_APP: CLIENT_APP,
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
     CLAUDE_CODE_MAX_RETRIES: "0",
+    CLAUDE_CODE_MAX_OUTPUT_TOKENS: String(maxOutputTokens),
     ENABLE_CLAUDEAI_MCP_SERVERS: "0",
     DISABLE_COMPACT: "1",
     CLAUDE_CODE_SILENT_TURN_REMINDER: "0",
     CLAUDE_CODE_TOTAL_TOKENS_REMINDER: "off",
     CLAUDE_CODE_RESUME_INTERRUPTED_TURN_MAX_AGE_MS: NEVER_RESUME_INTERRUPTED_TURN_AGE_MS,
-    MAX_MCP_OUTPUT_TOKENS: QM_RESULT_CAP_AS_TOKENS,
     ...(longestToolDescription ? { CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH: String(longestToolDescription) } : {}),
     ...cacheEnv(retention),
   };
@@ -333,6 +335,7 @@ function toolServer(tools: readonly ServedTool[], live: Live) {
       name: tool.name.slice(TOOL_PREFIX.length),
       description: tool.description,
       inputSchema: tool.input_schema as { type: "object" },
+      _meta: { [RESULT_SIZE_META]: MAX_TOOL_RESULT_CHARS },
     })),
   }));
   server.server.setRequestHandler(CallToolRequestSchema, (request) => {
@@ -564,6 +567,13 @@ function onStreamEvent(live: Live, event: Record<string, unknown> & { type: stri
     if (step.calls.length) {
       live.awaiting = step.calls;
       endStep(live, "toolUse");
+      return;
+    }
+    if (output.stopReason === "length") {
+      live.finished = true;
+      live.input.end();
+      live.child?.kill("SIGKILL");
+      endStep(live, "length");
     }
   }
 }
@@ -593,10 +603,11 @@ function fail(live: Live, error: Error): void {
   else swallow("claude-code: failure held for the next step", error);
 }
 
-async function appliesServerManagedSettings(query: Query): Promise<boolean> {
+async function appliesUnconfiguredSettings(query: Query): Promise<boolean> {
   const report = await (query as unknown as { getSettings(): Promise<SettingsReport | undefined> }).getSettings();
-  return (report?.sources ?? []).some(
-    (source) => source.source === "policySettings" && Object.keys(source.settings ?? {}).length > 0,
+  if (!Array.isArray(report?.sources)) return true;
+  return report.sources.some(
+    (source) => source.source !== QM_SETTINGS_SOURCE && Object.keys(source.settings ?? {}).length > 0,
   );
 }
 
@@ -685,7 +696,6 @@ function onMessage(live: Live, message: SDKMessage): void {
   if (message.type === "result") {
     live.finished = true;
     live.input.end();
-    live.child?.kill("SIGKILL");
     if (message.subtype === "success" && !message.is_error) {
       endStep(live, live.step?.output.stopReason === "length" ? "length" : "stop");
       return;
@@ -836,14 +846,6 @@ export function createClaudeCodeConnection(): ClaudeCodeConnection {
     mkdirSync(WORK_DIR, { recursive: true });
     const work = realpathSync(WORK_DIR);
     const sdk = await import("@anthropic-ai/claude-agent-sdk");
-    const managed = (await sdk.resolveSettings({ settingSources: [], cwd: work })).sources.filter(
-      (source) => source.source === "managed",
-    );
-    if (managed.length)
-      throw new ClaudeCodeFailure(
-        `Claude Code managed settings (${managed.map((source) => source.path ?? source.policyOrigin ?? "policy").join(", ")}) would apply to QM's queries; refusing to start Claude Code`,
-        { type: "permission_error" },
-      );
     const dir = realpathSync(mkdtempSync(join(tmpdir(), "qm-claude-code-")));
     let markExited!: () => void;
     const exited = new Promise<void>((resolve) => (markExited = resolve));
@@ -882,7 +884,16 @@ export function createClaudeCodeConnection(): ClaudeCodeConnection {
     const options: Options = {
       abortController: target.abort,
       cwd: work,
-      env: { ...claudeCodeEnv(token, dir, longest, streamOptions?.cacheRetention), ...thinking.env },
+      env: {
+        ...claudeCodeEnv(
+          token,
+          dir,
+          longest,
+          streamOptions?.maxTokens ?? model.maxTokens,
+          streamOptions?.cacheRetention,
+        ),
+        ...thinking.env,
+      },
       systemPrompt: request.system,
       model: request.model,
       tools: [],
@@ -904,8 +915,8 @@ export function createClaudeCodeConnection(): ClaudeCodeConnection {
     if (target.closed || connectionClosed) return closeLive(target, "QM ended the turn");
     target.query = sdk.query({ prompt: target.input, options });
     try {
-      if (await appliesServerManagedSettings(target.query))
-        throw unconfigured("applies server-managed settings from the Claude account");
+      if (await appliesUnconfiguredSettings(target.query))
+        throw unconfigured("applies settings (local managed policy or the Claude account's server-managed settings)");
       if (target.closed) return;
       target.input.push(userMessage(prompt));
       for await (const message of target.query) {
@@ -913,7 +924,8 @@ export function createClaudeCodeConnection(): ClaudeCodeConnection {
         onMessage(target, message);
         if (target.failure) break;
       }
-      if (!target.closed && !target.finished) throw apiFailure(target, "Claude Code ended without a result", undefined);
+      if (!target.closed && !target.finished && !target.failure)
+        throw apiFailure(target, "Claude Code ended without a result", undefined);
     } catch (error) {
       if (target.closed || target.finished) swallow("claude-code: error after the query ended", error);
       else fail(target, error instanceof ClaudeCodeFailure ? error : apiFailure(target, errMessage(error), undefined));

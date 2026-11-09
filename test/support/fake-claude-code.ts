@@ -45,10 +45,14 @@ export interface FakeCall {
   initSkills?: string[];
   hookEvent?: string;
   managedSettings?: Record<string, unknown>;
+  settingsReport?: unknown;
 }
 
 type Tweak = Partial<
-  Pick<FakeCall, "initTools" | "apiKeySource" | "initPlugins" | "initSkills" | "hookEvent" | "managedSettings">
+  Pick<
+    FakeCall,
+    "initTools" | "apiKeySource" | "initPlugins" | "initSkills" | "hookEvent" | "managedSettings" | "settingsReport"
+  >
 >;
 
 const BUILTIN_PLUGINS = [{ name: "cc-plugin-agents-md", path: "builtin" }];
@@ -344,6 +348,7 @@ export function fakeClaudeCode(model: Model, tweak: Tweak = {}) {
       },
       async interrupt() {},
       async getSettings() {
+        if (call.settingsReport !== undefined) return call.settingsReport;
         return {
           sources: [
             { source: "flagSettings", settings: options.settings },
