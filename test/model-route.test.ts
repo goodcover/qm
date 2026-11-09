@@ -8,6 +8,7 @@ import { ProviderTurnError } from "../src/core/turn-error.ts";
 import { runtimeConfigBody } from "../src/api/runtime-config.ts";
 import { testConfigStore } from "./support/test-database.ts";
 import { orgScope } from "../src/config.ts";
+import { installFakeClaudeCode } from "./support/fake-claude-code.ts";
 
 const GATEWAY = {
   url: "https://gateway.example/v1",
@@ -268,11 +269,16 @@ test("a fallback that fails keeps the original refusal and says what happened to
 });
 
 for (const [account, anthropic, fallbackModel, expectedHosts] of [
-  ["subscription", "sk-ant-oat01-subscription", "gpt-6-astra", ["api.anthropic.com"]],
-  ["subscription", "sk-ant-oat01-subscription", "codex/gpt-6-astra", ["api.anthropic.com", "chatgpt.com"]],
+  ["subscription", "sk-ant-oat01-subscription", "gpt-6-astra", []],
+  ["subscription", "sk-ant-oat01-subscription", "codex/gpt-6-astra", ["chatgpt.com"]],
   ["metered", "sk-ant-api03-metered", "gpt-6-astra", ["api.anthropic.com", "api.openai.com"]],
 ] as const) {
-  test(`a ${account} Claude turn ${expectedHosts.length > 1 ? "falls back" : "never falls back"} to ${fallbackModel}`, async () => {
+  const fallsBack = fallbackModel.startsWith("codex/") || account === "metered";
+  test(`a ${account} Claude turn ${fallsBack ? "falls back" : "never falls back"} to ${fallbackModel}`, async (t) => {
+    const claudeCode = await installFakeClaudeCode(() => ({
+      error: { kind: "authentication_failed", text: "login revoked", status: 401 },
+    }));
+    t.after(claudeCode.restore);
     const agent = createAgent({
       resolveProviderKeys: async () => ({ anthropic, openai: "sk-openai", "openai-codex": CHATGPT_LOGIN }),
       resolveFallbackRuntime: () => ({ modelId: fallbackModel }),
@@ -290,6 +296,11 @@ for (const [account, anthropic, fallbackModel, expectedHosts] of [
         assert.ok(error instanceof ProviderTurnError);
         assert.equal(error.code, "auth");
         assert.deepEqual([...new Set(calls.map((call) => call.host))], expectedHosts);
+        assert.equal(
+          claudeCode.calls.length,
+          account === "subscription" ? 1 : 0,
+          "only the subscription uses Claude Code",
+        );
       },
     );
   });

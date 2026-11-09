@@ -80,6 +80,7 @@ import {
   type ModelRequestPurpose,
 } from "../model/provider-endpoints.ts";
 import { modelBilling, routeKeys, routeLabel, servedBySubscription, type ModelRoute } from "../model/model-route.ts";
+import { claudeCodeModelId, isClaudeSubscriptionToken } from "../model/claude-subscription.ts";
 import {
   type Agent,
   type CompactInput,
@@ -872,14 +873,20 @@ export function createAgent(opts?: AgentOptions): Agent {
     ...(await opts?.resolveProviderKeys?.()),
   });
   const modelGateway = opts?.modelGateway;
-  const companyServedId = (id: string) => (opts?.companyModelId ? opts.companyModelId(id) : id);
-  const requiredModel = (id: string, company = true) => getRequiredModel(company ? companyServedId(id) : id, company);
+  const companyServedId = (id: string, keys?: ProviderKeys) => {
+    const served = opts?.companyModelId ? opts.companyModelId(id) : id;
+    if (modelGateway || !isClaudeSubscriptionToken(keys?.anthropic) || resolveModel(served)?.provider !== "anthropic")
+      return served;
+    const claudeCode = claudeCodeModelId(served);
+    return resolveModel(claudeCode) ? claudeCode : served;
+  };
   const servedId = (id: string, personalKeys?: ProviderKeys) =>
     personalKeys ? personalModelId(id, personalKeys) : companyServedId(id);
   const routeFor = async (requestedId: string, personalKeys?: ProviderKeys): Promise<ModelRoute> => {
     const modelId = personalKeys ? personalModelId(requestedId, personalKeys) : requestedId;
-    const model = requiredModel(modelId, !personalKeys);
-    const keys = routeKeys(model, personalKeys ?? (await resolveProviderKeys()));
+    const resolvedKeys = personalKeys ?? (await resolveProviderKeys());
+    const model = getRequiredModel(personalKeys ? modelId : companyServedId(modelId, resolvedKeys), !personalKeys);
+    const keys = routeKeys(model, resolvedKeys);
     const gateway = personalKeys ? undefined : modelGateway;
     return {
       modelId,

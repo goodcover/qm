@@ -33,7 +33,9 @@ test("a QM turn on claude-code serves QM's real prompt and tools, records usage,
   const requests: FakeRequest[] = [];
   const fake = await installFakeClaudeCode(historyThenAnswer(requests));
   t.after(fake.restore);
-  const built = buildApp(testConfig({ anthropicApiKey: COMPANY_TOKEN, modelId: MODEL_ID }), { agent: undefined });
+  const built = buildApp(testConfig({ anthropicApiKey: COMPANY_TOKEN, modelId: MODEL_ID, memoryCapture: "off" }), {
+    agent: undefined,
+  });
   const first = await turn(built, "claude-code-e2e");
   built.runtime.start();
   try {
@@ -89,7 +91,9 @@ test("under the strict posture a Claude Code tool call pauses for QM approval an
   const requests: FakeRequest[] = [];
   const fake = await installFakeClaudeCode(historyThenAnswer(requests));
   t.after(fake.restore);
-  const built = buildApp(testConfig({ anthropicApiKey: COMPANY_TOKEN, modelId: MODEL_ID }), { agent: undefined });
+  const built = buildApp(testConfig({ anthropicApiKey: COMPANY_TOKEN, modelId: MODEL_ID, memoryCapture: "off" }), {
+    agent: undefined,
+  });
   await built.config.setSecurityPosture("personal:U1", "strict");
   const first = await turn(built, "claude-code-approval-e2e");
   built.runtime.start();

@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { countTokens } from "../src/util/tokens.ts";
 import { createAgent, stableCwd } from "../src/agent/agent-run.ts";
 import type { AgentTurnInput } from "../src/agent/agent.ts";
+import { installFakeClaudeCode } from "./support/fake-claude-code.ts";
 
 function countTempDirs(prefix: string): number {
   return readdirSync(tmpdir()).filter((name) => name.startsWith(prefix)).length;
@@ -199,24 +200,24 @@ test("prior-turn bootstrap reaches the model before the first prompt", async () 
   assert.match(bodies[0]!, /tell me more/);
 });
 
-test("ack emoji on a Claude subscription token signs the call as a subscription request", async () => {
+test("ack emoji on a company Claude subscription token runs through Claude Code with that login", async (t) => {
+  const fake = await installFakeClaudeCode(() => ({ text: '{"emoji":"eyes"}' }));
+  t.after(fake.restore);
   const agent = createAgent({
     defaultModelId: "claude-sonnet-5",
     resolveProviderKeys: async () => ({ anthropic: "sk-ant-oat01-ack" }),
   });
   const realFetch = globalThis.fetch;
-  const seen: Array<{ headers: Headers; system: unknown }> = [];
+  const direct: string[] = [];
   globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
-    const { headers, body } = await ackRequest(input, init);
-    seen.push({ headers, system: body.system });
+    direct.push((await ackRequest(input, init)).url);
     return ackStream('{"emoji":"eyes"}');
   }) as typeof globalThis.fetch;
   try {
     assert.equal(await agent.pickAckEmoji?.("ship it", ["eyes"]), "eyes");
-    assert.equal(seen[0]!.headers.get("authorization"), "Bearer sk-ant-oat01-ack");
-    assert.equal(seen[0]!.headers.get("x-api-key"), null);
-    assert.match(seen[0]!.headers.get("anthropic-beta") ?? "", /oauth-2025-04-20/);
-    assert.match(JSON.stringify(seen[0]!.system), /You are Claude Code/);
+    assert.equal(fake.calls.length, 1);
+    assert.equal((fake.calls[0]!.options.env as Record<string, string>).CLAUDE_CODE_OAUTH_TOKEN, "sk-ant-oat01-ack");
+    assert.deepEqual(direct, [], "nothing went to the Anthropic API directly");
   } finally {
     globalThis.fetch = realFetch;
   }
@@ -225,7 +226,7 @@ test("ack emoji on a Claude subscription token signs the call as a subscription 
 test("an ack emoji provider failure surfaces its error instead of reading as a declined pick", async () => {
   const agent = createAgent({
     defaultModelId: "claude-sonnet-5",
-    resolveProviderKeys: async () => ({ anthropic: "sk-ant-oat01-revoked" }),
+    resolveProviderKeys: async () => ({ anthropic: "sk-ant-api03-revoked" }),
   });
   const realFetch = globalThis.fetch;
   globalThis.fetch = (async () =>
