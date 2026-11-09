@@ -17,7 +17,7 @@ import {
   type ModelOverlay,
 } from "./model-overlay.ts";
 import { MODEL_REGISTRY, type ModelEntry } from "./model-registry.ts";
-import { providerBaseUrl } from "./provider-endpoints.ts";
+import { providerBaseUrl, CODEX_SUBSCRIPTION_PROVIDER } from "./provider-endpoints.ts";
 import { type CustomRuntimeModel, isCustomModelId, resolveCustomModel } from "./custom-providers.ts";
 import type { ProviderKeys } from "./model-runtime.ts";
 
@@ -26,7 +26,7 @@ const getModel = getBuiltinModel as unknown as (provider: string, id: string) =>
 export const DEFAULT_AGENT_MODEL_ID = "claude-opus-5";
 export const DEFAULT_CODEX_MODEL_ID = "gpt-6.1-sol";
 const PROVIDER_DEFAULT_MODEL_IDS = [DEFAULT_AGENT_MODEL_ID, DEFAULT_CODEX_MODEL_ID, "openrouter/auto"];
-export const CODEX_SUBSCRIPTION_PROVIDER = "openai-codex";
+export { CODEX_SUBSCRIPTION_PROVIDER };
 const CODEX_SUBSCRIPTION_PREFIX = "codex/";
 
 export function codexSubscriptionModelId(id: string): string {

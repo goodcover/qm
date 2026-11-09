@@ -5,6 +5,7 @@ import { currentModelRequestContext } from "./request-context.ts";
 import { attestableActor } from "../directory/person.ts";
 
 export const PROVIDER_IDS = ["anthropic", "openai", "openrouter"] as const;
+export const CODEX_SUBSCRIPTION_PROVIDER = "openai-codex";
 type ProviderId = (typeof PROVIDER_IDS)[number];
 
 const PROVIDER_BASE_URL_ENV: Record<ProviderId, string> = {

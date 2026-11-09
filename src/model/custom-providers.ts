@@ -1,4 +1,5 @@
-import { parseProviderBaseUrl, PROVIDER_IDS } from "./provider-endpoints.ts";
+import { CODEX_SUBSCRIPTION_PROVIDER, parseProviderBaseUrl, PROVIDER_IDS } from "./provider-endpoints.ts";
+import { CLAUDE_CODE_KEY } from "./claude-subscription.ts";
 import { perTenant } from "../tenants/context.ts";
 
 export const CUSTOM_PROVIDER_PROTOCOLS = ["openai", "openai-responses", "anthropic"] as const;
@@ -23,7 +24,7 @@ export interface CustomProviderSpec {
 }
 
 const SLUG_RE = /^[a-z][a-z0-9-]{1,31}$/;
-const RESERVED = new Set<string>(PROVIDER_IDS);
+const RESERVED = new Set<string>([...PROVIDER_IDS, CODEX_SUBSCRIPTION_PROVIDER, CLAUDE_CODE_KEY]);
 
 export function validateCustomProviderSpec(spec: CustomProviderSpec): void {
   if (!SLUG_RE.test(spec.id)) {

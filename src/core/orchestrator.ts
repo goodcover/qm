@@ -3704,7 +3704,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         const onTurnEnd = memoryStrategy.onTurnEnd?.bind(memoryStrategy);
         if (!pausing && !cancelStopped && useMemory && memoryPolicy.capture !== "off" && onTurnEnd) {
           const prior = pendingCaptures.get(memoryScopeId);
-          const capture = (async () => {
+          const runCapture = async () => {
             if (prior) await prior.catch(swallowAs("prior memory capture", undefined));
             try {
               await onTurnEnd({
@@ -3730,7 +3730,8 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
                 e,
               );
             }
-          })();
+          };
+          const capture = deps.admittedWork?.canRun() ? deps.admittedWork.run(runCapture) : runCapture();
           pendingCaptures.set(memoryScopeId, capture);
           void capture.finally(() => {
             if (pendingCaptures.get(memoryScopeId) === capture) pendingCaptures.delete(memoryScopeId);

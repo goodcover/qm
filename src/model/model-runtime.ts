@@ -16,7 +16,8 @@ import {
 } from "@earendil-works/pi-ai";
 import { getServiceTierCostMultiplier } from "@earendil-works/pi-ai/api/openai-responses";
 import type { LlmCallUsage } from "../sessions/session-store.ts";
-import { claudeSubscriptionBetas, claudeSubscriptionHeaders } from "./claude-subscription.ts";
+import { CLAUDE_CODE_KEY, claudeSubscriptionBetas, claudeSubscriptionHeaders } from "./claude-subscription.ts";
+import { createClaudeCodeConnection } from "./claude-code.ts";
 import { gatewayModelsJson, gatewayModelsVersion } from "./gateway-models.ts";
 import {
   customModelsJson,
@@ -40,6 +41,7 @@ import {
 } from "./pi-models.ts";
 import { providerTurnError } from "./provider-error.ts";
 import { perTenant } from "../tenants/context.ts";
+import { withCleanup } from "../util/errors.ts";
 
 export function piUsageToCallUsage(
   u: Partial<Usage> | undefined,
@@ -95,6 +97,8 @@ export interface ProviderKeys {
   [provider: string]: string | undefined;
 }
 
+export type QmModelRuntime = ModelRuntime & { close(): Promise<void> };
+
 const customModelFiles = perTenant<{ cached?: { version: string; path: string | null } }>(() => ({}));
 function customModelsPath(): string | null {
   const files = customModelFiles();
@@ -116,10 +120,13 @@ export async function buildModelRuntime(
   modelGateway?: ModelGatewayTransportConfig,
   purpose?: ModelRequestPurpose,
   cacheRetention?: "long",
-): Promise<ModelRuntime> {
+): Promise<QmModelRuntime> {
   await modelGateway?.refresh?.();
-  const { [CODEX_SUBSCRIPTION_PROVIDER]: subscriptionToken, ...apiKeys }: ProviderKeys =
-    typeof keys === "string" ? { anthropic: keys } : keys;
+  const {
+    [CODEX_SUBSCRIPTION_PROVIDER]: subscriptionToken,
+    [CLAUDE_CODE_KEY]: claudeCodeLogin,
+    ...apiKeys
+  }: ProviderKeys = typeof keys === "string" ? { anthropic: keys } : keys;
   const credentials = new InMemoryCredentialStore();
   if (subscriptionToken)
     await credentials.modify(CODEX_SUBSCRIPTION_PROVIDER, async () => ({
@@ -130,6 +137,7 @@ export async function buildModelRuntime(
     }));
   const modelsPath = customModelsPath();
   const runtime = await ModelRuntime.create({ credentials, modelsPath });
+  const claudeCode = createClaudeCodeConnection();
   for (const [provider, apiKey] of Object.entries(apiKeys)) {
     if (apiKey) await runtime.setRuntimeApiKey(provider, apiKey, { allowNetwork: false });
   }
@@ -235,10 +243,12 @@ export async function buildModelRuntime(
   }) as typeof runtime.stream;
   const streamSimple = runtime.streamSimple.bind(runtime);
   runtime.streamSimple = ((model: Model<Api>, context: Context, options?: ModelsSimpleStreamOptions) => {
+    if (claudeCodeLogin && model.provider === "anthropic" && !modelGatewayRequest(modelGateway, model, purpose))
+      return claudeCode.streamSimple(model, context, { ...retained(options), apiKey: claudeCodeLogin });
     const routed = route(model, options);
     return streamSimple(routed.model, context, routed.options);
   }) as typeof runtime.streamSimple;
-  return runtime;
+  return Object.assign(runtime, { close: claudeCode.close });
 }
 
 export async function probeModel(
@@ -248,7 +258,31 @@ export async function probeModel(
   fastMode = false,
   modelGateway?: ModelGatewayTransportConfig,
 ): Promise<void> {
-  const runtime = await buildModelRuntime(keys, modelGateway, "probe");
+  await withModelRuntime(keys, modelGateway, "probe", (runtime) =>
+    probeRuntime(runtime, model, signal, fastMode, modelGateway),
+  );
+}
+
+export async function withModelRuntime<T>(
+  keys: ProviderKeys | string,
+  modelGateway: ModelGatewayTransportConfig | undefined,
+  purpose: ModelRequestPurpose | undefined,
+  use: (runtime: QmModelRuntime) => Promise<T>,
+): Promise<T> {
+  const runtime = await buildModelRuntime(keys, modelGateway, purpose);
+  return withCleanup(
+    () => use(runtime),
+    () => runtime.close(),
+  );
+}
+
+async function probeRuntime(
+  runtime: ModelRuntime,
+  model: Model<Api>,
+  signal: AbortSignal,
+  fastMode: boolean,
+  modelGateway: ModelGatewayTransportConfig | undefined,
+): Promise<void> {
   signal.throwIfAborted();
   const candidate = withRequestHeaders(model, !modelGateway?.models[model.id], fastMode);
   const response = await runtime

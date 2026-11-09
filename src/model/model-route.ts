@@ -1,8 +1,8 @@
 import type { Api, Model } from "@earendil-works/pi-ai";
-import type { ModelGatewayTransportConfig } from "./provider-endpoints.ts";
+import { providerBaseUrl, type ModelGatewayTransportConfig } from "./provider-endpoints.ts";
 import type { ProviderKeys } from "./model-runtime.ts";
 import { CODEX_SUBSCRIPTION_PROVIDER, modelDisplayName } from "./pi-models.ts";
-import { isClaudeSubscriptionToken } from "./claude-subscription.ts";
+import { CLAUDE_CODE_KEY, isClaudeSubscriptionToken } from "./claude-subscription.ts";
 
 export type ModelBilling = "model_gateway" | "org_key" | "org_subscription" | "personal_account";
 
@@ -25,6 +25,14 @@ export function modelBilling(viaGateway: boolean, personal: boolean, subscriptio
   if (personal) return "personal_account";
   if (viaGateway) return "model_gateway";
   return subscription ? "org_subscription" : "org_key";
+}
+
+export function companyRouteKeys(keys: ProviderKeys): ProviderKeys {
+  return {
+    ...keys,
+    [CLAUDE_CODE_KEY]:
+      isClaudeSubscriptionToken(keys.anthropic) && !providerBaseUrl("anthropic") ? keys.anthropic : undefined,
+  };
 }
 
 export function servedBySubscription(model: Model<Api>, keys: ProviderKeys): boolean {

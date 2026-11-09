@@ -4,8 +4,10 @@ import {
   buildModelRuntime,
   piUsageToCallUsage,
   wantsFastMode,
+  withModelRuntime,
   withRequestHeaders,
   type ProviderKeys,
+  type QmModelRuntime,
 } from "../model/model-runtime.ts";
 import {
   recordSteerIntake,
@@ -77,7 +79,13 @@ import {
   type ModelGatewayTransportConfig,
   type ModelRequestPurpose,
 } from "../model/provider-endpoints.ts";
-import { modelBilling, routeLabel, servedBySubscription, type ModelRoute } from "../model/model-route.ts";
+import {
+  companyRouteKeys,
+  modelBilling,
+  routeLabel,
+  servedBySubscription,
+  type ModelRoute,
+} from "../model/model-route.ts";
 import {
   type Agent,
   type CompactInput,
@@ -391,6 +399,7 @@ interface TurnSession {
   agentSession: AgentSession;
   ref: ToolContextRef & { effortLevel?: string };
   composedPromptTokens: number;
+  modelRuntime: QmModelRuntime;
   agentDir: string;
   ephemeralCwd?: string;
 }
@@ -704,6 +713,11 @@ async function createIsolatedResources(prefix: string, systemPrompt: string): Pr
   return { resourceLoader, settingsManager, cwd, agentDir, ...(ephemeralCwd ? { ephemeralCwd } : {}) };
 }
 
+async function releaseTurnSession(turn: { agentDir: string; ephemeralCwd?: string; modelRuntime: QmModelRuntime }) {
+  removeIsolatedDirs(turn);
+  await turn.modelRuntime.close();
+}
+
 function removeIsolatedDirs(dirs: { agentDir: string; ephemeralCwd?: string }): void {
   for (const dir of [dirs.agentDir, dirs.ephemeralCwd]) {
     if (!dir) continue;
@@ -729,54 +743,55 @@ export async function oneShot(
     recordLlmRequest?: (rec: TurnLlmRequestRecord) => void | Promise<void>;
   },
 ): Promise<string | undefined> {
-  const modelRuntime = await buildModelRuntime(keys, opts?.modelGateway, opts?.purpose);
-  const { resourceLoader, settingsManager, cwd, agentDir, ephemeralCwd } = await createIsolatedResources(
-    prefix,
-    systemPrompt,
-  );
-  try {
-    const { session } = await createAgentSession({
-      model,
-      modelRuntime,
-      resourceLoader,
-      settingsManager,
-      customTools: [],
-      noTools: "builtin",
-      sessionManager: SessionManager.inMemory(),
-      ...(opts?.thinkingLevel ? { thinkingLevel: opts.thinkingLevel } : {}),
-      cwd,
-      agentDir,
-    });
-    const messagesBefore = session.messages.length;
-    if (opts?.signal?.aborted) return undefined;
-    const onAbort = () => {
-      void session.abort().catch(() => undefined);
-    };
-    opts?.signal?.addEventListener("abort", onAbort, { once: true });
-    let recorded: Promise<void> = Promise.resolve();
-    let step = 0;
-    const unsubscribe = session.agent.subscribe((event) => {
-      if (event.type === "agent_start" && opts?.signal?.aborted) session.agent.abort();
-      if (event.type === "message_end" && event.message.role === "assistant" && opts?.recordLlmRequest) {
-        const record = opts.recordLlmRequest;
-        const call = event.message;
-        const at = step++;
-        recorded = recorded.then(() => recordOneShotCall(record, call, at, model));
-      }
-    });
+  return withModelRuntime(keys, opts?.modelGateway, opts?.purpose, async (modelRuntime) => {
+    const { resourceLoader, settingsManager, cwd, agentDir, ephemeralCwd } = await createIsolatedResources(
+      prefix,
+      systemPrompt,
+    );
     try {
-      await session.prompt(prompt);
-    } catch (err) {
-      throw piTurnError(session, err, messagesBefore);
+      const { session } = await createAgentSession({
+        model,
+        modelRuntime,
+        resourceLoader,
+        settingsManager,
+        customTools: [],
+        noTools: "builtin",
+        sessionManager: SessionManager.inMemory(),
+        ...(opts?.thinkingLevel ? { thinkingLevel: opts.thinkingLevel } : {}),
+        cwd,
+        agentDir,
+      });
+      const messagesBefore = session.messages.length;
+      if (opts?.signal?.aborted) return undefined;
+      const onAbort = () => {
+        void session.abort().catch(() => undefined);
+      };
+      opts?.signal?.addEventListener("abort", onAbort, { once: true });
+      let recorded: Promise<void> = Promise.resolve();
+      let step = 0;
+      const unsubscribe = session.agent.subscribe((event) => {
+        if (event.type === "agent_start" && opts?.signal?.aborted) session.agent.abort();
+        if (event.type === "message_end" && event.message.role === "assistant" && opts?.recordLlmRequest) {
+          const record = opts.recordLlmRequest;
+          const call = event.message;
+          const at = step++;
+          recorded = recorded.then(() => recordOneShotCall(record, call, at, model));
+        }
+      });
+      try {
+        await session.prompt(prompt);
+      } catch (err) {
+        throw piTurnError(session, err, messagesBefore);
+      } finally {
+        unsubscribe();
+        opts?.signal?.removeEventListener("abort", onAbort);
+        await recorded;
+      }
+      return piLastAssistantTextOrThrow(session);
     } finally {
-      unsubscribe();
-      opts?.signal?.removeEventListener("abort", onAbort);
-      await recorded;
+      removeIsolatedDirs({ agentDir, ephemeralCwd });
     }
-    return piLastAssistantTextOrThrow(session);
-  } finally {
-    removeIsolatedDirs({ agentDir, ephemeralCwd });
-  }
+  });
 }
 
 async function recordOneShotCall(
@@ -870,7 +885,7 @@ export function createAgent(opts?: AgentOptions): Agent {
   const routeFor = async (requestedId: string, personalKeys?: ProviderKeys): Promise<ModelRoute> => {
     const modelId = personalKeys ? personalModelId(requestedId, personalKeys) : requestedId;
     const model = requiredModel(modelId, !personalKeys);
-    const keys = personalKeys ?? (await resolveProviderKeys());
+    const keys = personalKeys ?? companyRouteKeys(await resolveProviderKeys());
     const gateway = personalKeys ? undefined : modelGateway;
     return {
       modelId,
@@ -960,7 +975,7 @@ export function createAgent(opts?: AgentOptions): Agent {
         agentDir,
       }));
     } catch (err) {
-      removeIsolatedDirs({ agentDir, ephemeralCwd });
+      await releaseTurnSession({ agentDir, ephemeralCwd, modelRuntime });
       throw err;
     }
 
@@ -1021,6 +1036,7 @@ export function createAgent(opts?: AgentOptions): Agent {
       agentSession: session,
       ref,
       composedPromptTokens: countTokens(systemPrompt),
+      modelRuntime,
       agentDir,
       ...(ephemeralCwd ? { ephemeralCwd } : {}),
     };
@@ -1650,7 +1666,7 @@ export function createAgent(opts?: AgentOptions): Agent {
           ...(entry.ref.silentRequested ? { silent: true } : {}),
         });
       } finally {
-        removeIsolatedDirs(entry);
+        await releaseTurnSession(entry);
       }
     },
 
@@ -1675,17 +1691,17 @@ export function createAgent(opts?: AgentOptions): Agent {
     },
 
     async compactHistory(input: CompactInput): Promise<string> {
-      const summarize = async (route: ModelRoute) => {
-        const runtime = await buildModelRuntime(route.keys, route.gateway, "compaction");
-        return summarizeHistory(input.history, route.model, (summaryModel, context, options) => {
-          input.recordModelCall({
-            model: route.modelId,
-            inputTokens: countTokens(context.systemPrompt ?? "") + countTokens(JSON.stringify(context.messages)),
-            entryCount: input.history.length,
-          });
-          return runtime.streamSimple(summaryModel, context, options);
-        });
-      };
+      const summarize = (route: ModelRoute) =>
+        withModelRuntime(route.keys, route.gateway, "compaction", (runtime) =>
+          summarizeHistory(input.history, route.model, (summaryModel, context, options) => {
+            input.recordModelCall({
+              model: route.modelId,
+              inputTokens: countTokens(context.systemPrompt ?? "") + countTokens(JSON.stringify(context.messages)),
+              entryCount: input.history.length,
+            });
+            return runtime.streamSimple(summaryModel, context, options);
+          }),
+        );
       const primary = servable(await sessionRoute(input));
       if (!primary)
         throw new Error(`no configured credential can serve ${input.runtime?.modelId ?? baseModelId()} for a summary`);
@@ -1773,11 +1789,12 @@ export function createAgent(opts?: AgentOptions): Agent {
       const route = await utilityRoute();
       if (!route) return undefined;
       const prompt = `Candidates: ${candidates.join(", ")}\n\nMessage: ${text.slice(0, 2000)}`;
-      const runtime = await buildModelRuntime(route.keys, route.gateway, "ack_emoji");
-      const reply = await runtime.completeSimple(
-        route.model,
-        { systemPrompt: ACK_EMOJI_PROMPT, messages: [{ role: "user", content: prompt, timestamp: Date.now() }] },
-        { maxTokens: 64, signal: AbortSignal.timeout(2_000) },
+      const reply = await withModelRuntime(route.keys, route.gateway, "ack_emoji", (runtime) =>
+        runtime.completeSimple(
+          route.model,
+          { systemPrompt: ACK_EMOJI_PROMPT, messages: [{ role: "user", content: prompt, timestamp: Date.now() }] },
+          { maxTokens: 64, signal: AbortSignal.timeout(2_000) },
+        ),
       );
       if (reply.stopReason === "error") throw providerTurnError(reply);
       const raw = reply.content.find((block) => block.type === "text")?.text;

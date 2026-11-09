@@ -1,26 +1,57 @@
-# Goodcover v0.1.16 source candidate
+# Goodcover v0.1.16 source sync
 
 The source target is upstream `v0.1.16`, commit
-`16ae628535be19486ce2ed95d65c998c2a85a1f0`. The candidate is not deployed, and this
-source sync does not authorize a rollout. Each rollout step below needs its own
-approval. Land the sync with a merge commit or an ancestry-preserving fast-forward.
-Never squash or rebase it.
+`16ae628535be19486ce2ed95d65c998c2a85a1f0`. Production has run it since 2026-11-07, as
+`0.1.16-gc.1` and then `0.1.16-gc.2`. The authoritative pins and the rollout record live
+in ops `gc4/packages/qm/images.json` and its README. Each rollout step needs its own
+approval. Land source syncs with a merge commit or an ancestry-preserving fast-forward.
+Never squash or rebase them.
 
-Production stays on `0.1.15-gc.1`, which is source `f43507f4` and MicroVM 4.0. The
-authoritative pins live in ops `gc4/packages/qm/images.json`. This change does not
-touch them. Delete this guide once production runs 0.1.16 and its pre-hop-1 backup
-is no longer needed for recovery.
+Going back to `0.1.15-gc.1` (source `f43507f4`, MicroVM 4.0) needs the matching
+pre-hop-1 database backup, as the ops README's recovery section describes. Delete this
+guide once that backup is no longer needed for recovery.
 
 ## What changes for GC4
 
 - **One agent.** Pi is now the only agent. Upstream removed the Claude Code harness,
   the `HARNESS` and `CLAUDE_MODEL` settings, and the approved-harnesses setting and
   table. Core ignores those variables instead of rejecting them.
-- **Claude through Pi.** `CLAUDE_AUTH_CREDENTIAL` now reaches Pi as the company
-  Anthropic credential, which Pi sends as an OAuth bearer. The existing setup token
-  has no refresh, so replace it when it expires. Company users can now choose Claude
-  models on that token. Pi identifies itself to Anthropic as Claude Code, so check
-  this use against the subscription terms before rollout.
+- **Claude through Claude Code.** `CLAUDE_AUTH_CREDENTIAL` is the company Anthropic
+  credential. Upstream sends it from Pi straight to the Messages API, which Anthropic
+  bills as a third-party app and refuses while Extra Usage is off. Goodcover serves
+  company Claude routes on a subscription token through the Claude Code binary bundled
+  with `@anthropic-ai/claude-agent-sdk` instead, as 0.1.15's harness did. Pi still runs
+  the turn and QM's tools. The existing setup token has no refresh, so replace it when
+  it expires.
+  - Pi's direct path is kept for metered keys, for an `ANTHROPIC_BASE_URL` override, for
+    models a model gateway carries, and for personal Claude accounts. Personal accounts
+    probably meet the same refusal there; the owner decided on 2026-11-09 to keep them on
+    the direct path for now.
+  - Fast mode is refused on this route, because on a subscription it draws on extra
+    usage.
+  - QM refuses a query when Claude Code reports any settings QM did not configure (local
+    managed policy or the Claude account's server-managed settings), and stops one in which
+    Claude Code runs a hook. An `apiKeyHelper` or `SessionStart` hook from managed settings
+    still runs once before the refusal, and policy re-fetched mid-query (hourly) is only
+    partly caught, so the login must stay on a Pro or Max plan, which has no
+    server-managed settings. A custom provider must not be named `claude-code` or
+    `openai-codex`.
+  - Each query is a Claude Code child process of about 130–210 MB anonymous memory plus
+    about 125 MB shared, bounded only by `WORKERS` (default 16). At 16 concurrent Claude
+    turns that can exceed the core pod's 3 GiB limit, as on 0.1.15. The core image is about
+    310 MB larger.
+  - Every fresh query waits on Claude Code's own fetch of the account's settings. If that
+    endpoint is degraded, each query stalls for about 17–30 s and then proceeds.
+  - **Canary right after deploying the image that brings this route in.** Pre-merge live QA
+    was deferred to it by the owner.
+    - Run one company Claude (`claude-opus-5-5`) tool turn plus a follow-up turn. One Codex
+      turn on the org default must also complete, and a memory capture must be written.
+    - **Pass:** core logs `[claude-code] query started … apiKeySource=none`, and
+      `[claude-code] subscription limit …` with `"isUsingOverage":false`. There is no
+      `managed_settings` refusal, the follow-up turn reads the prompt cache, and the first
+      token arrives within about 3 s of `query started`.
+    - **Roll back** to the previous core image if any Codex turn fails, the core pod restarts or
+      is `OOMKilled`, or a Claude turn fails with `managed_settings` or a billing refusal.
 - **Admin UI.** The admin dashboard is folded into web-ui at `/settings`, and the
   separate admin plugin is gone.
 - **Credentials in shared conversations.** Upstream removed the owner credential
@@ -365,6 +396,8 @@ application:
    Watch for these log lines:
    - `[model] company ChatGPT auth … yielded no token`
    - `[model] company Claude subscription credential … yielded no token`
+   - `[claude-code] query started … apiKeySource=none` on each company Claude query, and
+     `[claude-code] subscription limit …` with `"isUsingOverage":false`
    - `[pi] fallback … skipped`
    - `[swallowed] chatgpt: company oauth refresh`
    - `[mcp] … lists more than 128 tools`

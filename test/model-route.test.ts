@@ -8,6 +8,8 @@ import { ProviderTurnError } from "../src/core/turn-error.ts";
 import { runtimeConfigBody } from "../src/api/runtime-config.ts";
 import { testConfigStore } from "./support/test-database.ts";
 import { orgScope } from "../src/config.ts";
+import { installFakeClaudeCode } from "./support/fake-claude-code.ts";
+import { companyRouteKeys } from "../src/model/model-route.ts";
 
 const GATEWAY = {
   url: "https://gateway.example/v1",
@@ -88,7 +90,11 @@ function compact(agent: ReturnType<typeof createAgent>, route: Partial<CompactIn
   });
 }
 
-function turn(agent: ReturnType<typeof createAgent>, modelId: string): Promise<unknown> {
+function turn(
+  agent: ReturnType<typeof createAgent>,
+  modelId: string,
+  runtime: Omit<NonNullable<AgentTurnInput["runtime"]>, "modelId"> = {},
+): Promise<unknown> {
   let seq = 0;
   return agent.runTurn({
     session: { id: `route-turn-${modelId}` } as AgentTurnInput["session"],
@@ -98,7 +104,7 @@ function turn(agent: ReturnType<typeof createAgent>, modelId: string): Promise<u
     tools: {} as AgentTurnInput["tools"],
     scopeLabel: "personal:tester" as AgentTurnInput["scopeLabel"],
     orgScopeId: "org:test" as AgentTurnInput["orgScopeId"],
-    runtime: { modelId },
+    runtime: { modelId, ...runtime },
     emit: async (item: NewItem) => ({ ...item, seq: seq++, createdAt: Date.now() }) as unknown as Item,
     recordModelCall: () => {},
   });
@@ -267,12 +273,17 @@ test("a fallback that fails keeps the original refusal and says what happened to
   );
 });
 
-for (const [account, anthropic, fallbackModel, expectedHosts] of [
-  ["subscription", "sk-ant-oat01-subscription", "gpt-6-astra", ["api.anthropic.com"]],
-  ["subscription", "sk-ant-oat01-subscription", "codex/gpt-6-astra", ["api.anthropic.com", "chatgpt.com"]],
-  ["metered", "sk-ant-api03-metered", "gpt-6-astra", ["api.anthropic.com", "api.openai.com"]],
+for (const [account, anthropic, fallbackModel, verb, expectedHosts, claudeCodeCalls] of [
+  ["subscription", "sk-ant-oat01-subscription", "gpt-6-astra", "never falls back", [], 1],
+  ["subscription", "sk-ant-oat01-subscription", "codex/gpt-6-astra", "falls back", ["chatgpt.com"], 1],
+  ["subscription", "sk-ant-oat01-subscription", "claude-sonnet-5", "never falls back", [], 1],
+  ["metered", "sk-ant-api03-metered", "gpt-6-astra", "falls back", ["api.anthropic.com", "api.openai.com"], 0],
 ] as const) {
-  test(`a ${account} Claude turn ${expectedHosts.length > 1 ? "falls back" : "never falls back"} to ${fallbackModel}`, async () => {
+  test(`a ${account} Claude turn ${verb} to ${fallbackModel}`, async (t) => {
+    const claudeCode = await installFakeClaudeCode(() => ({
+      error: { kind: "authentication_failed", text: "login revoked", status: 401 },
+    }));
+    t.after(claudeCode.restore);
     const agent = createAgent({
       resolveProviderKeys: async () => ({ anthropic, openai: "sk-openai", "openai-codex": CHATGPT_LOGIN }),
       resolveFallbackRuntime: () => ({ modelId: fallbackModel }),
@@ -290,10 +301,45 @@ for (const [account, anthropic, fallbackModel, expectedHosts] of [
         assert.ok(error instanceof ProviderTurnError);
         assert.equal(error.code, "auth");
         assert.deepEqual([...new Set(calls.map((call) => call.host))], expectedHosts);
+        assert.equal(claudeCode.calls.length, claudeCodeCalls, "only the subscription uses Claude Code");
       },
     );
   });
 }
+
+test("company route keys carry the Claude Code login only for a subscription token", () => {
+  assert.equal(companyRouteKeys({ anthropic: "sk-ant-oat01-company" })["claude-code"], "sk-ant-oat01-company");
+  assert.equal(
+    companyRouteKeys({ anthropic: "sk-ant-api03-metered", "claude-code": "stale" })["claude-code"],
+    undefined,
+    "a stored claude-code key never rides along with a metered key",
+  );
+});
+
+test("a Claude subscription turn honors adaptive and provider-default effort and refuses fast mode", async (t) => {
+  const claudeCode = await installFakeClaudeCode(() => ({ text: "done" }));
+  t.after(claudeCode.restore);
+  const agent = createAgent({ resolveProviderKeys: async () => ({ anthropic: "sk-ant-oat01-subscription" }) });
+  await turn(agent, "claude-opus-5-5", { effortLevel: "adaptive" });
+  await turn(agent, "claude-opus-5-5", { effortLevel: "default" });
+  await turn(agent, "claude-sonnet-5", { effortLevel: "default" });
+  assert.deepEqual(
+    claudeCode.calls.map((call) => [call.options.thinking?.type, call.options.effort]),
+    [
+      ["adaptive", "high"],
+      ["adaptive", "high"],
+      ["disabled", "high"],
+    ],
+    "these levels send what the API applies when Pi omits the fields, not Claude Code's own defaults",
+  );
+  const fast = await turn(agent, "claude-opus-5-5", { fastMode: true }).then(
+    () => assert.fail("fast mode is refused"),
+    (e: unknown) => e,
+  );
+  assert.ok(fast instanceof ProviderTurnError);
+  assert.match(fast.message, /extra usage/);
+  assert.equal(claudeCode.calls.length, 3, "no Claude Code query starts in fast mode");
+});
 
 test("a company ChatGPT summary that fails never reaches a metered fallback", async () => {
   const agent = createAgent({

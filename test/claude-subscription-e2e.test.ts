@@ -5,51 +5,16 @@ import { buildApp } from "./support/build-app.ts";
 import { testConfig } from "./support/test-config.ts";
 import { createAgent } from "../src/agent/agent-run.ts";
 import { hashId } from "../src/util/crypto.ts";
+import { anthropicMessage } from "./support/gateway-stream.ts";
+import { historyThenAnswer, installFakeClaudeCode } from "./support/fake-claude-code.ts";
 
 const SUBSCRIPTION_TOKEN = "sk-ant-oat01-personal-e2e";
 
-function sse(events: unknown[]): Response {
-  const body = events.map((e) => `event: ${(e as { type: string }).type}\ndata: ${JSON.stringify(e)}\n\n`).join("");
-  return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
-}
-
-function message(model: string, blocks: unknown[], stop: string): Response {
-  const events: unknown[] = [
-    {
-      type: "message_start",
-      message: {
-        id: "msg_e2e",
-        type: "message",
-        role: "assistant",
-        model,
-        content: [],
-        stop_reason: null,
-        usage: { input_tokens: 10, output_tokens: 1 },
-      },
-    },
-  ];
-  blocks.forEach((block, index) => {
-    const b = block as { type: string; text?: string; id?: string; name?: string; input?: unknown };
-    if (b.type === "text") {
-      events.push({ type: "content_block_start", index, content_block: { type: "text", text: "" } });
-      events.push({ type: "content_block_delta", index, delta: { type: "text_delta", text: b.text } });
-    } else {
-      events.push({
-        type: "content_block_start",
-        index,
-        content_block: { type: "tool_use", id: b.id, name: b.name, input: {} },
-      });
-      events.push({
-        type: "content_block_delta",
-        index,
-        delta: { type: "input_json_delta", partial_json: JSON.stringify(b.input) },
-      });
-    }
-    events.push({ type: "content_block_stop", index });
+function message(model: string, blocks: Array<Record<string, unknown> & { type: string }>, stop: string): Response {
+  return new Response(anthropicMessage(model, blocks, stop, { input_tokens: 10, output_tokens: 1 }), {
+    status: 200,
+    headers: { "content-type": "text/event-stream" },
   });
-  events.push({ type: "message_delta", delta: { stop_reason: stop }, usage: { output_tokens: 5 } });
-  events.push({ type: "message_stop" });
-  return sse(events);
 }
 
 type Seen = Array<{ headers: Headers; body: Record<string, unknown> }>;
@@ -98,17 +63,9 @@ function fakeAnthropic(t: TestContext): Seen {
   return seen;
 }
 
-async function assertSubscriptionTurn(built: ReturnType<typeof buildApp>, seen: Seen, runId: string, token: string) {
+async function assertAnswered(built: ReturnType<typeof buildApp>, runId: string) {
   const finished = await built.runs.waitFor(runId, 20_000);
   assert.equal(finished.status, "done", JSON.stringify(finished.result));
-  const turnCalls = seen.filter((call) => JSON.stringify(call.body.system ?? "").includes("QM"));
-  assert.equal(turnCalls.length, 2, "one tool-use step and one closing step");
-  for (const call of turnCalls) {
-    assert.equal(call.headers.get("authorization"), `Bearer ${token}`);
-    assert.equal(call.headers.get("x-api-key"), null, "no API key header rides along");
-    assert.match(call.headers.get("anthropic-beta") ?? "", /oauth-2025-04-20/);
-    assert.match(JSON.stringify(call.body.system), /You are Claude Code/);
-  }
   const session = await built.sessions.getByThread(finished.sessionId);
   const items = session ? await built.sessions.getItems(session.id) : [];
   assert.ok(
@@ -124,6 +81,24 @@ async function assertSubscriptionTurn(built: ReturnType<typeof buildApp>, seen: 
     ),
     JSON.stringify(items.map((item) => item.kind)),
   );
+}
+
+async function assertSubscriptionTurn(built: ReturnType<typeof buildApp>, seen: Seen, runId: string, token: string) {
+  await assertAnswered(built, runId);
+  const turnCalls = seen.filter((call) => JSON.stringify(call.body.system ?? "").includes("QM"));
+  assert.equal(turnCalls.length, 2, "one tool-use step and one closing step");
+  for (const call of turnCalls) {
+    assert.equal(call.headers.get("authorization"), `Bearer ${token}`);
+    assert.equal(call.headers.get("x-api-key"), null, "no API key header rides along");
+    assert.match(call.headers.get("anthropic-beta") ?? "", /oauth-2025-04-20/);
+    assert.match(JSON.stringify(call.body.system), /You are Claude Code/);
+  }
+}
+
+async function claudeCodeServing(t: TestContext) {
+  const fake = await installFakeClaudeCode(historyThenAnswer(() => "pong from the Claude subscription"));
+  t.after(fake.restore);
+  return fake;
 }
 
 test("a personal Claude subscription turn runs end to end on Pi with OAuth bearer auth, including a tool round trip", async (t) => {
@@ -158,36 +133,22 @@ test("a personal Claude subscription turn runs end to end on Pi with OAuth beare
   }
 });
 
-test("a company Claude subscription token in ANTHROPIC_API_KEY serves company turns on the wired agent", async (t) => {
+test("a company Claude subscription credential serves company Claude turns through Claude Code beside a metered key and fails closed without it", async (t) => {
   const seen = fakeAnthropic(t);
-  const companyToken = "sk-ant-oat01-company-e2e";
-  const built = buildApp(testConfig({ anthropicApiKey: companyToken }), { agent: undefined });
-  const submitted = await built.app.turn({
-    surface: "slack",
-    actor: { externalId: "U1" },
-    conversation: { kind: "dm", threadRef: "claude-company-subscription-e2e" },
-    text: "ping",
-    origin: { kind: "human" },
-    async: true,
-  });
-  built.runtime.start();
-  try {
-    await assertSubscriptionTurn(built, seen, submitted.runId!, companyToken);
-  } finally {
-    await built.runtime.stop();
-  }
-});
-
-test("a company Claude subscription credential owns company Claude turns beside a metered key and fails closed without it", async (t) => {
-  const seen = fakeAnthropic(t);
+  const fake = await claudeCodeServing(t);
   const ownerId = "claude-owner";
   const service = "claude-code";
   const envKey = "CLAUDE_CODE_OAUTH_TOKEN";
   const companyToken = "sk-ant-oat01-company-keychain-e2e";
   const credentialId = hashId([ownerId, service, `env:${envKey}`]);
-  const built = buildApp(testConfig({ anthropicApiKey: "sk-ant-api03-metered", claudeAuthCredential: credentialId }), {
-    agent: undefined,
-  });
+  const built = buildApp(
+    testConfig({
+      anthropicApiKey: "sk-ant-api03-metered",
+      claudeAuthCredential: credentialId,
+      modelId: "claude-opus-5-5",
+    }),
+    { agent: undefined },
+  );
   assert.equal((await built.keychain!.save({ ownerId, service, secret: companyToken, envKey })).id, credentialId);
   const turn = (threadRef: string) =>
     built.app.turn({
@@ -201,9 +162,18 @@ test("a company Claude subscription credential owns company Claude turns beside 
   const first = await turn("claude-company-keychain-e2e");
   built.runtime.start();
   try {
-    await assertSubscriptionTurn(built, seen, first.runId!, companyToken);
+    await assertAnswered(built, first.runId!);
+    assert.deepEqual(
+      fake.calls.filter((call) => call.options.mcpServers).map((call) => call.options.model),
+      ["claude-opus-5-5"],
+      "one Claude Code query served the tool step and the answer with the selected model",
+    );
+    for (const call of fake.calls)
+      assert.equal((call.options.env as Record<string, string>).CLAUDE_CODE_OAUTH_TOKEN, companyToken);
+    assert.equal(seen.length, 0, "no company request went to the Anthropic API directly");
     await built.keychain!.remove(ownerId, credentialId);
-    seen.length = 0;
+    const turnQueries = () => fake.calls.filter((call) => call.options.mcpServers).length;
+    const queries = turnQueries();
     const second = await turn("claude-company-keychain-missing-e2e");
     const deadline = Date.now() + 20_000;
     while (((await built.runs.get(second.runId!))?.errorAttempts ?? 0) === 0) {
@@ -211,6 +181,7 @@ test("a company Claude subscription credential owns company Claude turns beside 
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
     assert.notEqual((await built.runs.get(second.runId!))?.status, "done");
+    assert.equal(turnQueries(), queries, "no Claude Code turn starts without the subscription credential");
     assert.deepEqual(
       seen.filter((call) => call.headers.get("x-api-key")),
       [],
