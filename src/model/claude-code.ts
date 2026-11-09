@@ -569,8 +569,26 @@ function fail(live: Live, error: Error): void {
   else swallow("claude-code: failure held for the next step", error);
 }
 
+function unconfigured(what: string): ClaudeCodeFailure {
+  return new ClaudeCodeFailure(
+    `Claude Code ${what} that QM did not configure, most likely from the Claude account's managed settings; QM refuses to run Claude Code with them`,
+    { type: "permission_error", code: "managed_settings" },
+  );
+}
+
 function onMessage(live: Live, message: SDKMessage): void {
+  if (message.type === "system" && message.subtype.startsWith("hook_")) {
+    const hook = message as { hook_event?: string; hook_name?: string };
+    console.error(`[claude-code] ${message.subtype} event=${hook.hook_event} name=${hook.hook_name}`);
+    return fail(live, unconfigured(`ran a ${hook.hook_event} hook (${hook.hook_name})`));
+  }
   if (message.type === "system" && message.subtype === "init") {
+    const plugins = message.plugins.filter((plugin) => plugin.path !== "builtin").map((plugin) => plugin.name);
+    if (plugins.length || message.skills.length)
+      return fail(
+        live,
+        unconfigured(`loaded plugins [${plugins.join(", ")}] and skills [${message.skills.join(", ")}]`),
+      );
     const servers = message.mcp_servers.map((server) => `${server.name}=${server.status}`).join(", ");
     const foreign = message.tools.filter((name) => !live.served.has(name));
     const missing = [...live.served.keys()].filter((name) => !message.tools.includes(name));
@@ -842,6 +860,7 @@ export function createClaudeCodeConnection(): ClaudeCodeConnection {
       skills: [],
       settings: { autoMemoryEnabled: false, crossSessionInbound: "refuse" },
       includePartialMessages: true,
+      includeHookEvents: true,
       verbatimPrompts: true,
       extraArgs: { "disable-slash-commands": null },
       ...(request.tools.length ? { mcpServers: { [SERVER]: toolServer(request.tools, target) } } : {}),

@@ -41,7 +41,14 @@ export interface FakeCall {
   closed: boolean;
   initTools?: string[];
   apiKeySource?: string;
+  initPlugins?: Array<{ name: string; path: string }>;
+  initSkills?: string[];
+  hookEvent?: string;
 }
+
+type Tweak = Partial<Pick<FakeCall, "initTools" | "apiKeySource" | "initPlugins" | "initSkills" | "hookEvent">>;
+
+const BUILTIN_PLUGINS = [{ name: "cc-plugin-agents-md", path: "builtin" }];
 
 type Model = (request: FakeRequest) => FakeReply | Promise<FakeReply>;
 
@@ -164,7 +171,7 @@ function historyFrom(records: Array<Record<string, unknown>>): Turn[] {
     });
 }
 
-export function fakeClaudeCode(model: Model, tweak: Partial<Pick<FakeCall, "initTools" | "apiKeySource">> = {}) {
+export function fakeClaudeCode(model: Model, tweak: Tweak = {}) {
   const calls: FakeCall[] = [];
 
   function query({ prompt, options }: { prompt: AsyncIterable<SDKUserMessage>; options: Options }) {
@@ -212,11 +219,23 @@ export function fakeClaudeCode(model: Model, tweak: Partial<Pick<FakeCall, "init
         call.listedTools = (await client.listTools()).tools;
       }
       const offered = call.listedTools.map((tool) => `mcp__qm__${tool.name}`);
+      if (call.hookEvent)
+        yield {
+          type: "system",
+          subtype: "hook_started",
+          hook_id: "hook-1",
+          hook_name: `${call.hookEvent}:startup`,
+          hook_event: call.hookEvent,
+          uuid: randomUUID(),
+          session_id: "fake",
+        } as unknown as SDKMessage;
       yield {
         type: "system",
         subtype: "init",
         tools: call.initTools ?? offered,
         apiKeySource: call.apiKeySource ?? "none",
+        plugins: call.initPlugins ?? BUILTIN_PLUGINS,
+        skills: call.initSkills ?? [],
         mcp_servers: server ? [{ name: "qm", status: "connected" }] : [],
         model: options.model,
         cwd: options.cwd,
@@ -327,10 +346,7 @@ export function fakeClaudeCode(model: Model, tweak: Partial<Pick<FakeCall, "init
   return { calls, query };
 }
 
-export async function installFakeClaudeCode(
-  model: Model,
-  tweak: Partial<Pick<FakeCall, "initTools" | "apiKeySource">> = {},
-) {
+export async function installFakeClaudeCode(model: Model, tweak: Tweak = {}) {
   const fake = fakeClaudeCode(model, tweak);
   const real = await import("@anthropic-ai/claude-agent-sdk");
   const mocked = mock.module("@anthropic-ai/claude-agent-sdk", {

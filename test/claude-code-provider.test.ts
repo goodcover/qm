@@ -204,11 +204,14 @@ test("Claude Code tool calls QM did not serve never reach QM", async (t) => {
   assert.deepEqual(toolNames, ["lookup"], "Pi only ever saw the served tool");
 });
 
-test("a mismatched tool list or an API key source fails the turn closed and is not retried", async () => {
+test("a mismatched tool list, an API key source, or an unconfigured hook, plugin or skill fails the turn closed and is not retried", async () => {
   const cases = [
     { tweak: { initTools: ["mcp__qm__lookup", "Bash"] }, message: /Bash/ },
     { tweak: { initTools: [] }, message: /mcp__qm__lookup/ },
     { tweak: { apiKeySource: "ANTHROPIC_API_KEY" }, message: /ANTHROPIC_API_KEY/ },
+    { tweak: { hookEvent: "SessionStart" }, message: /ran a SessionStart hook .*managed settings/ },
+    { tweak: { initPlugins: [{ name: "org-plugin", path: "/tmp/org-plugin" }] }, message: /plugins \[org-plugin\]/ },
+    { tweak: { initSkills: ["org-skill"] }, message: /skills \[org-skill\]/ },
   ];
   for (const { tweak, message } of cases) {
     const fake = await installFakeClaudeCode(() => ({ text: "must not be used" }), tweak);
