@@ -212,19 +212,21 @@ test("Claude Code tool calls QM did not serve never reach QM", async (t) => {
   assert.deepEqual(toolNames, ["lookup"], "Pi only ever saw the served tool");
 });
 
-test("a mismatched tool list, an API key source, or an unconfigured hook, plugin or skill fails the turn closed and is not retried", async () => {
+test("a mismatched tool list, an API key source, unconfigured settings or an unconfigured hook fails the turn closed and is not retried", async () => {
   const cases = [
     { tweak: { initTools: ["mcp__qm__lookup", "Bash"] }, message: /Bash/ },
     { tweak: { initTools: [] }, message: /mcp__qm__lookup/ },
     { tweak: { apiKeySource: "ANTHROPIC_API_KEY" }, message: /ANTHROPIC_API_KEY/ },
     { tweak: { hookEvent: "SessionStart" }, message: /ran a SessionStart hook .*managed settings/ },
-    { tweak: { initPlugins: [{ name: "org-plugin", path: "/tmp/org-plugin" }] }, message: /plugins \[org-plugin\]/ },
-    { tweak: { initSkills: ["org-skill"] }, message: /skills \[org-skill\]/ },
     {
       tweak: { managedSettings: { env: { ANTHROPIC_BASE_URL: "https://elsewhere.invalid" } } },
       message: /server-managed settings/,
     },
     { tweak: { settingsReport: {} }, message: /applies settings .*QM refuses/ },
+    {
+      tweak: { settingsReport: { sources: [{ source: "userSettings", settings: { model: "elsewhere" } }] } },
+      message: /applies settings .*QM refuses/,
+    },
   ];
   for (const { tweak, message } of cases) {
     const fake = await installFakeClaudeCode(() => ({ text: "must not be used" }), tweak);
@@ -618,5 +620,6 @@ test("QM's thinking level reaches the wire through Claude Code as Pi's Anthropic
     const piEffort = (pi.body.output_config as { effort?: string } | undefined)?.effort;
     assert.equal(options.effort, piEffort ?? "high", label);
     assert.equal(env.ANTHROPIC_BETAS ?? "", pi.beta.includes("thinking-binding") ? pi.beta : "", label);
+    assert.equal(env.CLAUDE_CODE_MAX_OUTPUT_TOKENS, String(pi.body.max_tokens), label);
   }
 });

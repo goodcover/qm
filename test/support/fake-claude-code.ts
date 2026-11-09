@@ -41,21 +41,12 @@ export interface FakeCall {
   closed: boolean;
   initTools?: string[];
   apiKeySource?: string;
-  initPlugins?: Array<{ name: string; path: string }>;
-  initSkills?: string[];
   hookEvent?: string;
   managedSettings?: Record<string, unknown>;
   settingsReport?: unknown;
 }
 
-type Tweak = Partial<
-  Pick<
-    FakeCall,
-    "initTools" | "apiKeySource" | "initPlugins" | "initSkills" | "hookEvent" | "managedSettings" | "settingsReport"
-  >
->;
-
-const BUILTIN_PLUGINS = [{ name: "cc-plugin-agents-md", path: "builtin" }];
+type Tweak = Partial<Pick<FakeCall, "initTools" | "apiKeySource" | "hookEvent" | "managedSettings" | "settingsReport">>;
 
 type Model = (request: FakeRequest) => FakeReply | Promise<FakeReply>;
 
@@ -241,8 +232,6 @@ export function fakeClaudeCode(model: Model, tweak: Tweak = {}) {
         subtype: "init",
         tools: call.initTools ?? offered,
         apiKeySource: call.apiKeySource ?? "none",
-        plugins: call.initPlugins ?? BUILTIN_PLUGINS,
-        skills: call.initSkills ?? [],
         mcp_servers: server ? [{ name: "qm", status: "connected" }] : [],
         model: options.model,
         cwd: options.cwd,

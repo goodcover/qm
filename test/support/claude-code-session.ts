@@ -1,4 +1,4 @@
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -74,7 +74,13 @@ export async function claudeCodeSession(
     agentDir: dir,
   });
   if (messages.length) session.agent.state.messages = [...messages];
-  return { session, close: () => runtime.close() };
+  return {
+    session,
+    close: async () => {
+      await runtime.close();
+      rmSync(dir, { recursive: true, force: true });
+    },
+  };
 }
 
 export function lastAssistant(session: AgentSession): AssistantMessage {

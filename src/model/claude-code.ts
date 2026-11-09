@@ -43,7 +43,7 @@ import {
   type ToolResultMessage,
   type Usage,
 } from "@earendil-works/pi-ai";
-import { adjustMaxTokensForThinking } from "@earendil-works/pi-ai/api/simple-options";
+import { adjustMaxTokensForThinking, clampMaxTokensToContext } from "@earendil-works/pi-ai/api/simple-options";
 import { transformMessages } from "@earendil-works/pi-ai/api/transform-messages";
 import { MAX_TOOL_RESULT_CHARS } from "../agent/agent-tools/record.ts";
 import { hashId } from "../util/crypto.ts";
@@ -146,6 +146,7 @@ interface ClaudeCodeRequest {
   system: string;
   messages: TranscriptMessage[];
   tools: ServedTool[];
+  max_tokens?: number;
   thinking?: WireThinking;
   output_config?: { effort?: EffortLevel };
   speed?: string;
@@ -372,18 +373,31 @@ function effortFor(model: Model<Api>, reasoning: string): EffortLevel {
 
 function thinkingFor(
   model: Model<Api>,
+  context: Context,
   options: SimpleStreamOptions | undefined,
-): Pick<ClaudeCodeRequest, "thinking" | "output_config"> {
+): Pick<ClaudeCodeRequest, "max_tokens" | "thinking" | "output_config"> {
   const reasoning = options?.reasoning;
+  const base = clampMaxTokensToContext(model, context, options?.maxTokens ?? model.maxTokens);
   if (!reasoning)
-    return model.reasoning && model.thinkingLevelMap?.off !== null ? { thinking: { type: "disabled" } } : {};
+    return model.reasoning && model.thinkingLevelMap?.off !== null
+      ? { max_tokens: base, thinking: { type: "disabled" } }
+      : { max_tokens: base };
   if (modelSupportsAdaptiveThinking(model))
     return {
+      max_tokens: base,
       thinking: { type: "adaptive", display: THINKING_DISPLAY },
       output_config: { effort: effortFor(model, reasoning) },
     };
-  const { thinkingBudget } = adjustMaxTokensForThinking(undefined, model.maxTokens, reasoning, options.thinkingBudgets);
-  return { thinking: { type: "enabled", budget_tokens: thinkingBudget, display: THINKING_DISPLAY } };
+  const adjusted = adjustMaxTokensForThinking(base, model.maxTokens, reasoning, options.thinkingBudgets);
+  const maxTokens = clampMaxTokensToContext(model, context, adjusted.maxTokens);
+  return {
+    max_tokens: maxTokens,
+    thinking: {
+      type: "enabled",
+      budget_tokens: Math.min(adjusted.thinkingBudget, Math.max(0, maxTokens - 1024)),
+      display: THINKING_DISPLAY,
+    },
+  };
 }
 
 function sdkThinking(thinking: WireThinking): ThinkingConfig {
@@ -564,16 +578,16 @@ function onStreamEvent(live: Live, event: Record<string, unknown> & { type: stri
       failStep(step, new ClaudeCodeFailure("The model declined to continue (refusal)", { type: "refusal" }), false);
       return;
     }
-    if (step.calls.length) {
-      live.awaiting = step.calls;
-      endStep(live, "toolUse");
-      return;
-    }
     if (output.stopReason === "length") {
       live.finished = true;
       live.input.end();
       live.child?.kill("SIGKILL");
       endStep(live, "length");
+      return;
+    }
+    if (step.calls.length) {
+      live.awaiting = step.calls;
+      endStep(live, "toolUse");
     }
   }
 }
@@ -625,12 +639,6 @@ function onMessage(live: Live, message: SDKMessage): void {
     return fail(live, unconfigured(`ran a ${hook.hook_event} hook (${hook.hook_name})`));
   }
   if (message.type === "system" && message.subtype === "init") {
-    const plugins = message.plugins.filter((plugin) => plugin.path !== "builtin").map((plugin) => plugin.name);
-    if (plugins.length || message.skills.length)
-      return fail(
-        live,
-        unconfigured(`loaded plugins [${plugins.join(", ")}] and skills [${message.skills.join(", ")}]`),
-      );
     const servers = message.mcp_servers.map((server) => `${server.name}=${server.status}`).join(", ");
     const foreign = message.tools.filter((name) => !live.served.has(name));
     const missing = [...live.served.keys()].filter((name) => !message.tools.includes(name));
@@ -697,7 +705,7 @@ function onMessage(live: Live, message: SDKMessage): void {
     live.finished = true;
     live.input.end();
     if (message.subtype === "success" && !message.is_error) {
-      endStep(live, live.step?.output.stopReason === "length" ? "length" : "stop");
+      endStep(live, "stop");
       return;
     }
     const text =
@@ -885,13 +893,7 @@ export function createClaudeCodeConnection(): ClaudeCodeConnection {
       abortController: target.abort,
       cwd: work,
       env: {
-        ...claudeCodeEnv(
-          token,
-          dir,
-          longest,
-          streamOptions?.maxTokens ?? model.maxTokens,
-          streamOptions?.cacheRetention,
-        ),
+        ...claudeCodeEnv(token, dir, longest, request.max_tokens ?? model.maxTokens, streamOptions?.cacheRetention),
         ...thinking.env,
       },
       systemPrompt: request.system,
@@ -954,7 +956,7 @@ export function createClaudeCodeConnection(): ClaudeCodeConnection {
           description: tool.description,
           input_schema: tool.parameters,
         })),
-        ...thinkingFor(model, options),
+        ...thinkingFor(model, context, options),
       };
       const continuing = continues(live, messages) ? live : undefined;
       void (async () => {

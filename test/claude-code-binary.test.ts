@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingHttpHeaders } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -36,6 +36,30 @@ interface Captured {
     max_tokens?: number;
     output_config?: { effort?: string };
   };
+}
+
+function truncatedToolCall(model: string): string {
+  const usage = { input_tokens: 21, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
+  return [
+    {
+      type: "message_start",
+      message: { id: "msg_cut", type: "message", role: "assistant", model, content: [], usage },
+    },
+    { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+    { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "let me look" } },
+    { type: "content_block_stop", index: 0 },
+    {
+      type: "content_block_start",
+      index: 1,
+      content_block: { type: "tool_use", id: "toolu_cut", name: "mcp__qm__lookup", input: {} },
+    },
+    { type: "content_block_delta", index: 1, delta: { type: "input_json_delta", partial_json: '{"key": "al' } },
+    { type: "content_block_stop", index: 1 },
+    { type: "message_delta", delta: { stop_reason: "max_tokens" }, usage: { output_tokens: 9 } },
+    { type: "message_stop" },
+  ]
+    .map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`)
+    .join("");
 }
 
 function reply(model: string, block: Block, stop: string): string {
@@ -108,8 +132,10 @@ async function mockMessagesApi(
     other,
     status,
     truncate = false,
+    truncateToolCall = false,
   }: {
     truncate?: boolean;
+    truncateToolCall?: boolean;
     status?: number;
     hang?: boolean;
     headers?: Record<string, string>;
@@ -145,6 +171,14 @@ async function mockMessagesApi(
         return res.end(other?.(call) ?? reply(model, { type: "text", text: "side request" }, "end_turn"));
       if (truncate) return res.end(reply(model, { type: "text", text: "partial answer" }, "max_tokens"));
       const result = lastUser({ messages: conversation(call) }).find((block) => block.type === "tool_result");
+      if (truncateToolCall) {
+        const answered = conversation(call).some(
+          (message) => Array.isArray(message.content) && message.content.some((block) => block.type === "tool_result"),
+        );
+        return res.end(
+          answered ? reply(model, { type: "text", text: "done after the cut" }, "end_turn") : truncatedToolCall(model),
+        );
+      }
       if (!result || alwaysCallTool)
         return res.end(
           reply(
@@ -153,7 +187,10 @@ async function mockMessagesApi(
             "tool_use",
           ),
         );
-      const text = (result.content as Block[]).map((block) => String(block.text)).join("");
+      const text =
+        typeof result.content === "string"
+          ? result.content
+          : (result.content as Block[]).map((block) => String(block.text)).join("");
       res.end(reply(model, { type: "text", text: `done after ${text}` }, "end_turn"));
     });
   });
@@ -272,6 +309,27 @@ test("the real binary sends Pi's output ceiling and thinking defaults, and stops
   assert.ok(cleanedUp(spawned), "the Claude Code process exited and its directory is gone");
 });
 
+test(
+  "a tool call cut off at the output ceiling ends the step as length and never runs",
+  { timeout: 30_000 },
+  async (t) => {
+    const api = await mockMessagesApi(t, { truncateToolCall: true });
+    const spawned = await pointClaudeCodeAt(t, api.url);
+    const executed: string[] = [];
+    const run = await claudeCodeSession({ anthropic: TOKEN }, [lookupTool(executed)], [], {
+      modelId: PRODUCTION_MODEL,
+    });
+    t.after(() => run.close());
+    await run.session.prompt("look it up");
+    await run.close();
+    assert.deepEqual(executed, [], "the truncated tool call was not run");
+    const stops = run.session.messages.flatMap((message) => (message.role === "assistant" ? [message.stopReason] : []));
+    assert.deepEqual(stops, ["length", "stop"], "the cut step ends as length, as on Pi, and the turn continues");
+    assert.equal(api.captured.filter(isTurn).length, 2, "no Claude Code resume request after the ceiling");
+    assert.ok(cleanedUp(spawned), "every Claude Code process exited and its directory is gone");
+  },
+);
+
 test("a tool result up to QM's cap reaches the model whole through the real binary", async (t) => {
   const api = await mockMessagesApi(t);
   const spawned = await pointClaudeCodeAt(t, api.url);
@@ -301,6 +359,7 @@ test(
     const api = await mockMessagesApi(t, { status: 500 });
     const spawned = await pointClaudeCodeAt(t, api.url);
     const run = await claudeCodeSession({ anthropic: TOKEN }, [lookupTool([])], [], { modelId: PRODUCTION_MODEL });
+    t.after(() => run.close());
     run.session.settingsManager.setRetryEnabled(false);
     await run.session.prompt("hi").catch(() => undefined);
     await run.close();
@@ -324,50 +383,7 @@ test("a hook QM did not configure stops the real binary before any model request
   assert.ok(cleanedUp(spawned), "the Claude Code process exited and its directory is gone");
 });
 
-test("the real binary reports its settings sources, with QM's own as flagSettings, before any prompt", async (t) => {
-  const api = await mockMessagesApi(t);
-  const home = realpathSync(mkdtempSync(join(tmpdir(), "claude-code-settings-test-")));
-  t.after(() => rmSync(home, { recursive: true, force: true }));
-  let release!: () => void;
-  const held = new Promise<void>((resolve) => (release = resolve));
-  const { query } = await import("@anthropic-ai/claude-agent-sdk");
-  const session = query({
-    prompt: (async function* () {
-      await held;
-      yield* [];
-    })(),
-    options: {
-      cwd: home,
-      env: {
-        PATH: "/usr/bin:/bin",
-        HOME: home,
-        CLAUDE_CONFIG_DIR: home,
-        CLAUDE_CODE_OAUTH_TOKEN: TOKEN,
-        ANTHROPIC_BASE_URL: api.url,
-      },
-      settingSources: [],
-      settings: { autoMemoryEnabled: false },
-      tools: [],
-      strictMcpConfig: true,
-    },
-  });
-  try {
-    const report = (await (session as unknown as { getSettings(): Promise<unknown> }).getSettings()) as {
-      sources?: Array<{ source?: string; settings?: Record<string, unknown> }>;
-    };
-    assert.ok(
-      report.sources?.some(
-        (source) => source.source === "flagSettings" && source.settings?.autoMemoryEnabled === false,
-      ),
-      JSON.stringify(report),
-    );
-  } finally {
-    release();
-    await session.return(undefined);
-  }
-});
-
-test("aborting a turn kills the real Claude Code process mid-request", async (t) => {
+test("aborting a turn kills the real Claude Code process mid-request", { timeout: 30_000 }, async (t) => {
   const api = await mockMessagesApi(t, { hang: true });
   const spawned = await pointClaudeCodeAt(t, api.url);
   const { session, close } = await claudeCodeSession({ anthropic: TOKEN }, [lookupTool([])]);

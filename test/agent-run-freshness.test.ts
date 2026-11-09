@@ -217,6 +217,11 @@ test("ack emoji on a company Claude subscription token runs through Claude Code 
     assert.equal(await agent.pickAckEmoji?.("ship it", ["eyes"]), "eyes");
     assert.equal(fake.calls.length, 1);
     assert.equal((fake.calls[0]!.options.env as Record<string, string>).CLAUDE_CODE_OAUTH_TOKEN, "sk-ant-oat01-ack");
+    assert.equal(
+      (fake.calls[0]!.options.env as Record<string, string>).CLAUDE_CODE_MAX_OUTPUT_TOKENS,
+      "64",
+      "the ack emoji's own output cap reaches Claude Code",
+    );
     assert.deepEqual(direct, [], "nothing went to the Anthropic API directly");
   } finally {
     globalThis.fetch = realFetch;

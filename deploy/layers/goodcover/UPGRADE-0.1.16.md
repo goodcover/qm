@@ -30,11 +30,12 @@ guide once that backup is no longer needed for recovery.
   - Fast mode is refused on this route, because on a subscription it draws on extra
     usage.
   - QM refuses a query when Claude Code reports any settings QM did not configure (local
-    managed policy or the Claude account's server-managed settings), and when it runs a
-    hook or loads a plugin or skill QM did not configure. An `apiKeyHelper` or
-    `SessionStart` hook from managed settings can still run once before the refusal, so
-    the login must stay on a Pro or Max plan, which has no server-managed settings. A
-    custom provider must not be named `claude-code` or `openai-codex`.
+    managed policy or the Claude account's server-managed settings), and stops one in which
+    Claude Code runs a hook. An `apiKeyHelper` or `SessionStart` hook from managed settings
+    still runs once before the refusal, and policy re-fetched mid-query (hourly) is only
+    partly caught, so the login must stay on a Pro or Max plan, which has no
+    server-managed settings. A custom provider must not be named `claude-code` or
+    `openai-codex`.
   - Each query is a Claude Code child process of about 130–210 MB anonymous memory plus
     about 125 MB shared, bounded only by `WORKERS` (default 16). At 16 concurrent Claude
     turns that can exceed the core pod's 3 GiB limit, as on 0.1.15. The core image is about

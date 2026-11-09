@@ -9,6 +9,7 @@ import { runtimeConfigBody } from "../src/api/runtime-config.ts";
 import { testConfigStore } from "./support/test-database.ts";
 import { orgScope } from "../src/config.ts";
 import { installFakeClaudeCode } from "./support/fake-claude-code.ts";
+import { companyRouteKeys } from "../src/model/model-route.ts";
 
 const GATEWAY = {
   url: "https://gateway.example/v1",
@@ -305,6 +306,15 @@ for (const [account, anthropic, fallbackModel, verb, expectedHosts, claudeCodeCa
     );
   });
 }
+
+test("company route keys carry the Claude Code login only for a subscription token", () => {
+  assert.equal(companyRouteKeys({ anthropic: "sk-ant-oat01-company" })["claude-code"], "sk-ant-oat01-company");
+  assert.equal(
+    companyRouteKeys({ anthropic: "sk-ant-api03-metered", "claude-code": "stale" })["claude-code"],
+    undefined,
+    "a stored claude-code key never rides along with a metered key",
+  );
+});
 
 test("a Claude subscription turn honors adaptive and provider-default effort and refuses fast mode", async (t) => {
   const claudeCode = await installFakeClaudeCode(() => ({ text: "done" }));
