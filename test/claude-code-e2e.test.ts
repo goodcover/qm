@@ -3,19 +3,10 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { buildApp } from "./support/build-app.ts";
 import { testConfig } from "./support/test-config.ts";
-import { answered, installFakeClaudeCode, type FakeRequest } from "./support/fake-claude-code.ts";
+import { historyThenAnswer, installFakeClaudeCode, type FakeRequest } from "./support/fake-claude-code.ts";
 import { CLAUDE_CODE_TEST_MODEL as MODEL_ID } from "./support/claude-code-session.ts";
 
 const COMPANY_TOKEN = "sk-ant-oat01-company-claude-code-e2e";
-
-function historyThenAnswer(requests: FakeRequest[]) {
-  return (request: FakeRequest) => {
-    if (!request.tools.length) return { text: "side request" };
-    requests.push(request);
-    if (answered(request)) return { text: `pong ${requests.length}`, usage: { input: 40, output: 8 } };
-    return { tools: [{ id: `toolu_${requests.length}`, name: "mcp__qm__history", input: { query: "anything" } }] };
-  };
-}
 
 function turn(built: ReturnType<typeof buildApp>, threadRef: string, extra: Record<string, unknown> = {}) {
   return built.app.turn({
@@ -31,9 +22,9 @@ function turn(built: ReturnType<typeof buildApp>, threadRef: string, extra: Reco
 
 test("a QM turn on claude-code serves QM's real prompt and tools, records usage, and resumes from Postgres history", async (t) => {
   const requests: FakeRequest[] = [];
-  const fake = await installFakeClaudeCode(historyThenAnswer(requests));
+  const fake = await installFakeClaudeCode(historyThenAnswer((n) => `pong ${n}`, requests));
   t.after(fake.restore);
-  const built = buildApp(testConfig({ anthropicApiKey: COMPANY_TOKEN, modelId: MODEL_ID, memoryCapture: "off" }), {
+  const built = buildApp(testConfig({ anthropicApiKey: COMPANY_TOKEN, modelId: MODEL_ID }), {
     agent: undefined,
   });
   const first = await turn(built, "claude-code-e2e");
@@ -89,9 +80,9 @@ test("a QM turn on claude-code serves QM's real prompt and tools, records usage,
 
 test("under the strict posture a Claude Code tool call pauses for QM approval and resumes after it", async (t) => {
   const requests: FakeRequest[] = [];
-  const fake = await installFakeClaudeCode(historyThenAnswer(requests));
+  const fake = await installFakeClaudeCode(historyThenAnswer((n) => `pong ${n}`, requests));
   t.after(fake.restore);
-  const built = buildApp(testConfig({ anthropicApiKey: COMPANY_TOKEN, modelId: MODEL_ID, memoryCapture: "off" }), {
+  const built = buildApp(testConfig({ anthropicApiKey: COMPANY_TOKEN, modelId: MODEL_ID }), {
     agent: undefined,
   });
   await built.config.setSecurityPosture("personal:U1", "strict");

@@ -16,11 +16,13 @@ is no longer needed for recovery.
 - **One agent.** Pi is now the only agent. Upstream removed the Claude Code harness,
   the `HARNESS` and `CLAUDE_MODEL` settings, and the approved-harnesses setting and
   table. Core ignores those variables instead of rejecting them.
-- **Claude through Pi.** `CLAUDE_AUTH_CREDENTIAL` now reaches Pi as the company
-  Anthropic credential, which Pi sends as an OAuth bearer. The existing setup token
-  has no refresh, so replace it when it expires. Company users can now choose Claude
-  models on that token. Pi identifies itself to Anthropic as Claude Code, so check
-  this use against the subscription terms before rollout.
+- **Claude through Claude Code.** `CLAUDE_AUTH_CREDENTIAL` is the company Anthropic
+  credential. Upstream sends it from Pi straight to the Messages API, which Anthropic
+  bills as a third-party app and refuses while Extra Usage is off. Goodcover serves
+  every company Claude route through the Claude Code binary bundled with
+  `@anthropic-ai/claude-agent-sdk` instead, as 0.1.15's harness did. Pi still runs the
+  turn and QM's tools. The existing setup token has no refresh, so replace it when it
+  expires. Personal Claude accounts and metered keys keep Pi's direct path.
 - **Admin UI.** The admin dashboard is folded into web-ui at `/settings`, and the
   separate admin plugin is gone.
 - **Credentials in shared conversations.** Upstream removed the owner credential
@@ -365,6 +367,8 @@ application:
    Watch for these log lines:
    - `[model] company ChatGPT auth … yielded no token`
    - `[model] company Claude subscription credential … yielded no token`
+   - `[claude-code] query started … apiKeySource=none` on each company Claude query, and
+     `[claude-code] subscription limit …` with `"isUsingOverage":false`
    - `[pi] fallback … skipped`
    - `[swallowed] chatgpt: company oauth refresh`
    - `[mcp] … lists more than 128 tools`

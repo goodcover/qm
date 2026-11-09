@@ -89,7 +89,11 @@ function compact(agent: ReturnType<typeof createAgent>, route: Partial<CompactIn
   });
 }
 
-function turn(agent: ReturnType<typeof createAgent>, modelId: string): Promise<unknown> {
+function turn(
+  agent: ReturnType<typeof createAgent>,
+  modelId: string,
+  runtime: Omit<NonNullable<AgentTurnInput["runtime"]>, "modelId"> = {},
+): Promise<unknown> {
   let seq = 0;
   return agent.runTurn({
     session: { id: `route-turn-${modelId}` } as AgentTurnInput["session"],
@@ -99,7 +103,7 @@ function turn(agent: ReturnType<typeof createAgent>, modelId: string): Promise<u
     tools: {} as AgentTurnInput["tools"],
     scopeLabel: "personal:tester" as AgentTurnInput["scopeLabel"],
     orgScopeId: "org:test" as AgentTurnInput["orgScopeId"],
-    runtime: { modelId },
+    runtime: { modelId, ...runtime },
     emit: async (item: NewItem) => ({ ...item, seq: seq++, createdAt: Date.now() }) as unknown as Item,
     recordModelCall: () => {},
   });
@@ -271,9 +275,10 @@ test("a fallback that fails keeps the original refusal and says what happened to
 for (const [account, anthropic, fallbackModel, expectedHosts] of [
   ["subscription", "sk-ant-oat01-subscription", "gpt-6-astra", []],
   ["subscription", "sk-ant-oat01-subscription", "codex/gpt-6-astra", ["chatgpt.com"]],
+  ["subscription", "sk-ant-oat01-subscription", "claude-sonnet-5", []],
   ["metered", "sk-ant-api03-metered", "gpt-6-astra", ["api.anthropic.com", "api.openai.com"]],
 ] as const) {
-  const fallsBack = fallbackModel.startsWith("codex/") || account === "metered";
+  const fallsBack = expectedHosts.some((host) => host !== "api.anthropic.com");
   test(`a ${account} Claude turn ${fallsBack ? "falls back" : "never falls back"} to ${fallbackModel}`, async (t) => {
     const claudeCode = await installFakeClaudeCode(() => ({
       error: { kind: "authentication_failed", text: "login revoked", status: 401 },
@@ -305,6 +310,28 @@ for (const [account, anthropic, fallbackModel, expectedHosts] of [
     );
   });
 }
+
+test("a Claude subscription turn honors adaptive and provider-default effort and refuses fast mode", async (t) => {
+  const claudeCode = await installFakeClaudeCode(() => ({ text: "done" }));
+  t.after(claudeCode.restore);
+  const agent = createAgent({ resolveProviderKeys: async () => ({ anthropic: "sk-ant-oat01-subscription" }) });
+  await turn(agent, "claude-opus-5-5", { effortLevel: "adaptive" });
+  await turn(agent, "claude-opus-5-5", { effortLevel: "default" });
+  assert.deepEqual(
+    claudeCode.calls.map((call) => [call.options.thinking, call.options.effort]),
+    [
+      [{ type: "adaptive", display: "summarized" }, undefined],
+      [undefined, undefined],
+    ],
+  );
+  const fast = await turn(agent, "claude-opus-5-5", { fastMode: true }).then(
+    () => assert.fail("fast mode is refused"),
+    (e: unknown) => e,
+  );
+  assert.ok(fast instanceof ProviderTurnError);
+  assert.match(fast.message, /extra usage/);
+  assert.equal(claudeCode.calls.length, 2, "no Claude Code query starts in fast mode");
+});
 
 test("a company ChatGPT summary that fails never reaches a metered fallback", async () => {
   const agent = createAgent({

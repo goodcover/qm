@@ -12,7 +12,6 @@ import {
   type ModelProvider,
 } from "../model/pi-models.ts";
 import type { UserModelCredential } from "../model/user-model-credential-store.ts";
-import { CLAUDE_CODE_PROVIDER } from "../model/claude-subscription.ts";
 
 export type IndividualAuthRouting =
   | { kind: "apikey"; provider: ModelProvider; model: string | undefined; apiKey: string }
@@ -26,7 +25,6 @@ export function resolveIndividualAuthRouting(
 ): IndividualAuthRouting {
   if (requestedModel && (modelUnavailableReason(requestedModel) || !resolveModel(requestedModel))) return null;
   const rawProvider = requestedModel ? resolveModel(requestedModel)?.provider : undefined;
-  if (rawProvider === CLAUDE_CODE_PROVIDER) return null;
   const requestedProvider = rawProvider === CODEX_SUBSCRIPTION_PROVIDER ? "openai" : rawProvider;
   const pick = ((): { provider: "anthropic" | "openai"; cred: UserModelCredential } | null => {
     if (requestedProvider === "anthropic" && anthCred) return { provider: "anthropic", cred: anthCred };

@@ -13,7 +13,6 @@ import {
 } from "./pi-models.ts";
 import type { resolveBrowserModel } from "./browser-model.ts";
 import type { UserModelCredentialStore } from "./user-model-credential-store.ts";
-import { CLAUDE_CODE_PROVIDER } from "./claude-subscription.ts";
 import { buildModelRuntime, type ProviderKeys, zeroUsage } from "./model-runtime.ts";
 
 function object(value: unknown): Record<string, unknown> | undefined {
@@ -50,8 +49,6 @@ export async function nativeBrowserCompletion(
   let model = selection.model ? resolveModel(selection.model, selection.account === "company") : undefined;
   if ((!routing && selection.account !== "company") || !model)
     throw new BrowserCompletionError("Selected browser model is unavailable", 409);
-  if (model.provider === CLAUDE_CODE_PROVIDER)
-    throw new BrowserCompletionError("Claude Code models do not support browser inference", 422);
   if (selection.account === "company" && input.companySubscriptionProvider === model.provider) {
     if (model.provider === "anthropic")
       throw new BrowserCompletionError("Claude subscription access does not support browser inference", 422);

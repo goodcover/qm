@@ -19,6 +19,7 @@ import { lastUser, type Block } from "./support/fake-claude-code.ts";
 import { anthropicMessage } from "./support/gateway-stream.ts";
 
 const TOKEN = "sk-ant-oat01-binary-contract-test";
+const PRODUCTION_MODEL = "claude-opus-5-5";
 
 type WireMessage = { role: string; content: string | Block[] };
 interface Captured {
@@ -175,7 +176,7 @@ test("the bundled Claude Code binary serves QM tool turns with only QM's tools a
   const executed: string[] = [];
   const description = `${"D".repeat(6000)} end of description`;
   const tools = [lookupTool(executed), { ...lookupTool([]), name: "long_doc", description }];
-  const first = await claudeCodeSession({ anthropic: TOKEN }, tools);
+  const first = await claudeCodeSession({ anthropic: TOKEN }, tools, [], { modelId: PRODUCTION_MODEL });
   await first.session.prompt("Compare alpha");
   await first.close();
   const live = api.captured.filter(isTurn);
@@ -189,11 +190,13 @@ test("the bundled Claude Code binary serves QM tool turns with only QM's tools a
     assert.equal(call.headers["x-api-key"], undefined);
     assert.ok(String(call.headers["user-agent"]).includes("sdk-ts"));
     assert.ok(String(call.headers["user-agent"]).includes("client-app/qm/claude-code-provider"));
-    const offered = new Map(call.body.tools?.map((tool) => [tool.name, tool.description]));
+    assert.equal(call.body.model, PRODUCTION_MODEL);
+    const visible = call.body.tools?.filter((tool) => !(tool as { defer_loading?: boolean }).defer_loading);
+    const offered = new Map(visible?.map((tool) => [tool.name, tool.description]));
     assert.deepEqual(
       [...offered.keys()].sort(),
       ["mcp__qm__long_doc", "mcp__qm__lookup"],
-      "no Claude Code built-in tool is offered to the model",
+      "the model sees no Claude Code built-in tool",
     );
     assert.equal(offered.get("mcp__qm__long_doc"), description, "a long tool description arrives whole");
     assert.ok(!environmentReminder(call).includes("<total_tokens>"), "no per-step token countdown");
@@ -201,7 +204,9 @@ test("the bundled Claude Code binary serves QM tool turns with only QM's tools a
   assert.ok(cleanedUp(spawned), "every Claude Code process exited and its directory is gone");
 
   api.captured.length = 0;
-  const second = await claudeCodeSession({ anthropic: TOKEN }, tools, [...first.session.messages] as Message[]);
+  const second = await claudeCodeSession({ anthropic: TOKEN }, tools, [...first.session.messages] as Message[], {
+    modelId: PRODUCTION_MODEL,
+  });
   await second.session.prompt("And again?");
   await second.close();
   const resumed = api.captured.find(isTurn)!;

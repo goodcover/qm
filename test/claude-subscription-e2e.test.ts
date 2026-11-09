@@ -6,7 +6,7 @@ import { testConfig } from "./support/test-config.ts";
 import { createAgent } from "../src/agent/agent-run.ts";
 import { hashId } from "../src/util/crypto.ts";
 import { anthropicMessage } from "./support/gateway-stream.ts";
-import { answered, installFakeClaudeCode, type FakeRequest } from "./support/fake-claude-code.ts";
+import { historyThenAnswer, installFakeClaudeCode } from "./support/fake-claude-code.ts";
 
 const SUBSCRIPTION_TOKEN = "sk-ant-oat01-personal-e2e";
 
@@ -95,30 +95,29 @@ async function assertSubscriptionTurn(built: ReturnType<typeof buildApp>, seen: 
   }
 }
 
-async function fakeClaudeCode(t: TestContext) {
-  const fake = await installFakeClaudeCode((request: FakeRequest) => {
-    if (!request.tools.length) return { text: "side request" };
-    if (answered(request)) return { text: "pong from the Claude subscription" };
-    return { tools: [{ id: "toolu_e2e", name: "mcp__qm__history", input: { query: "anything" } }] };
-  });
+async function claudeCodeServing(t: TestContext) {
+  const fake = await installFakeClaudeCode(historyThenAnswer(() => "pong from the Claude subscription"));
   t.after(fake.restore);
   return fake;
 }
 
 async function assertClaudeCodeTurn(
   built: ReturnType<typeof buildApp>,
-  fake: Awaited<ReturnType<typeof fakeClaudeCode>>,
+  fake: Awaited<ReturnType<typeof claudeCodeServing>>,
   seen: Seen,
   runId: string,
   token: string,
+  model: string,
 ) {
   await assertAnswered(built, runId);
   const turnQueries = fake.calls.filter((call) => call.options.mcpServers);
-  assert.ok(turnQueries.length, "Claude Code served the turn");
-  for (const call of fake.calls) {
+  assert.deepEqual(
+    turnQueries.map((call) => call.options.model),
+    [model],
+    "one Claude Code query served the tool step and the answer with the selected model",
+  );
+  for (const call of fake.calls)
     assert.equal((call.options.env as Record<string, string>).CLAUDE_CODE_OAUTH_TOKEN, token);
-    assert.ok(!call.options.model?.startsWith("claude-code/"), call.options.model);
-  }
   assert.deepEqual(
     seen.map((call) => call.body.model),
     [],
@@ -160,14 +159,11 @@ test("a personal Claude subscription turn runs end to end on Pi with OAuth beare
 
 test("a company Claude subscription token in ANTHROPIC_API_KEY serves company Claude turns through Claude Code", async (t) => {
   const seen = fakeAnthropic(t);
-  const fake = await fakeClaudeCode(t);
+  const fake = await claudeCodeServing(t);
   const companyToken = "sk-ant-oat01-company-e2e";
-  const built = buildApp(
-    testConfig({ anthropicApiKey: companyToken, modelId: "claude-sonnet-5", memoryCapture: "off" }),
-    {
-      agent: undefined,
-    },
-  );
+  const built = buildApp(testConfig({ anthropicApiKey: companyToken, modelId: "claude-sonnet-5" }), {
+    agent: undefined,
+  });
   const submitted = await built.app.turn({
     surface: "slack",
     actor: { externalId: "U1" },
@@ -178,7 +174,7 @@ test("a company Claude subscription token in ANTHROPIC_API_KEY serves company Cl
   });
   built.runtime.start();
   try {
-    await assertClaudeCodeTurn(built, fake, seen, submitted.runId!, companyToken);
+    await assertClaudeCodeTurn(built, fake, seen, submitted.runId!, companyToken, "claude-sonnet-5");
   } finally {
     await built.runtime.stop();
   }
@@ -186,7 +182,7 @@ test("a company Claude subscription token in ANTHROPIC_API_KEY serves company Cl
 
 test("a company Claude subscription credential serves company Claude turns through Claude Code beside a metered key and fails closed without it", async (t) => {
   const seen = fakeAnthropic(t);
-  const fake = await fakeClaudeCode(t);
+  const fake = await claudeCodeServing(t);
   const ownerId = "claude-owner";
   const service = "claude-code";
   const envKey = "CLAUDE_CODE_OAUTH_TOKEN";
@@ -197,7 +193,6 @@ test("a company Claude subscription credential serves company Claude turns throu
       anthropicApiKey: "sk-ant-api03-metered",
       claudeAuthCredential: credentialId,
       modelId: "claude-opus-5-5",
-      memoryCapture: "off",
     }),
     { agent: undefined },
   );
@@ -214,8 +209,7 @@ test("a company Claude subscription credential serves company Claude turns throu
   const first = await turn("claude-company-keychain-e2e");
   built.runtime.start();
   try {
-    await assertClaudeCodeTurn(built, fake, seen, first.runId!, companyToken);
-    assert.ok(fake.calls.some((call) => call.options.model === "claude-opus-5-5"));
+    await assertClaudeCodeTurn(built, fake, seen, first.runId!, companyToken, "claude-opus-5-5");
     await built.keychain!.remove(ownerId, credentialId);
     const turnQueries = () => fake.calls.filter((call) => call.options.mcpServers).length;
     const queries = turnQueries();

@@ -16,8 +16,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { getServiceTierCostMultiplier } from "@earendil-works/pi-ai/api/openai-responses";
 import type { LlmCallUsage } from "../sessions/session-store.ts";
-import { CLAUDE_CODE_PROVIDER, claudeSubscriptionBetas, claudeSubscriptionHeaders } from "./claude-subscription.ts";
-import { routeKeys } from "./model-route.ts";
+import { CLAUDE_CODE_KEY, claudeSubscriptionBetas, claudeSubscriptionHeaders } from "./claude-subscription.ts";
 import { createClaudeCodeConnection } from "./claude-code.ts";
 import { gatewayModelsJson, gatewayModelsVersion } from "./gateway-models.ts";
 import {
@@ -123,8 +122,11 @@ export async function buildModelRuntime(
   cacheRetention?: "long",
 ): Promise<QmModelRuntime> {
   await modelGateway?.refresh?.();
-  const { [CODEX_SUBSCRIPTION_PROVIDER]: subscriptionToken, ...apiKeys }: ProviderKeys =
-    typeof keys === "string" ? { anthropic: keys } : keys;
+  const {
+    [CODEX_SUBSCRIPTION_PROVIDER]: subscriptionToken,
+    [CLAUDE_CODE_KEY]: claudeCodeLogin,
+    ...apiKeys
+  }: ProviderKeys = typeof keys === "string" ? { anthropic: keys } : keys;
   const credentials = new InMemoryCredentialStore();
   if (subscriptionToken)
     await credentials.modify(CODEX_SUBSCRIPTION_PROVIDER, async () => ({
@@ -135,12 +137,7 @@ export async function buildModelRuntime(
     }));
   const modelsPath = customModelsPath();
   const runtime = await ModelRuntime.create({ credentials, modelsPath });
-  const claudeCode = createClaudeCodeConnection({ gateway: Boolean(modelGateway) });
-  if (apiKeys[CLAUDE_CODE_PROVIDER])
-    runtime.registerProvider(CLAUDE_CODE_PROVIDER, {
-      api: CLAUDE_CODE_PROVIDER as Api,
-      streamSimple: claudeCode.streamSimple,
-    });
+  const claudeCode = createClaudeCodeConnection();
   for (const [provider, apiKey] of Object.entries(apiKeys)) {
     if (apiKey) await runtime.setRuntimeApiKey(provider, apiKey, { allowNetwork: false });
   }
@@ -246,6 +243,8 @@ export async function buildModelRuntime(
   }) as typeof runtime.stream;
   const streamSimple = runtime.streamSimple.bind(runtime);
   runtime.streamSimple = ((model: Model<Api>, context: Context, options?: ModelsSimpleStreamOptions) => {
+    if (claudeCodeLogin && model.provider === "anthropic" && !modelGatewayRequest(modelGateway, model, purpose))
+      return claudeCode.streamSimple(model, context, { ...retained(options), apiKey: claudeCodeLogin });
     const routed = route(model, options);
     return streamSimple(routed.model, context, routed.options);
   }) as typeof runtime.streamSimple;
@@ -259,7 +258,7 @@ export async function probeModel(
   fastMode = false,
   modelGateway?: ModelGatewayTransportConfig,
 ): Promise<void> {
-  await withModelRuntime(routeKeys(model, keys), modelGateway, "probe", (runtime) =>
+  await withModelRuntime(keys, modelGateway, "probe", (runtime) =>
     probeRuntime(runtime, model, signal, fastMode, modelGateway),
   );
 }

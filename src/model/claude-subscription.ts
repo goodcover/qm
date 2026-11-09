@@ -1,13 +1,4 @@
-export const CLAUDE_CODE_PROVIDER = "claude-code";
-export const CLAUDE_CODE_PREFIX = "claude-code/";
-
-export function claudeCodeNativeId(id: string): string {
-  return id.slice(CLAUDE_CODE_PREFIX.length);
-}
-
-export function claudeCodeModelId(nativeId: string): string {
-  return CLAUDE_CODE_PREFIX + nativeId;
-}
+export const CLAUDE_CODE_KEY = "claude-code";
 
 const CLAUDE_SUBSCRIPTION_BETAS = ["claude-code-20250219", "oauth-2025-04-20"];
 const CLAUDE_CODE_CLIENT = "claude-cli/2.1.280";

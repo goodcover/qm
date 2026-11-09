@@ -1,8 +1,8 @@
 import type { Api, Model } from "@earendil-works/pi-ai";
-import type { ModelGatewayTransportConfig } from "./provider-endpoints.ts";
+import { providerBaseUrl, type ModelGatewayTransportConfig } from "./provider-endpoints.ts";
 import type { ProviderKeys } from "./model-runtime.ts";
 import { CODEX_SUBSCRIPTION_PROVIDER, modelDisplayName } from "./pi-models.ts";
-import { CLAUDE_CODE_PROVIDER, isClaudeSubscriptionToken } from "./claude-subscription.ts";
+import { CLAUDE_CODE_KEY, isClaudeSubscriptionToken } from "./claude-subscription.ts";
 
 export type ModelBilling = "model_gateway" | "org_key" | "org_subscription" | "personal_account";
 
@@ -27,16 +27,15 @@ export function modelBilling(viaGateway: boolean, personal: boolean, subscriptio
   return subscription ? "org_subscription" : "org_key";
 }
 
-export function routeKeys(model: Model<Api>, keys: ProviderKeys): ProviderKeys {
-  return model.provider === CLAUDE_CODE_PROVIDER && keys.anthropic
-    ? { ...keys, [CLAUDE_CODE_PROVIDER]: keys.anthropic }
+export function companyRouteKeys(keys: ProviderKeys): ProviderKeys {
+  return isClaudeSubscriptionToken(keys.anthropic) && !providerBaseUrl("anthropic")
+    ? { ...keys, [CLAUDE_CODE_KEY]: keys.anthropic }
     : keys;
 }
 
 export function servedBySubscription(model: Model<Api>, keys: ProviderKeys): boolean {
   return (
     model.provider === CODEX_SUBSCRIPTION_PROVIDER ||
-    model.provider === CLAUDE_CODE_PROVIDER ||
     (model.provider === "anthropic" && isClaudeSubscriptionToken(keys.anthropic))
   );
 }

@@ -346,6 +346,15 @@ export async function installFakeClaudeCode(
   };
 }
 
+export function historyThenAnswer(answer: (requests: number) => string, sink: FakeRequest[] = []): Model {
+  return (request) => {
+    if (!request.tools.length) return { text: "side request" };
+    sink.push(request);
+    if (answered(request)) return { text: answer(sink.length), usage: { input: 40, output: 8 } };
+    return { tools: [{ id: `toolu_${sink.length}`, name: "mcp__qm__history", input: { query: "anything" } }] };
+  };
+}
+
 export function lastUser(request: { messages: ReadonlyArray<{ role: string; content: Block[] }> }): Block[] {
   return request.messages.findLast((message) => message.role === "user")?.content ?? [];
 }

@@ -4,21 +4,10 @@ import { test } from "node:test";
 import { Type } from "typebox";
 import type { AgentSession, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { AssistantMessage, Message, Usage } from "@earendil-works/pi-ai";
-import {
-  auxiliaryModelFor,
-  defaultInteractiveThinkingLevel,
-  defaultModel,
-  defaultWebuiModelIds,
-  modelIdReserved,
-  resolveModel,
-  selectableBaseModels,
-} from "../src/model/pi-models.ts";
-import { modelBilling, routeLabel, servedBySubscription } from "../src/model/model-route.ts";
+import { resolveModel } from "../src/model/pi-models.ts";
 import { providerTurnError } from "../src/model/provider-error.ts";
 import { setProviderBaseUrls } from "../src/model/provider-endpoints.ts";
 import { zeroUsage } from "../src/model/model-runtime.ts";
-import { resolveIndividualAuthRouting } from "../src/core/individual-auth-routing.ts";
-import { BrowserCompletionError, nativeBrowserCompletion } from "../src/model/browser-completion.ts";
 import { answered, installFakeClaudeCode, lastUser, type Block, type FakeReply } from "./support/fake-claude-code.ts";
 import {
   CLAUDE_CODE_TEST_MODEL as MODEL_ID,
@@ -52,46 +41,6 @@ function assistantFrom(model: string, content: AssistantMessage["content"], extr
     ...extra,
   } as AssistantMessage;
 }
-
-test("claude-code models resolve only by explicit id and stay out of catalogs and defaults", () => {
-  const model = resolveModel(MODEL_ID);
-  assert.equal(model?.provider, "claude-code");
-  assert.equal(model?.api, "claude-code");
-  assert.equal(resolveModel("claude-code/gpt-6.1-sol"), undefined, "only Anthropic models run through Claude Code");
-  assert.ok(modelIdReserved(MODEL_ID));
-  const listed = [...selectableBaseModels(true).map((entry) => entry.id), ...defaultWebuiModelIds(), defaultModel()];
-  assert.ok(!listed.some((id) => id.startsWith("claude-code/")));
-  assert.equal(defaultInteractiveThinkingLevel(model!), "low", "same default effort as native Anthropic");
-  assert.equal(resolveModel(auxiliaryModelFor("claude-code/claude-opus-5"))?.provider, "claude-code");
-});
-
-test("claude-code routes are labelled as subscription usage", () => {
-  assert.ok(servedBySubscription(resolveModel(MODEL_ID)!, { anthropic: TOKEN }));
-  assert.equal(
-    routeLabel({ modelId: MODEL_ID, billing: modelBilling(false, false, true) }),
-    `${MODEL_ID} (billed to the organization's subscription)`,
-  );
-});
-
-test("personal model accounts never route to claude-code", () => {
-  const oauth = { provider: "anthropic", kind: "oauth", oauth: {}, updatedAt: 1 } as const;
-  const apiKey = { provider: "anthropic", kind: "apikey", apiKey: "sk-ant-api03-personal", updatedAt: 1 } as const;
-  assert.equal(resolveIndividualAuthRouting(oauth, null, MODEL_ID), null);
-  assert.equal(resolveIndividualAuthRouting(apiKey, null, MODEL_ID), null);
-});
-
-test("browser inference refuses claude-code models", async () => {
-  await assert.rejects(
-    nativeBrowserCompletion({
-      selection: { account: "company", model: MODEL_ID } as Parameters<typeof nativeBrowserCompletion>[0]["selection"],
-      companyProviderKeys: { anthropic: TOKEN },
-      actorId: "U1",
-      body: { messages: [] },
-      signal: new AbortController().signal,
-    }),
-    (error: unknown) => error instanceof BrowserCompletionError && error.status === 422,
-  );
-});
 
 test("a multi-tool turn runs QM tools only through Pi and pairs every result with its tool_use id", async (t) => {
   const executed: string[] = [];
@@ -175,33 +124,59 @@ test("a multi-tool turn runs QM tools only through Pi and pairs every result wit
   }
 });
 
-test("metered or missing Anthropic credentials, a model gateway, or an operator Anthropic base URL fail before Claude Code starts", async (t) => {
-  const fake = await installFakeClaudeCode(() => ({ text: "should never run" }));
+test("metered keys, an operator Anthropic base URL and gateway-served models stay on Pi's direct path", async (t) => {
+  const fake = await installFakeClaudeCode(() => ({ text: "from Claude Code" }));
   t.after(fake.restore);
-  const metered = await piSession({ anthropic: "sk-ant-api03-metered" }, []);
-  await metered.session.prompt("hi");
-  await metered.close();
-  assert.match(lastAssistant(metered.session).errorMessage ?? "", /never uses a metered API key/);
-  assert.equal(providerTurnError(lastAssistant(metered.session)).code, "auth");
+  const direct: Array<{ host: string; apiKey: string | null; authorization: string | null }> = [];
+  t.mock.method(globalThis, "fetch", async (input: string | URL | Request, init?: RequestInit) => {
+    const headers = new Headers(input instanceof Request ? input.headers : init?.headers);
+    direct.push({
+      host: new URL(String(input instanceof Request ? input.url : input)).host,
+      apiKey: headers.get("x-api-key"),
+      authorization: headers.get("authorization"),
+    });
+    return new Response(
+      JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "direct" } }),
+      {
+        status: 400,
+        headers: { "content-type": "application/json" },
+      },
+    );
+  });
+  const prompt = async (keys: Parameters<typeof piSession>[0], options?: Parameters<typeof piSession>[3]) => {
+    const run = await piSession(keys, [], [], options);
+    await run.session.prompt("hi").catch(() => undefined);
+    await run.close();
+    return lastAssistant(run.session);
+  };
+
+  await prompt({ anthropic: "sk-ant-api03-metered" });
+  assert.equal(direct.at(-1)?.apiKey, "sk-ant-api03-metered", "a metered key goes to the Anthropic API");
 
   setProviderBaseUrls({ anthropic: "https://egress.invalid" });
   t.after(() => setProviderBaseUrls({}));
-  const proxied = await piSession({ anthropic: TOKEN }, []);
-  await proxied.session.prompt("hi");
-  await proxied.close();
-  assert.match(lastAssistant(proxied.session).errorMessage ?? "", /through https:\/\/egress\.invalid/);
+  await prompt({ anthropic: TOKEN });
+  assert.equal(direct.at(-1)?.host, "egress.invalid", "an operator base URL keeps Anthropic traffic on that URL");
   setProviderBaseUrls({});
 
-  const gateway = { url: "http://gateway.invalid/", apiKey: "gk", apiKeyHeader: "api-key", models: {} };
-  const gatewayed = await piSession({ anthropic: TOKEN }, [], [], { gateway });
-  await gatewayed.session.prompt("hi");
-  await gatewayed.close();
-  assert.match(lastAssistant(gatewayed.session).errorMessage ?? "", /model gateway/);
-
-  const missing = await piSession({ openai: "sk-openai" }, []);
-  await assert.rejects(missing.session.prompt("hi"), /claude-code/);
-  await missing.close();
+  const gateway = {
+    url: "http://gateway.invalid/v1",
+    apiKey: "gk",
+    apiKeyHeader: "api-key",
+    models: { [MODEL_ID]: `anthropic/${MODEL_ID}` },
+  };
+  await prompt({ anthropic: TOKEN }, { gateway });
+  assert.equal(direct.at(-1)?.host, "gateway.invalid", "the gateway serves the models it carries");
   assert.equal(fake.calls.length, 0, "Claude Code never started");
+
+  const unmapped = await prompt({ anthropic: TOKEN }, { gateway: { ...gateway, models: {} } });
+  assert.equal(unmapped.stopReason, "stop", unmapped.errorMessage);
+  assert.equal(fake.calls.length, 1, "a model the gateway does not carry runs on the subscription through Claude Code");
+  assert.deepEqual(
+    direct.filter((call) => call.host === "api.anthropic.com").map((call) => call.apiKey),
+    ["sk-ant-api03-metered"],
+    "only the metered key reached the Anthropic API directly",
+  );
 });
 
 test("Claude Code tool calls QM did not serve never reach QM", async (t) => {
@@ -578,7 +553,7 @@ test("QM's thinking level reaches Claude Code the way Pi's Anthropic provider se
   adaptive.session.setThinkingLevel("off");
   await adaptive.session.prompt("two");
   await adaptive.close();
-  const budget = await piSession({ anthropic: TOKEN }, [], [], { modelId: "claude-code/claude-haiku-4-5" });
+  const budget = await piSession({ anthropic: TOKEN }, [], [], { modelId: "claude-haiku-4-5" });
   budget.session.setThinkingLevel("medium");
   await budget.session.prompt("three");
   await budget.close();

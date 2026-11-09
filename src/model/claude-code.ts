@@ -12,6 +12,7 @@ import type {
   SDKUserMessage,
   SpawnedProcess,
   SpawnOptions,
+  ThinkingConfig,
 } from "@anthropic-ai/claude-agent-sdk";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { CallToolRequestSchema, ListToolsRequestSchema, type CallToolResult } from "@modelcontextprotocol/sdk/types.js";
@@ -47,9 +48,9 @@ import { transformMessages } from "@earendil-works/pi-ai/api/transform-messages"
 import { MAX_TOOL_RESULT_CHARS } from "../agent/agent-tools/record.ts";
 import { hashId } from "../util/crypto.ts";
 import { asError, errMessage, swallow } from "../util/errors.ts";
-import { claudeCodeNativeId, isClaudeSubscriptionToken } from "./claude-subscription.ts";
+import { isClaudeSubscriptionToken } from "./claude-subscription.ts";
 import { zeroUsage } from "./model-runtime.ts";
-import { providerBaseUrl } from "./provider-endpoints.ts";
+import { modelSupportsAdaptiveThinking } from "./pi-models.ts";
 
 const SERVER = "qm";
 const TOOL_PREFIX = `mcp__${SERVER}__`;
@@ -100,6 +101,7 @@ function claudeCodeEnv(
     CLAUDE_CODE_OAUTH_TOKEN: token,
     CLAUDE_AGENT_SDK_CLIENT_APP: CLIENT_APP,
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+    CLAUDE_CODE_MAX_RETRIES: "0",
     ENABLE_CLAUDEAI_MCP_SERVERS: "0",
     DISABLE_COMPACT: "1",
     CLAUDE_CODE_SILENT_TURN_REMINDER: "0",
@@ -125,11 +127,20 @@ interface ServedTool {
   input_schema: unknown;
 }
 
+interface WireThinking {
+  type: ThinkingConfig["type"];
+  budget_tokens?: number;
+  display?: "summarized" | "omitted";
+}
+
 interface ClaudeCodeRequest {
   model: string;
   system: string;
   messages: TranscriptMessage[];
   tools: ServedTool[];
+  thinking?: WireThinking;
+  output_config?: { effort?: EffortLevel };
+  speed?: string;
 }
 
 interface Step {
@@ -261,13 +272,17 @@ function isRequest(value: unknown): value is ClaudeCodeRequest {
   );
 }
 
+function lastUserBlocks(messages: readonly TranscriptMessage[]): ContentBlock[] {
+  const last = messages.at(-1);
+  const content = last?.role === "user" ? last.content : [];
+  return typeof content === "string" ? textBlocks(content) : content;
+}
+
 function splitPrompt(messages: readonly TranscriptMessage[]): {
   history: TranscriptMessage[];
   prompt: ContentBlock[];
 } {
-  const last = messages.at(-1);
-  const content = last?.role === "user" ? last.content : [];
-  const blocks = typeof content === "string" ? textBlocks(content) : content;
+  const blocks = lastUserBlocks(messages);
   const results = blocks.filter((block) => block.type === "tool_result");
   const prompt = blocks.filter((block) => block.type !== "tool_result");
   if (!prompt.length) return { history: [...messages], prompt: [{ type: "text", text: RESUMED_AT_TOOL_RESULTS }] };
@@ -349,14 +364,27 @@ function effortFor(model: Model<Api>, reasoning: string): EffortLevel {
 function thinkingFor(
   model: Model<Api>,
   options: SimpleStreamOptions | undefined,
-): Pick<Options, "thinking" | "effort"> {
+): Pick<ClaudeCodeRequest, "thinking" | "output_config"> {
   const reasoning = options?.reasoning;
   if (!reasoning)
     return model.reasoning && model.thinkingLevelMap?.off !== null ? { thinking: { type: "disabled" } } : {};
-  if ((model as Model<"anthropic-messages">).compat?.forceAdaptiveThinking === true)
-    return { thinking: { type: "adaptive", display: THINKING_DISPLAY }, effort: effortFor(model, reasoning) };
+  if (modelSupportsAdaptiveThinking(model))
+    return {
+      thinking: { type: "adaptive", display: THINKING_DISPLAY },
+      output_config: { effort: effortFor(model, reasoning) },
+    };
   const { thinkingBudget } = adjustMaxTokensForThinking(undefined, model.maxTokens, reasoning, options.thinkingBudgets);
-  return { thinking: { type: "enabled", budgetTokens: thinkingBudget, display: THINKING_DISPLAY } };
+  return { thinking: { type: "enabled", budget_tokens: thinkingBudget, display: THINKING_DISPLAY } };
+}
+
+function sdkThinking({ thinking, output_config }: ClaudeCodeRequest): Pick<Options, "thinking" | "effort"> {
+  const effort = output_config?.effort ? { effort: output_config.effort } : {};
+  if (!thinking) return effort;
+  const display = thinking.display ? { display: thinking.display } : {};
+  if (thinking.type === "disabled") return { thinking: { type: "disabled" }, ...effort };
+  if (thinking.type === "adaptive") return { thinking: { type: "adaptive", ...display }, ...effort };
+  const budget = thinking.budget_tokens ? { budgetTokens: thinking.budget_tokens } : {};
+  return { thinking: { type: "enabled", ...budget, ...display }, ...effort };
 }
 
 function started(step: Step): void {
@@ -684,27 +712,14 @@ function closeLive(live: Live, reason: string): Promise<void> {
   return live.closing;
 }
 
-function refusalFor(closed: boolean, token: string | undefined, gateway: boolean): ClaudeCodeFailure | undefined {
+function refusalFor(closed: boolean, token: string | undefined): ClaudeCodeFailure | undefined {
   if (closed) return new ClaudeCodeFailure("This model runtime has been closed", { type: "invalid_request_error" });
   if (!isClaudeSubscriptionToken(token))
     return new ClaudeCodeFailure(
-      "Claude Code models need a Claude subscription OAuth token; this route never uses a metered API key",
+      "Claude Code serves only a Claude subscription OAuth token; this route never uses a metered API key",
       { type: "authentication_error" },
     );
-  if (gateway)
-    return new ClaudeCodeFailure(
-      "This deployment routes models through a model gateway, which Claude Code would bypass",
-      { type: "invalid_request_error" },
-    );
-  const baseUrl = providerBaseUrl("anthropic");
-  return baseUrl
-    ? new ClaudeCodeFailure(
-        `This deployment sends Anthropic traffic through ${baseUrl}, which Claude Code would bypass`,
-        {
-          type: "invalid_request_error",
-        },
-      )
-    : undefined;
+  return undefined;
 }
 
 function continues(live: Live | undefined, messages: readonly Message[]): live is Live {
@@ -719,7 +734,7 @@ function continues(live: Live | undefined, messages: readonly Message[]): live i
   return calls.every((id) => answered.has(id));
 }
 
-export function createClaudeCodeConnection({ gateway = false }: { gateway?: boolean } = {}): ClaudeCodeConnection {
+export function createClaudeCodeConnection(): ClaudeCodeConnection {
   let live: Live | undefined;
   let connectionClosed = false;
 
@@ -732,7 +747,13 @@ export function createClaudeCodeConnection({ gateway = false }: { gateway?: bool
     signal.addEventListener("abort", () => void closeLive(target, "The run was aborted"), { once: true });
   };
 
-  const attach = (target: Live, step: Step, messages: readonly Message[], signal: AbortSignal | undefined) => {
+  const attach = (
+    target: Live,
+    step: Step,
+    request: ClaudeCodeRequest,
+    messages: readonly Message[],
+    signal: AbortSignal | undefined,
+  ) => {
     target.awaiting = [];
     if (target.failure) {
       failStep(step, target.failure, false);
@@ -741,7 +762,7 @@ export function createClaudeCodeConnection({ gateway = false }: { gateway?: bool
     const tail = messages.slice(messages.findLastIndex((message) => message.role === "assistant") + 1);
     target.step = step;
     bindAbort(target, signal);
-    const steer = tail.flatMap((message) => (message.role === "user" ? userBlocks(message.content) : []));
+    const steer = lastUserBlocks(request.messages).filter((block) => block.type !== "tool_result");
     if (steer.length) target.input.push(userMessage(steer));
     for (const message of tail)
       if (message.role === "toolResult") deliver(target, message.toolCallId, mcpResult(message));
@@ -825,7 +846,7 @@ export function createClaudeCodeConnection({ gateway = false }: { gateway?: bool
       extraArgs: { "disable-slash-commands": null },
       ...(request.tools.length ? { mcpServers: { [SERVER]: toolServer(request.tools, target) } } : {}),
       ...(history.length ? { resume: sessionId } : { sessionId }),
-      ...thinkingFor(model, streamOptions),
+      ...sdkThinking(request),
       spawnClaudeCodeProcess: spawnTracked(target),
     };
     if (target.closed || connectionClosed) return closeLive(target, "QM ended the turn");
@@ -851,14 +872,14 @@ export function createClaudeCodeConnection({ gateway = false }: { gateway?: bool
       const stream = createAssistantMessageEventStream();
       const step = newStep(stream, model);
       const token = options?.apiKey;
-      const refusal = refusalFor(connectionClosed, token, gateway);
+      const refusal = refusalFor(connectionClosed, token);
       if (refusal) {
         queueMicrotask(() => failStep(step, refusal, false));
         return stream;
       }
       const messages = transformMessages(context.messages, model, toolCallId);
       const request: ClaudeCodeRequest = {
-        model: claudeCodeNativeId(model.id),
+        model: model.id,
         system: (context.systemPrompt ?? "").toWellFormed(),
         messages: claudeCodeTranscript(messages),
         tools: (context.tools ?? []).map((tool) => ({
@@ -866,13 +887,19 @@ export function createClaudeCodeConnection({ gateway = false }: { gateway?: bool
           description: tool.description,
           input_schema: tool.parameters,
         })),
+        ...thinkingFor(model, options),
       };
       const continuing = continues(live, messages) ? live : undefined;
       void (async () => {
         const shaped = options?.onPayload ? await options.onPayload(request, model) : undefined;
         if (shaped !== undefined && !isRequest(shaped))
           throw new Error("QM's request hook returned a payload the claude-code route cannot send");
-        if (continuing) attach(continuing, step, messages, options?.signal);
+        if ((shaped ?? request).speed === "fast")
+          throw new ClaudeCodeFailure(
+            "Fast mode draws on Claude extra usage, which the Claude subscription route refuses; turn fast mode off for this model",
+            { type: "invalid_request_error", code: "fast_mode_unavailable" },
+          );
+        if (continuing) attach(continuing, step, shaped ?? request, messages, options?.signal);
         else await start(model, shaped ?? request, token!, step, options);
       })().catch((error) => {
         const failure = asError(error);
