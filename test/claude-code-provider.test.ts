@@ -16,6 +16,14 @@ import {
   lookupTool,
 } from "./support/claude-code-session.ts";
 import { sleep } from "../src/util/async.ts";
+import { anthropicMessage } from "./support/gateway-stream.ts";
+
+type ThinkingLevel = Parameters<AgentSession["setThinkingLevel"]>[0];
+
+function wireThinking(thinking: unknown): unknown {
+  const { budgetTokens, ...rest } = (thinking ?? {}) as { budgetTokens?: number };
+  return budgetTokens ? { ...rest, budget_tokens: budgetTokens } : rest;
+}
 
 const TOKEN = "sk-ant-oat01-claude-code-test";
 
@@ -212,16 +220,34 @@ test("a mismatched tool list, an API key source, or an unconfigured hook, plugin
     { tweak: { hookEvent: "SessionStart" }, message: /ran a SessionStart hook .*managed settings/ },
     { tweak: { initPlugins: [{ name: "org-plugin", path: "/tmp/org-plugin" }] }, message: /plugins \[org-plugin\]/ },
     { tweak: { initSkills: ["org-skill"] }, message: /skills \[org-skill\]/ },
+    {
+      tweak: { managedSettings: { env: { ANTHROPIC_BASE_URL: "https://elsewhere.invalid" } } },
+      message: /server-managed settings/,
+    },
   ];
   for (const { tweak, message } of cases) {
-    const fake = await installFakeClaudeCode(() => ({ text: "must not be used" }), tweak);
+    let asked = 0;
+    const fake = await installFakeClaudeCode(() => {
+      asked += 1;
+      return { text: "must not be used" };
+    }, tweak);
     const run = await piSession({ anthropic: TOKEN }, [lookupTool([])]);
     await run.session.prompt("go").finally(() => run.close().finally(fake.restore));
     const failed = lastAssistant(run.session);
     assert.match(failed.errorMessage ?? "", message);
     assert.equal(providerTurnError(failed).retryable, false);
     assert.equal(fake.calls.length, 1);
+    assert.equal(asked, 0, "the prompt never reached the model");
   }
+});
+
+test("an empty server-managed settings object does not block the turn", async (t) => {
+  const fake = await installFakeClaudeCode(() => ({ text: "ok" }), { managedSettings: {} });
+  t.after(fake.restore);
+  const run = await piSession({ anthropic: TOKEN }, []);
+  await run.session.prompt("hi");
+  await run.close();
+  assert.equal(lastAssistant(run.session).stopReason, "stop", lastAssistant(run.session).errorMessage);
 });
 
 test("a tool Claude Code cannot load fails the turn before Claude Code starts", async (t) => {
@@ -460,6 +486,12 @@ test("provider failures keep Claude Code's wording and map to QM's error codes w
     ],
     [{ error: { kind: "rate_limit", status: 429, text: "API Error: 429 rate limited" } }, "rate_limit", true, 429],
     [{ error: { kind: "overloaded", text: "API Error: overloaded" } }, "transient", true, undefined],
+    [
+      { error: { kind: "unknown", status: 400, text: "API Error: 400 Invalid signature in thinking block" } },
+      "bad_request",
+      false,
+      400,
+    ],
     [{ refusal: true, text: "I can't help with that." }, "refusal", false, undefined],
   ];
   for (const [reply, code, retryable, status] of cases) {
@@ -511,7 +543,7 @@ test("a steer queued during a tool call reaches Claude Code with that tool's res
   assert.equal(fake.calls.length, 1, "the steer joined the live query instead of starting another");
 });
 
-test("QM's request hook sees every model call and shapes what a fresh Claude Code query receives", async (t) => {
+test("QM's request hook sees every model call; its system and tools shape a fresh query and its added content reaches a continued step", async (t) => {
   const prompts: Block[][] = [];
   const fake = await installFakeClaudeCode((request) => {
     prompts.push(lastUser(request));
@@ -543,27 +575,52 @@ test("QM's request hook sees every model call and shapes what a fresh Claude Cod
   );
   assert.equal(seen[0]!.model, "claude-sonnet-5");
   assert.deepEqual(texts(prompts[0]!), ["summarize the attachment", "[document text: quarterly.pdf]"]);
+  assert.deepEqual(
+    texts(prompts[1]!),
+    ["record z", "[document text: quarterly.pdf]"],
+    "a continued step carries what the hook added",
+  );
   assert.equal(fake.calls[0]!.options.systemPrompt, `${session.systemPrompt}\nHook note.`);
   assert.equal(fake.calls.length, 1);
 });
 
-test("QM's thinking level reaches Claude Code the way Pi's Anthropic provider sends it", async (t) => {
+test("QM's thinking level reaches the wire through Claude Code as Pi's Anthropic provider sends it", async (t) => {
   const fake = await installFakeClaudeCode(() => ({ text: "ok" }));
   t.after(fake.restore);
-  const adaptive = await piSession({ anthropic: TOKEN }, []);
-  adaptive.session.setThinkingLevel("high");
-  await adaptive.session.prompt("one");
-  adaptive.session.setThinkingLevel("off");
-  await adaptive.session.prompt("two");
-  await adaptive.close();
-  const budget = await piSession({ anthropic: TOKEN }, [], [], { modelId: "claude-haiku-4-5" });
-  budget.session.setThinkingLevel("medium");
-  await budget.session.prompt("three");
-  await budget.close();
-  const sent = fake.calls.map(({ options }) => ({ thinking: options.thinking, effort: options.effort }));
-  assert.deepEqual(sent, [
-    { thinking: { type: "adaptive", display: "summarized" }, effort: "high" },
-    { thinking: { type: "disabled" }, effort: undefined },
-    { thinking: { type: "enabled", budgetTokens: 8192, display: "summarized" }, effort: undefined },
-  ]);
+  const direct: Array<{ body: Record<string, unknown>; beta: string }> = [];
+  t.mock.method(globalThis, "fetch", async (input: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+    direct.push({ body, beta: new Headers(init?.headers).get("anthropic-beta") ?? "" });
+    return new Response(anthropicMessage(String(body.model), [{ type: "text", text: "ok" }], "end_turn"), {
+      headers: { "content-type": "text/event-stream" },
+    });
+  });
+  const send = async (keys: Parameters<typeof piSession>[0], modelId: string, level: ThinkingLevel) => {
+    const run = await piSession(keys, [], [], { modelId });
+    run.session.setThinkingLevel(level);
+    await run.session.prompt("hi");
+    await run.close();
+  };
+  const cases: Array<[string, ThinkingLevel]> = [
+    ["claude-opus-5-5", "high"],
+    ["claude-opus-5-5", "off"],
+    ["claude-sonnet-5", "low"],
+    ["claude-sonnet-5", "off"],
+    ["claude-haiku-4-5", "medium"],
+  ];
+  for (const [modelId, level] of cases) {
+    await send({ anthropic: "sk-ant-api03-metered" }, modelId, level);
+    await send({ anthropic: TOKEN }, modelId, level);
+    const pi = direct.at(-1)!;
+    const { options } = fake.calls.at(-1)!;
+    const env = options.env as Record<string, string>;
+    const thinking = env.CLAUDE_CODE_EXTRA_BODY
+      ? (JSON.parse(env.CLAUDE_CODE_EXTRA_BODY) as { thinking: unknown }).thinking
+      : wireThinking(options.thinking);
+    const label = `${modelId} at ${level}`;
+    assert.deepEqual(thinking, pi.body.thinking ?? { type: "disabled" }, label);
+    const piEffort = (pi.body.output_config as { effort?: string } | undefined)?.effort;
+    assert.equal(options.effort, piEffort ?? "high", label);
+    assert.equal(env.ANTHROPIC_BETAS ?? "", pi.beta.includes("thinking-binding") ? pi.beta : "", label);
+  }
 });

@@ -7,15 +7,14 @@ import { test } from "node:test";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { isClaudeSubscriptionToken } from "../src/model/claude-subscription.ts";
 import { buildApp } from "./support/build-app.ts";
-import { CLAUDE_CODE_TEST_MODEL } from "./support/claude-code-session.ts";
 import { testConfig } from "./support/test-config.ts";
 
 const TOKEN_FILE = process.env.CLAUDE_CODE_LIVE_TOKEN_FILE;
 const ANTHROPIC_HOSTS = ["anthropic.com", "claude.ai", "claude.com"];
 const LIMIT_LOG = "[claude-code] subscription limit ";
 const RETRY_LOG = "[claude-code] api_retry ";
-const MODEL_CALL_BUDGET = 8;
-const MODEL_ID = process.env.CLAUDE_CODE_LIVE_MODEL ?? CLAUDE_CODE_TEST_MODEL;
+const MODEL_CALL_BUDGET = 12;
+const MODEL_ID = process.env.CLAUDE_CODE_LIVE_MODEL ?? "claude-opus-5-5";
 
 async function accountEvidence(token: string): Promise<Record<string, unknown>> {
   const home = mkdtempSync(join(tmpdir(), "qm-claude-code-account-"));
@@ -71,7 +70,7 @@ test(
     });
 
     t.diagnostic(`account: ${JSON.stringify(await accountEvidence(token))}`);
-    const built = buildApp(testConfig({ anthropicApiKey: token, modelId: MODEL_ID, memoryCapture: "off" }), {
+    const built = buildApp(testConfig({ anthropicApiKey: token, modelId: MODEL_ID }), {
       agent: undefined,
     });
     const ask = (text: string) =>

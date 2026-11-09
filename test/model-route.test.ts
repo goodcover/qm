@@ -272,14 +272,13 @@ test("a fallback that fails keeps the original refusal and says what happened to
   );
 });
 
-for (const [account, anthropic, fallbackModel, expectedHosts] of [
-  ["subscription", "sk-ant-oat01-subscription", "gpt-6-astra", []],
-  ["subscription", "sk-ant-oat01-subscription", "codex/gpt-6-astra", ["chatgpt.com"]],
-  ["subscription", "sk-ant-oat01-subscription", "claude-sonnet-5", []],
-  ["metered", "sk-ant-api03-metered", "gpt-6-astra", ["api.anthropic.com", "api.openai.com"]],
+for (const [account, anthropic, fallbackModel, verb, expectedHosts, claudeCodeCalls] of [
+  ["subscription", "sk-ant-oat01-subscription", "gpt-6-astra", "never falls back", [], 1],
+  ["subscription", "sk-ant-oat01-subscription", "codex/gpt-6-astra", "falls back", ["chatgpt.com"], 1],
+  ["subscription", "sk-ant-oat01-subscription", "claude-sonnet-5", "never falls back", [], 1],
+  ["metered", "sk-ant-api03-metered", "gpt-6-astra", "falls back", ["api.anthropic.com", "api.openai.com"], 0],
 ] as const) {
-  const fallsBack = expectedHosts.some((host) => host !== "api.anthropic.com");
-  test(`a ${account} Claude turn ${fallsBack ? "falls back" : "never falls back"} to ${fallbackModel}`, async (t) => {
+  test(`a ${account} Claude turn ${verb} to ${fallbackModel}`, async (t) => {
     const claudeCode = await installFakeClaudeCode(() => ({
       error: { kind: "authentication_failed", text: "login revoked", status: 401 },
     }));
@@ -301,11 +300,7 @@ for (const [account, anthropic, fallbackModel, expectedHosts] of [
         assert.ok(error instanceof ProviderTurnError);
         assert.equal(error.code, "auth");
         assert.deepEqual([...new Set(calls.map((call) => call.host))], expectedHosts);
-        assert.equal(
-          claudeCode.calls.length,
-          account === "subscription" ? 1 : 0,
-          "only the subscription uses Claude Code",
-        );
+        assert.equal(claudeCode.calls.length, claudeCodeCalls, "only the subscription uses Claude Code");
       },
     );
   });
@@ -317,12 +312,25 @@ test("a Claude subscription turn honors adaptive and provider-default effort and
   const agent = createAgent({ resolveProviderKeys: async () => ({ anthropic: "sk-ant-oat01-subscription" }) });
   await turn(agent, "claude-opus-5-5", { effortLevel: "adaptive" });
   await turn(agent, "claude-opus-5-5", { effortLevel: "default" });
+  const pisAdaptive = {
+    type: "adaptive",
+    display: "summarized",
+    block_binding: { prefix_mismatch_behavior: "drop_block" },
+  };
   assert.deepEqual(
-    claudeCode.calls.map((call) => [call.options.thinking, call.options.effort]),
+    claudeCode.calls.map((call) => [
+      (
+        JSON.parse((call.options.env as Record<string, string>).CLAUDE_CODE_EXTRA_BODY ?? "{}") as {
+          thinking?: unknown;
+        }
+      ).thinking,
+      call.options.effort,
+    ]),
     [
-      [{ type: "adaptive", display: "summarized" }, undefined],
-      [undefined, undefined],
+      [pisAdaptive, "high"],
+      [pisAdaptive, "high"],
     ],
+    "the wire carries the thinking Pi's Anthropic provider sends for these levels, and the API's default effort",
   );
   const fast = await turn(agent, "claude-opus-5-5", { fastMode: true }).then(
     () => assert.fail("fast mode is refused"),

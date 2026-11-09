@@ -157,29 +157,6 @@ test("a personal Claude subscription turn runs end to end on Pi with OAuth beare
   }
 });
 
-test("a company Claude subscription token in ANTHROPIC_API_KEY serves company Claude turns through Claude Code", async (t) => {
-  const seen = fakeAnthropic(t);
-  const fake = await claudeCodeServing(t);
-  const companyToken = "sk-ant-oat01-company-e2e";
-  const built = buildApp(testConfig({ anthropicApiKey: companyToken, modelId: "claude-sonnet-5" }), {
-    agent: undefined,
-  });
-  const submitted = await built.app.turn({
-    surface: "slack",
-    actor: { externalId: "U1" },
-    conversation: { kind: "dm", threadRef: "claude-company-subscription-e2e" },
-    text: "ping",
-    origin: { kind: "human" },
-    async: true,
-  });
-  built.runtime.start();
-  try {
-    await assertClaudeCodeTurn(built, fake, seen, submitted.runId!, companyToken, "claude-sonnet-5");
-  } finally {
-    await built.runtime.stop();
-  }
-});
-
 test("a company Claude subscription credential serves company Claude turns through Claude Code beside a metered key and fails closed without it", async (t) => {
   const seen = fakeAnthropic(t);
   const fake = await claudeCodeServing(t);

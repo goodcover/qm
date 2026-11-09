@@ -98,6 +98,8 @@ test("catalog lists custom models; clearing the registry removes them", () => {
 
 test("spec validation rejects reserved ids, bad slugs, bad URLs, and empty model lists", () => {
   assert.throws(() => validateCustomProviderSpec({ ...GATEWAY, id: "openai" }), /reserved/);
+  assert.throws(() => validateCustomProviderSpec({ ...GATEWAY, id: "claude-code" }), /reserved/);
+  assert.throws(() => validateCustomProviderSpec({ ...GATEWAY, id: "openai-codex" }), /reserved/);
   assert.throws(() => validateCustomProviderSpec({ ...GATEWAY, id: "Not A Slug" }), /slug/);
   assert.throws(() => validateCustomProviderSpec({ ...GATEWAY, baseUrl: "ftp://x" }), /http/);
   assert.throws(() => validateCustomProviderSpec({ ...GATEWAY, baseUrl: "https://x?y=1" }), /query/);

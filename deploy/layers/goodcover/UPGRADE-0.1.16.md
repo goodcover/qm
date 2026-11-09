@@ -1,15 +1,15 @@
-# Goodcover v0.1.16 source candidate
+# Goodcover v0.1.16 source sync
 
 The source target is upstream `v0.1.16`, commit
-`16ae628535be19486ce2ed95d65c998c2a85a1f0`. The candidate is not deployed, and this
-source sync does not authorize a rollout. Each rollout step below needs its own
-approval. Land the sync with a merge commit or an ancestry-preserving fast-forward.
-Never squash or rebase it.
+`16ae628535be19486ce2ed95d65c998c2a85a1f0`. Production has run it since 2026-11-07, as
+`0.1.16-gc.1` and then `0.1.16-gc.2`. The authoritative pins and the rollout record live
+in ops `gc4/packages/qm/images.json` and its README. Each rollout step needs its own
+approval. Land source syncs with a merge commit or an ancestry-preserving fast-forward.
+Never squash or rebase them.
 
-Production stays on `0.1.15-gc.1`, which is source `f43507f4` and MicroVM 4.0. The
-authoritative pins live in ops `gc4/packages/qm/images.json`. This change does not
-touch them. Delete this guide once production runs 0.1.16 and its pre-hop-1 backup
-is no longer needed for recovery.
+Going back to `0.1.15-gc.1` (source `f43507f4`, MicroVM 4.0) needs the matching
+pre-hop-1 database backup, as the ops README's recovery section describes. Delete this
+guide once that backup is no longer needed for recovery.
 
 ## What changes for GC4
 
@@ -19,10 +19,21 @@ is no longer needed for recovery.
 - **Claude through Claude Code.** `CLAUDE_AUTH_CREDENTIAL` is the company Anthropic
   credential. Upstream sends it from Pi straight to the Messages API, which Anthropic
   bills as a third-party app and refuses while Extra Usage is off. Goodcover serves
-  every company Claude route through the Claude Code binary bundled with
-  `@anthropic-ai/claude-agent-sdk` instead, as 0.1.15's harness did. Pi still runs the
-  turn and QM's tools. The existing setup token has no refresh, so replace it when it
-  expires. Personal Claude accounts and metered keys keep Pi's direct path.
+  company Claude routes on a subscription token through the Claude Code binary bundled
+  with `@anthropic-ai/claude-agent-sdk` instead, as 0.1.15's harness did. Pi still runs
+  the turn and QM's tools. The existing setup token has no refresh, so replace it when
+  it expires.
+  - Pi's direct path is kept for metered keys, for an `ANTHROPIC_BASE_URL` override, for
+    models a model gateway carries, and for personal Claude accounts. Personal accounts
+    probably meet the same refusal there; whether to move them is an open owner decision.
+  - Fast mode is refused on this route, because on a subscription it draws on extra
+    usage.
+  - QM refuses a query when the Claude account applies server-managed settings, or when
+    Claude Code runs a hook or loads a plugin or skill QM did not configure. An
+    `apiKeyHelper` or `SessionStart` hook from managed settings can still run once before
+    the refusal, so the login should have no server-managed settings.
+  - Each query is a Claude Code child process of about 110–250 MB, bounded only by
+    `WORKERS`, and the core image is about 310 MB larger.
 - **Admin UI.** The admin dashboard is folded into web-ui at `/settings`, and the
   separate admin plugin is gone.
 - **Credentials in shared conversations.** Upstream removed the owner credential

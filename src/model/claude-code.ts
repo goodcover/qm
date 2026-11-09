@@ -49,7 +49,7 @@ import { MAX_TOOL_RESULT_CHARS } from "../agent/agent-tools/record.ts";
 import { hashId } from "../util/crypto.ts";
 import { asError, errMessage, swallow } from "../util/errors.ts";
 import { isClaudeSubscriptionToken } from "./claude-subscription.ts";
-import { zeroUsage } from "./model-runtime.ts";
+import { applyThinkingBinding, withRequestHeaders, zeroUsage } from "./model-runtime.ts";
 import { modelSupportsAdaptiveThinking } from "./pi-models.ts";
 
 const SERVER = "qm";
@@ -63,10 +63,12 @@ const RESUMED_AT_TOOL_RESULTS = "[system] The run resumed after the tool results
 const QM_RESULT_CAP_AS_TOKENS = String(MAX_TOOL_RESULT_CHARS);
 const NEVER_RESUME_INTERRUPTED_TURN_AGE_MS = "1";
 const THINKING_DISPLAY = "summarized";
+const API_DEFAULT_THINKING: WireThinking = { type: "disabled" };
+const API_DEFAULT_EFFORT: EffortLevel = "high";
 const ANNOUNCED = new Set(["environment", "model", "date"]);
 const announcements = new Map<string, ImportAttachment["attachment"][]>();
 
-const ERROR_TYPES: Record<SDKAssistantMessageError, string> = {
+const ERROR_TYPES: Partial<Record<SDKAssistantMessageError, string>> = {
   authentication_failed: "authentication_error",
   cloud_credential_error: "authentication_error",
   oauth_org_not_allowed: "permission_error",
@@ -79,7 +81,6 @@ const ERROR_TYPES: Record<SDKAssistantMessageError, string> = {
   overloaded: "overloaded_error",
   model_not_found: "not_found_error",
   server_error: "api_error",
-  unknown: "api_error",
 };
 
 function cacheEnv(retention: CacheRetention | undefined): Record<string, string> {
@@ -121,6 +122,10 @@ class ClaudeCodeFailure extends Error {
   }
 }
 
+interface SettingsReport {
+  sources?: Array<{ source?: string; settings?: Record<string, unknown> }>;
+}
+
 interface ServedTool {
   name: string;
   description: string;
@@ -131,6 +136,7 @@ interface WireThinking {
   type: ThinkingConfig["type"];
   budget_tokens?: number;
   display?: "summarized" | "omitted";
+  block_binding?: unknown;
 }
 
 interface ClaudeCodeRequest {
@@ -377,14 +383,32 @@ function thinkingFor(
   return { thinking: { type: "enabled", budget_tokens: thinkingBudget, display: THINKING_DISPLAY } };
 }
 
-function sdkThinking({ thinking, output_config }: ClaudeCodeRequest): Pick<Options, "thinking" | "effort"> {
-  const effort = output_config?.effort ? { effort: output_config.effort } : {};
-  if (!thinking) return effort;
+function sdkThinking(thinking: WireThinking): ThinkingConfig {
   const display = thinking.display ? { display: thinking.display } : {};
-  if (thinking.type === "disabled") return { thinking: { type: "disabled" }, ...effort };
-  if (thinking.type === "adaptive") return { thinking: { type: "adaptive", ...display }, ...effort };
-  const budget = thinking.budget_tokens ? { budgetTokens: thinking.budget_tokens } : {};
-  return { thinking: { type: "enabled", ...budget, ...display }, ...effort };
+  if (thinking.type === "disabled") return { type: "disabled" };
+  if (thinking.type === "adaptive") return { type: "adaptive", ...display };
+  return { type: "enabled", ...(thinking.budget_tokens ? { budgetTokens: thinking.budget_tokens } : {}), ...display };
+}
+
+function thinkingOptions(
+  model: Model<Api>,
+  request: ClaudeCodeRequest,
+): { options: Pick<Options, "thinking" | "effort">; env: Record<string, string> } {
+  const headers = withRequestHeaders(model, true, false);
+  const bound = (applyThinkingBinding({ thinking: request.thinking }, headers) as Pick<ClaudeCodeRequest, "thinking">)
+    .thinking;
+  const options = {
+    thinking: sdkThinking(bound ?? API_DEFAULT_THINKING),
+    effort: request.output_config?.effort ?? API_DEFAULT_EFFORT,
+  };
+  const betas = headers.headers?.["anthropic-beta"];
+  return {
+    options,
+    env: {
+      ...(betas ? { ANTHROPIC_BETAS: betas } : {}),
+      ...(bound?.block_binding ? { CLAUDE_CODE_EXTRA_BODY: JSON.stringify({ thinking: bound }) } : {}),
+    },
+  };
 }
 
 function started(step: Step): void {
@@ -549,7 +573,7 @@ function apiFailure(live: Live, text: string, status: number | null | undefined)
   const evidence = [...new Set([text, live.apiError?.text, live.authError].filter(Boolean))].join(" — ");
   return new ClaudeCodeFailure(evidence || `Claude Code failed${kind ? ` (${kind})` : ""}`, {
     ...(typeof status === "number" ? { status } : {}),
-    ...(kind ? { type: ERROR_TYPES[kind], code: kind } : {}),
+    ...(kind ? { code: kind, ...(ERROR_TYPES[kind] ? { type: ERROR_TYPES[kind] } : {}) } : {}),
   });
 }
 
@@ -567,6 +591,13 @@ function fail(live: Live, error: Error): void {
   live.step = undefined;
   if (step) failStep(step, live.failure, false);
   else swallow("claude-code: failure held for the next step", error);
+}
+
+async function appliesServerManagedSettings(query: Query): Promise<boolean> {
+  const report = await (query as unknown as { getSettings(): Promise<SettingsReport | undefined> }).getSettings();
+  return (report?.sources ?? []).some(
+    (source) => source.source === "policySettings" && Object.keys(source.settings ?? {}).length > 0,
+  );
 }
 
 function unconfigured(what: string): ClaudeCodeFailure {
@@ -654,6 +685,7 @@ function onMessage(live: Live, message: SDKMessage): void {
   if (message.type === "result") {
     live.finished = true;
     live.input.end();
+    live.child?.kill("SIGKILL");
     if (message.subtype === "success" && !message.is_error) {
       endStep(live, live.step?.output.stopReason === "length" ? "length" : "stop");
       return;
@@ -846,10 +878,11 @@ export function createClaudeCodeConnection(): ClaudeCodeConnection {
       session.save();
     }
     const longest = Math.max(0, ...request.tools.map((tool) => tool.description.length));
+    const thinking = thinkingOptions(model, request);
     const options: Options = {
       abortController: target.abort,
       cwd: work,
-      env: claudeCodeEnv(token, dir, longest, streamOptions?.cacheRetention),
+      env: { ...claudeCodeEnv(token, dir, longest, streamOptions?.cacheRetention), ...thinking.env },
       systemPrompt: request.system,
       model: request.model,
       tools: [],
@@ -865,13 +898,16 @@ export function createClaudeCodeConnection(): ClaudeCodeConnection {
       extraArgs: { "disable-slash-commands": null },
       ...(request.tools.length ? { mcpServers: { [SERVER]: toolServer(request.tools, target) } } : {}),
       ...(history.length ? { resume: sessionId } : { sessionId }),
-      ...sdkThinking(request),
+      ...thinking.options,
       spawnClaudeCodeProcess: spawnTracked(target),
     };
     if (target.closed || connectionClosed) return closeLive(target, "QM ended the turn");
     target.query = sdk.query({ prompt: target.input, options });
-    target.input.push(userMessage(prompt));
     try {
+      if (await appliesServerManagedSettings(target.query))
+        throw unconfigured("applies server-managed settings from the Claude account");
+      if (target.closed) return;
+      target.input.push(userMessage(prompt));
       for await (const message of target.query) {
         if (target.closed) break;
         onMessage(target, message);
@@ -879,7 +915,7 @@ export function createClaudeCodeConnection(): ClaudeCodeConnection {
       }
       if (!target.closed && !target.finished) throw apiFailure(target, "Claude Code ended without a result", undefined);
     } catch (error) {
-      if (target.closed) swallow("claude-code: error after the query was closed", error);
+      if (target.closed || target.finished) swallow("claude-code: error after the query ended", error);
       else fail(target, error instanceof ClaudeCodeFailure ? error : apiFailure(target, errMessage(error), undefined));
     } finally {
       if (target.failure || target.finished) await closeLive(target, "The Claude Code query ended");

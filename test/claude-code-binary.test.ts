@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingHttpHeaders } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -9,6 +9,7 @@ import { mock, test, type TestContext } from "node:test";
 import type { Options } from "@anthropic-ai/claude-agent-sdk";
 import type { Message } from "@earendil-works/pi-ai";
 import { sleep } from "../src/util/async.ts";
+import { resolveModel } from "../src/model/pi-models.ts";
 import {
   CLAUDE_CODE_TEST_SYSTEM,
   claudeCodeSession,
@@ -30,6 +31,8 @@ interface Captured {
     system?: Array<{ text: string }>;
     messages?: WireMessage[];
     tools?: Array<{ name: string; description: string }>;
+    thinking?: { type?: string; block_binding?: unknown };
+    max_tokens?: number;
   };
 }
 
@@ -101,7 +104,9 @@ async function mockMessagesApi(
     headers = {},
     alwaysCallTool = false,
     other,
+    status,
   }: {
+    status?: number;
     hang?: boolean;
     headers?: Record<string, string>;
     alwaysCallTool?: boolean;
@@ -125,6 +130,11 @@ async function mockMessagesApi(
         return;
       }
       if (hang) return;
+      if (status) {
+        res.writeHead(status, { "content-type": "application/json" });
+        res.end(JSON.stringify({ type: "error", error: { type: "api_error", message: "mock server error" } }));
+        return;
+      }
       const model = String(call.body.model);
       res.writeHead(200, { "content-type": "text/event-stream", ...headers });
       if (!isTurn(call))
@@ -150,7 +160,7 @@ async function mockMessagesApi(
   return { captured, url: `http://127.0.0.1:${(server.address() as AddressInfo).port}` };
 }
 
-async function pointClaudeCodeAt(t: TestContext, url: string) {
+async function pointClaudeCodeAt(t: TestContext, url: string, settings: Options["settings"] = {}) {
   const real = await import("@anthropic-ai/claude-agent-sdk");
   const spawned: Options[] = [];
   const mocked = mock.module("@anthropic-ai/claude-agent-sdk", {
@@ -158,7 +168,14 @@ async function pointClaudeCodeAt(t: TestContext, url: string) {
       ...real,
       query: ({ prompt, options }: { prompt: AsyncIterable<never>; options: Options }) => {
         spawned.push(options);
-        return real.query({ prompt, options: { ...options, env: { ...options.env, ANTHROPIC_BASE_URL: url } } });
+        return real.query({
+          prompt,
+          options: {
+            ...options,
+            settings: { ...(options.settings as object), ...(settings as object) },
+            env: { ...options.env, ANTHROPIC_BASE_URL: url },
+          },
+        });
       },
     },
   });
@@ -191,6 +208,9 @@ test("the bundled Claude Code binary serves QM tool turns with only QM's tools a
     assert.ok(String(call.headers["user-agent"]).includes("sdk-ts"));
     assert.ok(String(call.headers["user-agent"]).includes("client-app/qm/claude-code-provider"));
     assert.equal(call.body.model, PRODUCTION_MODEL);
+    assert.equal(call.body.max_tokens, resolveModel(PRODUCTION_MODEL)!.maxTokens, "Pi's output ceiling");
+    assert.deepEqual(call.body.thinking?.block_binding, { prefix_mismatch_behavior: "drop_block" });
+    assert.ok(String(call.headers["anthropic-beta"]).includes("thinking-binding-controls-2026-08-01"));
     const visible = call.body.tools?.filter((tool) => !(tool as { defer_loading?: boolean }).defer_loading);
     const offered = new Map(visible?.map((tool) => [tool.name, tool.description]));
     assert.deepEqual(
@@ -227,6 +247,77 @@ test("the bundled Claude Code binary serves QM tool turns with only QM's tools a
     ],
   );
   assert.ok(cleanedUp(spawned));
+});
+
+test("the real binary makes one request per query on a server error, leaving retries to QM", async (t) => {
+  const api = await mockMessagesApi(t, { status: 500 });
+  const spawned = await pointClaudeCodeAt(t, api.url);
+  const run = await claudeCodeSession({ anthropic: TOKEN }, [lookupTool([])], [], { modelId: PRODUCTION_MODEL });
+  run.session.settingsManager.setRetryEnabled(false);
+  await run.session.prompt("hi").catch(() => undefined);
+  await run.close();
+  assert.equal(lastAssistant(run.session).stopReason, "error");
+  assert.equal(spawned.length, 1);
+  assert.equal(api.captured.filter(isTurn).length, 1, "Claude Code did not retry the request itself");
+  assert.ok(cleanedUp(spawned), "the Claude Code process exited and its directory is gone");
+});
+
+test("a hook QM did not configure stops the real binary before any model request", async (t) => {
+  const api = await mockMessagesApi(t);
+  const marker = join(mkdtempSync(join(tmpdir(), "claude-code-hook-test-")), "ran");
+  const spawned = await pointClaudeCodeAt(t, api.url, {
+    hooks: { SessionStart: [{ hooks: [{ type: "command", command: `touch ${marker}` }] }] },
+  });
+  const run = await claudeCodeSession({ anthropic: TOKEN }, [lookupTool([])], [], { modelId: PRODUCTION_MODEL });
+  await run.session.prompt("hi").catch(() => undefined);
+  await run.close();
+  assert.match(lastAssistant(run.session).errorMessage ?? "", /SessionStart hook .*QM refuses/);
+  assert.equal(api.captured.filter(isTurn).length, 0, "no model request was made");
+  assert.ok(cleanedUp(spawned), "the Claude Code process exited and its directory is gone");
+});
+
+test("the real binary reports its settings sources before any prompt, as QM's managed-settings check reads them", async (t) => {
+  const api = await mockMessagesApi(t);
+  const home = realpathSync(mkdtempSync(join(tmpdir(), "claude-code-settings-test-")));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => (release = resolve));
+  const { query } = await import("@anthropic-ai/claude-agent-sdk");
+  const session = query({
+    prompt: (async function* () {
+      await held;
+      yield* [];
+    })(),
+    options: {
+      cwd: home,
+      env: {
+        PATH: "/usr/bin:/bin",
+        HOME: home,
+        CLAUDE_CONFIG_DIR: home,
+        CLAUDE_CODE_OAUTH_TOKEN: TOKEN,
+        ANTHROPIC_BASE_URL: api.url,
+      },
+      settingSources: [],
+      settings: { autoMemoryEnabled: false },
+      tools: [],
+      strictMcpConfig: true,
+    },
+  });
+  try {
+    const report = (await (session as unknown as { getSettings(): Promise<unknown> }).getSettings()) as {
+      sources?: Array<{ source?: string; settings?: Record<string, unknown> }>;
+    };
+    assert.ok(
+      report.sources?.some(
+        (source) => source.source === "flagSettings" && source.settings?.autoMemoryEnabled === false,
+      ),
+      JSON.stringify(report),
+    );
+    assert.equal(api.captured.filter(isTurn).length, 0);
+  } finally {
+    release();
+    await session.return(undefined);
+  }
 });
 
 test("aborting a turn kills the real Claude Code process mid-request", async (t) => {
