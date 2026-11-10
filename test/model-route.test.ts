@@ -358,6 +358,31 @@ test("a Claude subscription turn honors adaptive and provider-default effort and
   assert.equal(claudeCode.calls.length, 3, "no Claude Code query starts in fast mode");
 });
 
+test("a company Claude subscription serves Claude Fable 5.2 through Claude Code and refuses its fast mode", async (t) => {
+  const claudeCode = await installFakeClaudeCode(() => ({ text: "done" }));
+  t.after(claudeCode.restore);
+  const agent = createAgent({
+    routes: createModelRoutes({ resolveProviderKeys: async () => ({ anthropic: "sk-ant-oat01-subscription" }) }),
+  });
+  await withFetch(
+    () => errorReply(401, "authentication_error", "the subscription token reached a provider API"),
+    async (calls) => {
+      await turn(agent, "claude-fable-5-2", { effortLevel: "adaptive" });
+      const fast = await turn(agent, "claude-fable-5-2", { fastMode: true }).then(
+        () => assert.fail("fast mode is refused"),
+        (e: unknown) => e,
+      );
+      assert.ok(fast instanceof ProviderTurnError);
+      assert.match(fast.message, /extra usage/);
+      assert.deepEqual(calls, [], "no request leaves QM except through Claude Code");
+    },
+  );
+  assert.deepEqual(
+    claudeCode.calls.map((call) => [call.options.model, call.options.thinking?.type, call.options.effort]),
+    [["claude-fable-5-2", "adaptive", "high"]],
+  );
+});
+
 test("a company ChatGPT summary that fails never reaches a metered fallback", async () => {
   const agent = createAgent({
     routes: createModelRoutes({
