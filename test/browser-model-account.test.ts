@@ -193,7 +193,7 @@ test("a company ChatGPT subscription serves company browsing without an API-key 
     { ...structuredRequest, model: "gpt-5.6-sol" },
   );
   assert.equal(response.status, 502);
-  assert.match(await response.text(), /billed to the organization's own provider key/);
+  assert.match(await response.text(), /billed to the organization's subscription/);
   assert.equal(calls[0]?.host, "chatgpt.com");
   assert.equal(calls[0]?.headers.get("authorization"), `Bearer ${chatgptToken}`);
 });
