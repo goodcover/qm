@@ -44,7 +44,7 @@ test("a QM turn on claude-code serves QM's real prompt and tools, records usage,
     );
 
     const call = fake.calls.find((c) => c.options.mcpServers)!;
-    assert.ok(requests[0]!.tools.includes("mcp__qm__history") && requests[0]!.tools.includes("mcp__qm__execute"));
+    assert.ok(requests[0]!.tools.includes("mcp__qm__history") && requests[0]!.tools.includes("mcp__qm__subagents"));
     assert.ok(
       requests[0]!.tools.every((name) => name.startsWith("mcp__qm__")),
       "only QM's tool catalog",
