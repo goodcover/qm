@@ -1,6 +1,6 @@
 import { Type } from "typebox";
 import type { Context, ImageContent, TextContent } from "@earendil-works/pi-ai";
-import { buildModelRuntime, zeroUsage } from "./model-runtime.ts";
+import { withModelRuntime, zeroUsage } from "./model-runtime.ts";
 import { routeLabel, type ModelRoute } from "./model-route.ts";
 
 function object(value: unknown): Record<string, unknown> | undefined {
@@ -77,24 +77,25 @@ export async function completeBrowserRequest(route: ModelRoute, body: Record<str
   const limit = body.max_completion_tokens ?? body.max_tokens ?? 4096;
   if (typeof limit !== "number" || !Number.isSafeInteger(limit) || limit <= 0)
     throw new BrowserCompletionError("Invalid browser output token limit");
-  const runtime = await buildModelRuntime(route.keys, route.gateway, "browser");
   const modelApi = model.api;
-  const result = await runtime.completeSimple(model, context, {
-    signal,
-    maxTokens: Math.min(limit, model.maxTokens),
-    maxRetries: 0,
-    onPayload: schema
-      ? (raw) => {
-          const payload = object(raw);
-          if (!payload) throw new BrowserCompletionError("Invalid model request");
-          let toolChoice: object = { type: "function", name: "browser_result" };
-          if (modelApi === "anthropic-messages") toolChoice = { type: "tool", name: "browser_result" };
-          if (modelApi === "openai-completions")
-            toolChoice = { type: "function", function: { name: "browser_result" } };
-          return { ...payload, tool_choice: toolChoice };
-        }
-      : undefined,
-  });
+  const result = await withModelRuntime(route.keys, route.gateway, "browser", (runtime) =>
+    runtime.completeSimple(model, context, {
+      signal,
+      maxTokens: Math.min(limit, model.maxTokens),
+      maxRetries: 0,
+      onPayload: schema
+        ? (raw) => {
+            const payload = object(raw);
+            if (!payload) throw new BrowserCompletionError("Invalid model request");
+            let toolChoice: object = { type: "function", name: "browser_result" };
+            if (modelApi === "anthropic-messages") toolChoice = { type: "tool", name: "browser_result" };
+            if (modelApi === "openai-completions")
+              toolChoice = { type: "function", function: { name: "browser_result" } };
+            return { ...payload, tool_choice: toolChoice };
+          }
+        : undefined,
+    }),
+  );
   if (result.stopReason === "error" || result.stopReason === "aborted" || result.stopReason === "length")
     throw new BrowserCompletionError(
       `${routeLabel(route)} could not complete the browser request: ${result.errorMessage ?? result.stopReason}`,
