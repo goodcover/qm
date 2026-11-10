@@ -1,6 +1,7 @@
 import { CODEX_SUBSCRIPTION_PROVIDER, parseProviderBaseUrl, PROVIDER_IDS } from "./provider-endpoints.ts";
 import { CLAUDE_CODE_KEY } from "./claude-subscription.ts";
-import { perTenant } from "../tenants/context.ts";
+import { perTenant } from "../tenants/cache.ts";
+import { boundTenant } from "../tenants/context.ts";
 
 export const CUSTOM_PROVIDER_PROTOCOLS = ["openai", "openai-responses", "anthropic"] as const;
 export type CustomProviderProtocol = (typeof CUSTOM_PROVIDER_PROTOCOLS)[number];
@@ -143,7 +144,7 @@ export function resolveCustomModel(id: string): CustomRuntimeModel | undefined {
 }
 
 export function isCustomModelId(id: string): boolean {
-  return state().registry.has(id);
+  return boundTenant() !== undefined && state().registry.has(id);
 }
 
 export function customModelCatalog(): Array<{ id: string; name: string; provider: string }> {

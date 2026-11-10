@@ -19,9 +19,8 @@ import {
 import { errMessage, errorAlreadyReported, reportFailure, swallow } from "../util/errors.ts";
 import { sleep } from "../util/async.ts";
 import { retryDelay } from "./retry-delay.ts";
-import { inTenantOf } from "../tenants/claim.ts";
-import { withoutTenant } from "../tenants/context.ts";
 import { FLUSH_MS, traceQueued } from "../../plugins/chassis/src/error-reporting.ts";
+import { withTenant } from "../tenants/context.ts";
 
 export interface ProcessDeps {
   runs: RunStore;
@@ -49,7 +48,7 @@ export async function processRun(
   opts?: { shutdown?: AbortSignal; park?: TurnPark },
 ): Promise<TurnResult> {
   const { trace, ...request } = run.request;
-  return inTenantOf(run.tenantId, () =>
+  return withTenant(run.tenantId, () =>
     traceQueued(
       trace,
       "run",
@@ -292,7 +291,7 @@ export function createWorker(deps: WorkerDeps): Worker {
     if (batch.length && (stopped || !admitted())) {
       await Promise.all(
         batch.map((run) =>
-          inTenantOf(run.tenantId, () => deps.runs.releaseLease(run.id, run.leaseToken!)).catch((e) =>
+          withTenant(run.tenantId, () => deps.runs.releaseLease(run.id, run.leaseToken!)).catch((e) =>
             swallow("worker: post-stop claim handback failed", e),
           ),
         ),
@@ -353,7 +352,7 @@ export function createWorker(deps: WorkerDeps): Worker {
     await settled();
   };
   function run(): void {
-    loopDone = withoutTenant(loop).then(
+    loopDone = loop().then(
       () => {
         loopDone = null;
         if (!stopped) run();
@@ -413,23 +412,19 @@ export function createRunPreemption(deps: {
     );
     if (!slotPark || !live.includes(slotPark)) slotPark = undefined;
     if (live.length === 0) return false;
-    const blocked = new Set<HeldRun>();
+    const blocking = new Set<HeldRun>();
     for (const [tenantId, group] of Map.groupBy(live, ({ run }) => run.tenantId)) {
-      const waiting = await inTenantOf(tenantId, () =>
-        deps.runs.personWaitingIn(
-          group.map(({ run }) => run.sessionId),
-          createdBefore,
-        ),
-      );
-      for (const held of group) if (waiting.has(held.run.sessionId)) blocked.add(held);
+      const sessionIds = group.map(({ run }) => run.sessionId);
+      const waiting = await withTenant(tenantId, () => deps.runs.personWaitingIn(sessionIds, createdBefore));
+      for (const held of group) if (waiting.has(held.run.sessionId)) blocking.add(held);
     }
     const waitingElsewhere = held.length >= deps.worker.slots && (await deps.runs.personWaiting(createdBefore));
     if (!waitingElsewhere) slotPark = undefined;
     else if (!slotPark && !held.some(({ shutdown }) => shutdown.signal.aborted))
-      slotPark = live.filter((held) => !blocked.has(held)).sort((a, b) => b.claimedAt - a.claimedAt)[0];
+      slotPark = live.filter((held) => !blocking.has(held)).sort((a, b) => b.claimedAt - a.claimedAt)[0];
     let requested = false;
     for (const run of live) {
-      const wanted = blocked.has(run) || run === slotPark;
+      const wanted = blocking.has(run) || run === slotPark;
       requested ||= wanted && !run.parkRequested;
       run.parkRequested = wanted;
     }

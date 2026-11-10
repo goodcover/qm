@@ -1,8 +1,12 @@
+import { trimTrailingSlashes } from "../util/text.ts";
 import { randomUUID } from "node:crypto";
 import type { ScopeId } from "../types.ts";
 import type { DurableMap } from "../persistence/durable-map.ts";
-import type { Claimed } from "../tenants/claim.ts";
 import type { PgPool } from "../persistence/pg-pool.ts";
+import type { ClaimedRow } from "../tenants/claim.ts";
+import { DEPLOYMENT_TABLES, NAME_INDEX } from "./page-views.ts";
+import { tenantAppHandle } from "../tenants/settings.ts";
+import { appHostLabel } from "../tenants/app-handle.ts";
 import {
   createDeployGitStore,
   type DeployGitDiff,
@@ -10,8 +14,6 @@ import {
   type DeployGitStoreOptions,
   type DeployGitTreeFile,
 } from "./deploy-git-store.ts";
-import { TENANCY, createIfParentTenantKeyed, tenantTables } from "../tenants/migrations.ts";
-import { durableMapTenancy } from "../persistence/durable-map.ts";
 
 export interface DeploymentVersion {
   version: number;
@@ -34,6 +36,17 @@ export interface DeployEndpoint {
   httpVersion?: "1.1" | "2";
   proxyHeaders?: Record<string, string>;
   socksProxyPort?: number;
+}
+
+export function appUrlOf(
+  d: { id: string; name?: string; endpoint?: DeployEndpoint | null },
+  { sharedWebUrl, appsDomain }: { sharedWebUrl: string | undefined; appsDomain: string | undefined },
+): string | undefined {
+  const ref = d.name ?? d.id;
+  const handle = tenantAppHandle();
+  if (appsDomain && handle) return `https://${appHostLabel(handle, ref)}.${appsDomain.toLowerCase()}/`;
+  const path = `/d/${encodeURIComponent(ref)}/`;
+  return publicUrlOf(d.endpoint) ?? (sharedWebUrl ? `${trimTrailingSlashes(sharedWebUrl)}${path}` : undefined);
 }
 
 export function publicUrlOf(endpoint: DeployEndpoint | null | undefined): string | undefined {
@@ -105,7 +118,7 @@ export interface DeployStore {
   get(id: string): Promise<Deployment | null>;
   getByName(name: string): Promise<Deployment | null>;
   list(): Promise<Deployment[]>;
-  acrossTenants(): Promise<Array<Claimed<Deployment>>>;
+  claimTenants(): Promise<ClaimedRow[]>;
   setCurrentVersion(id: string, version: number): Promise<void>;
   setVersionImage(id: string, version: number, image: string): Promise<void>;
   setStatus(id: string, status: DeploymentStatus): Promise<void>;
@@ -139,7 +152,6 @@ export interface DeployStoreBackings {
 
 const CURRENT_REF = "refs/heads/current";
 const versionRef = (version: number): string => `refs/versions/${version}`;
-const NAME_INDEX = "deployments_name_unique";
 const TOUCH_DEBOUNCE_MS = 60_000;
 
 interface DeployAccess {
@@ -149,63 +161,14 @@ interface DeployAccess {
   findByName?(name: string): Promise<Deployment | null>;
 }
 
-const NAME_LOOKUP = {
-  id: "durable-map/deployments/0011-access-tenants-name-lookup",
-  statements: [
-    `CREATE INDEX CONCURRENTLY IF NOT EXISTS deployments_name_lookup ON deployments ((json->>'name')) WHERE json->>'name' IS NOT NULL`,
-  ],
-};
-
-const ACCESS_TENANCY = tenantTables(
-  "durable-map/deployments/0011-access-tenants",
-  [{ table: "deployment_access", primaryKey: "id" }],
-  {
-    foreignKeys: [
-      {
-        table: "deployment_access",
-        name: "deployment_access_id_fkey",
-        columns: "id",
-        references: "deployments(tenant_id, id)",
-        onDelete: "CASCADE",
-      },
-    ],
-    after: [
-      `DROP INDEX IF EXISTS ${NAME_INDEX}`,
-      `CREATE UNIQUE INDEX ${NAME_INDEX} ON deployments (tenant_id, (json->>'name')) WHERE json->>'name' IS NOT NULL`,
-    ],
-  },
-);
-
 function createPgDeployAccess(pg: PgPool): DeployAccess {
-  const migration = {
-    id: "deploy/access/0001",
-    statements: [
-      "CREATE TABLE IF NOT EXISTS deployments (id TEXT PRIMARY KEY, json JSONB NOT NULL)",
-      `CREATE TABLE IF NOT EXISTS deployment_access (
-        id TEXT PRIMARY KEY REFERENCES deployments(id) ON DELETE CASCADE,
-        last_access_at BIGINT NOT NULL
-      )`,
-    ],
-  };
-  const preKeyed = createIfParentTenantKeyed(
-    "deploy/access/0000-tenant-keyed-deployments",
-    "deployments",
-    "deployment_access",
-    "CREATE TABLE deployment_access (id TEXT NOT NULL, last_access_at BIGINT NOT NULL)",
-  );
-  const migrations = [
-    ...TENANCY,
-    preKeyed,
-    migration,
-    ...durableMapTenancy("deployments"),
-    ...ACCESS_TENANCY,
-    NAME_LOOKUP,
-  ];
-  for (const definition of migrations) pg.registerMigration(definition);
+  for (const migration of DEPLOYMENT_TABLES) pg.registerMigration(migration);
   let readyP: Promise<void> | null = null;
   function ready(): Promise<void> {
     if (!readyP) {
-      readyP = pg.migrate(...migrations).catch((e) => {
+      readyP = (async () => {
+        for (const migration of DEPLOYMENT_TABLES) await pg.migrate(migration);
+      })().catch((e) => {
         readyP = null;
         throw e;
       });
@@ -373,12 +336,12 @@ export function createDeployStore(backing: DeployStoreBackings): DeployStore {
         : ((await backingMap.all()).find((x) => x.name === name) ?? null);
       return d ? withAccess(d, await access.readOne(d.id)) : null;
     },
+    claimTenants() {
+      return backingMap.claimTenants();
+    },
     async list() {
       const [ds, accessAt] = await Promise.all([backingMap.all(), access.readAll()]);
       return ds.map((d) => withAccess(d, accessAt.get(d.id)));
-    },
-    async acrossTenants() {
-      return (await backingMap.acrossTenants()).map(({ tenantId, value }) => ({ ...value, tenantId }));
     },
     async setCurrentVersion(id, version) {
       const d = await backingMap.get(id);

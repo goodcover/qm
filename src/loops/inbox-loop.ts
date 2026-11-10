@@ -3,6 +3,7 @@ import type { LoopItemLedger } from "./item-ledger.ts";
 import { scopeId } from "../types.ts";
 import type { LoopStore } from "./loop-store.ts";
 import { adapterForItem } from "./sources/index.ts";
+import { isObj } from "./sources/adapter.ts";
 import { EVENT_TEXT_CHARS, type LatestEvent } from "./ingress.ts";
 import type { FileArtifactStore } from "../files/file-artifact-store.ts";
 import { text } from "node:stream/consumers";
@@ -56,6 +57,21 @@ const SOURCE_TEXT = {
     images: "url_private; up to 4",
   },
 } as const;
+
+export const INBOX_PRECHECK_QUERIES = {
+  gmail: { addressed: "in:inbox -from:me" },
+  slack: { waiting: ["with:me -from:me", "<@USER>"], ownReplies: "from:me" },
+} as const;
+
+export function inboxItemNeedsRepair(item: LoopItem, source: string): boolean {
+  const payload = item.sourcePayload;
+  return (
+    !item.proposal ||
+    typeof payload?.title !== "string" ||
+    typeof payload.snippet !== "string" ||
+    !isObj(payload[source])
+  );
+}
 
 export const VOICE_JUDGEMENT =
   "The draft must read as the person's own writing: compare it with their voice profile in the work instructions above when one is there (greeting, sign-off, length, register and hard rules), otherwise with their own messages in the transcript. Return continue, naming what to change, when it reads like a generic business reply instead.";
@@ -129,22 +145,11 @@ export async function loadInboxVoiceProfile(
   loop: Loop,
 ): Promise<string | undefined> {
   if (inboxSource(loop) !== "gmail") return undefined;
-  const scopes = [scopeId("personal", loop.owner)];
-  let cursor: string | undefined;
-  do {
-    const page = await files.listOwnedByScopes(scopes, {
-      nameQuery: EMAIL_VOICE_PROFILE_NAME,
-      ...(cursor ? { cursor } : {}),
-    });
-    const artifact = page.files.find((file) => file.name === EMAIL_VOICE_PROFILE_NAME);
-    if (artifact) {
-      const opened = await files.open(artifact.id);
-      if (!opened) return undefined;
-      return (await text(opened.stream)).trim() || undefined;
-    }
-    cursor = page.nextCursor;
-  } while (cursor);
-  return undefined;
+  const [artifact] = (
+    await files.listOwnedByScopes([scopeId("personal", loop.owner)], { name: EMAIL_VOICE_PROFILE_NAME, limit: 1 })
+  ).files;
+  const opened = artifact ? await files.open(artifact.id) : null;
+  return opened ? (await text(opened.stream)).trim() || undefined : undefined;
 }
 
 export function inboxTaskContext(loop: Loop, voiceProfile?: string): InboxTaskContext {

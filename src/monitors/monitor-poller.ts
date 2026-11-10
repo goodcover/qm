@@ -11,7 +11,7 @@ import { ProcessSessionGoneError } from "../sandbox/exec-process-session.ts";
 import { runTrigger, type TriggerDeps, type TriggerOutcome } from "../triggers/run-trigger.ts";
 import type { LeaderLease } from "../persistence/leader-lease.ts";
 import { createSweeper } from "../util/sweeper.ts";
-import { inTenantOf, type Claimed } from "../tenants/claim.ts";
+import { currentTenant, withTenant } from "../tenants/context.ts";
 import { errMessage, reportFailureAs } from "../util/errors.ts";
 import type { CurrentScopeMembers } from "../resolution/scope-membership.ts";
 import { compileMonitorPattern } from "./monitor-broker.ts";
@@ -160,6 +160,7 @@ export function createMonitorPoller(deps: MonitorPollerDeps): MonitorPoller {
       fireKey,
       surface: "monitor",
       threadRef: m.threadRef,
+      redrivesHandOff: true,
       ...(m.destination ? { destination: m.destination } : {}),
       ...(withErrorNotice
         ? {
@@ -266,40 +267,44 @@ export function createMonitorPoller(deps: MonitorPollerDeps): MonitorPoller {
     return true;
   }
 
+  type Handles = Map<string, { tenantId: string; handle: SandboxHandle }>;
+
+  async function pollMonitor(sandbox: ProcessSandbox, handles: Handles, m: Monitor, t: number): Promise<number> {
+    const rec = await deps.processes.get(m.processId);
+    if (!rec?.sandboxId) {
+      await reportLost(m);
+      return 1;
+    }
+    const tenantId = currentTenant();
+    const targetKey = `${tenantId}:${rec.sandboxId}`;
+    let handle = handles.get(targetKey)?.handle;
+    if (!handle) {
+      try {
+        handle = await sandbox.provision(rec.scopeId, {
+          sandboxId: rec.sandboxId,
+        });
+      } catch (e) {
+        await deps.monitors.recordError(m.id, errMessage(e));
+        return 0;
+      }
+      handles.set(targetKey, { tenantId, handle });
+    }
+    try {
+      return (await poll(sandbox, handle, m, t)) ? 1 : 0;
+    } catch (e) {
+      await deps.monitors.recordError(m.id, errMessage(e));
+      console.error("%s", `[monitor] poll failed for ${m.id}:`, errMessage(e));
+      return 0;
+    }
+  }
+
   async function pollAll(t: number, observed: number): Promise<void> {
     if (!supportsProcessSessions(deps.sandbox)) return;
     const sandbox = deps.sandbox;
-    const enabled = (await deps.monitors.enabledAcrossTenants()).sort((a, b) => a.createdAt - b.createdAt);
+    const enabled = (await deps.monitors.claimEnabled()).sort((a, b) => a.createdAt - b.createdAt);
     if (enabled.length === 0) return;
 
-    const handles = new Map<string, { tenantId?: string; handle: SandboxHandle }>();
-    const pollOne = async (m: Claimed<Monitor>): Promise<boolean> => {
-      const rec = await deps.processes.get(m.processId);
-      if (!rec?.sandboxId) {
-        await reportLost(m);
-        return true;
-      }
-      const handleKey = `${m.tenantId ?? ""}:${rec.sandboxId}`;
-      let handle = handles.get(handleKey)?.handle;
-      if (!handle) {
-        try {
-          handle = await sandbox.provision(rec.scopeId, {
-            sandboxId: rec.sandboxId,
-          });
-        } catch (e) {
-          await deps.monitors.recordError(m.id, errMessage(e));
-          return false;
-        }
-        handles.set(handleKey, { ...(m.tenantId === undefined ? {} : { tenantId: m.tenantId }), handle });
-      }
-      try {
-        return await poll(sandbox, handle, m, t);
-      } catch (e) {
-        await deps.monitors.recordError(m.id, errMessage(e));
-        console.error("%s", `[monitor] poll failed for ${m.id}:`, errMessage(e));
-        return false;
-      }
-    };
+    const handles: Handles = new Map();
     let fires = 0;
     try {
       for (const m of enabled) {
@@ -308,11 +313,11 @@ export function createMonitorPoller(deps: MonitorPollerDeps): MonitorPoller {
           console.warn(`[monitor] fan-out capped: fired ${fires}/${enabled.length} watched jobs this tick`);
           break;
         }
-        if (await inTenantOf(m.tenantId, () => pollOne(m))) fires++;
+        fires += await withTenant(m.tenantId, () => pollMonitor(sandbox, handles, m, t));
       }
     } finally {
       for (const { tenantId, handle } of handles.values()) {
-        await inTenantOf(tenantId, () => sandbox.teardown(handle, { keepWarm: true })).catch((e: unknown) => {
+        await withTenant(tenantId, () => sandbox.teardown(handle, { keepWarm: true })).catch((e: unknown) => {
           console.error("[monitor] teardown failed:", errMessage(e));
         });
       }

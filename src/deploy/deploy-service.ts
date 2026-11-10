@@ -15,6 +15,7 @@ import { samePerson } from "../directory/person.ts";
 import { CONNECTOR_HOSTS } from "../connectors/oauth.ts";
 import type { AuditLog } from "../audit/audit-log.ts";
 import {
+  appUrlOf,
   currentVersionOf,
   deployCurrentGitRef,
   type DeployStore,
@@ -26,9 +27,10 @@ import type { DeployProfile, DeployProvider } from "./deploy-provider.ts";
 import type { LeaderLease } from "../persistence/leader-lease.ts";
 import type { AdvisoryLock } from "../persistence/advisory-lock.ts";
 import { createKeyedQueue } from "../util/async.ts";
-import { errMessage, reportFailure, swallow, swallowAs } from "../util/errors.ts";
+import { errMessage, reportFailure, swallow } from "../util/errors.ts";
 import { uuidSchema } from "../util/ids.ts";
-import { inTenantOf } from "../tenants/claim.ts";
+import { claimThenBind } from "../tenants/claim.ts";
+import { assertAppLabelFits } from "../tenants/settings.ts";
 
 export interface DeployFile {
   path: string;
@@ -80,6 +82,7 @@ export interface DeployService {
   deploy(input: DeployInput): Promise<Deployment>;
   redeploy(id: string, input: RedeployInput): Promise<Deployment>;
   getDeployment(idOrName: string): Promise<Deployment | null>;
+  appUrl?(d: Deployment): string | undefined;
   listDeployments(): Promise<Deployment[]>;
   rollbackDeployment(id: string, version: number, options?: { alwaysOn?: boolean; actor?: string }): Promise<void>;
   archiveDeployment(id: string): Promise<void>;
@@ -145,7 +148,6 @@ export interface DeployServiceDeps {
   provider: DeployProvider;
   deployDir: string;
   auditLog: AuditLog;
-  appPublished?: (principal: string, deploymentId: string, version: number) => Promise<void>;
   acl: AclStore;
   leaderLease: LeaderLease;
   advisoryLock: AdvisoryLock;
@@ -179,6 +181,7 @@ function validateName(name: string): void {
       `invalid deployment name "${name}": use 2-40 chars, lowercase letters/digits/hyphens, no leading/trailing hyphen`,
     );
   }
+  assertAppLabelFits(name);
 }
 
 const DISPLAY_NAME_MAX = 60;
@@ -222,6 +225,10 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
     });
   }
 
+  const eachRunning = (work: (d: Deployment) => Promise<void>) =>
+    claimThenBind(deps.deployStore.claimTenants, async () => {
+      for (const d of await deps.deployStore.list()) if (d.status === "running") await work(d);
+    });
   function withDeployLock<T>(id: string, fn: () => Promise<T>): Promise<T> {
     return deployQueue(id, () => advisoryLock.withLock(`deploy:${id}`, fn));
   }
@@ -305,31 +312,6 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
       await deps.provider.park?.(cur).catch((e) => swallow("deploy: park rotated app", e));
     });
 
-  async function maintainOne(id: string): Promise<boolean> {
-    const cur = await deps.deployStore.get(id);
-    if (!cur || cur.status !== "running") return false;
-    if (await deps.provider.rotationDue?.(cur)) {
-      await rotateDeployment(cur.id);
-      return true;
-    }
-    return Boolean(cur.alwaysOn && (await liveEndpoint(cur)));
-  }
-
-  async function reapIdle(id: string, ttlMs: number, now: number): Promise<boolean> {
-    const d = await deps.deployStore.get(id);
-    if (!d || d.status !== "running" || d.alwaysOn) return false;
-    const last = d.lastAccessAt ?? d.versions[d.versions.length - 1]?.createdAt ?? 0;
-    if (now - last < ttlMs) return false;
-    return withDeployLock(id, async () => {
-      const cur = await deps.deployStore.get(id);
-      if (!cur || cur.status !== "running" || cur.alwaysOn) return false;
-      await deps.provider.destroy(cur);
-      await deps.deployStore.setStatus(id, "stopped");
-      await deps.deployStore.setEndpoint(id, null);
-      return true;
-    });
-  }
-
   const deploymentRef = (id: string): string => encodeRef(deployRef(id));
   const grantsOn = (d: Deployment): Promise<Grant[]> => deps.acl.grantsFor(d.ownerScopeId, deploymentRef(d.id));
 
@@ -379,6 +361,7 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
   }
 
   return {
+    appUrl: (d) => appUrlOf(d, { sharedWebUrl: deps.publicWebUrl, appsDomain: deps.deployAppsDomain }),
     providerProfile: deps.provider.profile,
     assertShareAllowed,
 
@@ -387,11 +370,12 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
         validateName(input.name);
         if (await deps.deployStore.getByName(input.name)) throw new Error(`deployment name taken: ${input.name}`);
       }
+      const id = randomUUID();
+      if (input.name === undefined) assertAppLabelFits(id);
       assertAppSize(fileSizes(input.files), deps.provider.profile.maxAppBytes);
       const snapshotDir = await snapshotFiles(deps.deployDir, input.files);
       const homeDir = input.homeFiles?.length ? await snapshotFiles(deps.deployDir, input.homeFiles) : undefined;
       const env = input.stampEnv ? { ...input.env, ...input.stampEnv } : input.env;
-      const id = randomUUID();
       if (input.createdInScope && parseScopeId(input.createdInScope).kind === "channel") {
         await deps.acl.grant({
           ownerScopeId: input.ownerScopeId,
@@ -416,9 +400,6 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
       });
       const endpoint = await applyVersion(d.id, d.versions[0]!);
       await markVersionRunning(d.id, d.versions[0]!.version, endpoint);
-      void deps
-        .appPublished?.(input.createdBy, d.id, d.versions[0]!.version)
-        .catch(swallowAs("deploy: app published hook", undefined));
       deps.auditLog.record({
         at: Date.now(),
         principalId: input.createdBy,
@@ -450,9 +431,6 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
         });
         const endpoint = await applyVersion(id, v, before.appliedVersion ?? before.currentVersion, input.alwaysOn);
         await markVersionRunning(id, v.version, endpoint);
-        void deps
-          .appPublished?.(before.createdBy, id, v.version)
-          .catch(swallowAs("deploy: app published hook", undefined));
         deps.auditLog.record({
           at: Date.now(),
           principalId: before.createdBy,
@@ -662,14 +640,17 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
     async maintainDeployments() {
       const result = await leaderLease.hold("deployments:keep-warm", async () => {
         let maintained = 0;
-        for (const d of await deps.deployStore.acrossTenants()) {
-          if (d.status !== "running") continue;
+        await eachRunning(async (listed) => {
           try {
-            if (await inTenantOf(d.tenantId, () => maintainOne(d.id))) maintained++;
+            const rotate = await deps.provider.rotationDue?.(listed);
+            const cur = rotate || listed.alwaysOn ? await deps.deployStore.get(listed.id) : null;
+            if (cur?.status !== "running") return;
+            if (rotate) await rotateDeployment(cur.id);
+            if (rotate || (cur.alwaysOn && (await liveEndpoint(cur)))) maintained++;
           } catch (e) {
-            console.error("%s", `[deploy] maintenance failed for ${d.name ?? d.id}:`, errMessage(e));
+            console.error("%s", `[deploy] maintenance failed for ${listed.id}:`, errMessage(e));
           }
-        }
+        });
         return maintained;
       });
       return result ?? 0;
@@ -718,9 +699,6 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
           if (!v) return result;
           const endpoint = await applyVersion(id, v, before.appliedVersion ?? before.currentVersion);
           await markVersionRunning(id, v.version, endpoint);
-          void deps
-            .appPublished?.(before.createdBy, id, v.version)
-            .catch(swallowAs("deploy: app published hook", undefined));
           deps.auditLog.record({
             at: Date.now(),
             principalId: before.createdBy,
@@ -747,10 +725,17 @@ export function createDeployService(deps: DeployServiceDeps): DeployService {
       const result = await leaderLease.hold("deployments:reaper", async () => {
         if (deps.provider.profile.managedScaleToZero) return 0;
         let stopped = 0;
-        for (const d of await deps.deployStore.acrossTenants()) {
-          if (d.status !== "running" || d.alwaysOn) continue;
-          if (await inTenantOf(d.tenantId, () => reapIdle(d.id, ttlMs, now))) stopped++;
-        }
+        await eachRunning(async ({ id, alwaysOn, lastAccessAt, versions }) => {
+          if (alwaysOn || now - (lastAccessAt ?? versions.at(-1)?.createdAt ?? 0) < ttlMs) return;
+          await withDeployLock(id, async () => {
+            const cur = await deps.deployStore.get(id);
+            if (!cur || cur.status !== "running" || cur.alwaysOn) return;
+            await deps.provider.destroy(cur);
+            await deps.deployStore.setStatus(id, "stopped");
+            await deps.deployStore.setEndpoint(id, null);
+            stopped++;
+          });
+        });
         return stopped;
       });
       return result ?? 0;

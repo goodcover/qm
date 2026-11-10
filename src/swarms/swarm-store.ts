@@ -1,4 +1,3 @@
-import type { Claimed } from "../tenants/claim.ts";
 import type { GoalCreateInput } from "../agent/goal.ts";
 import { NonRetryableTurnError } from "../core/turn-error.ts";
 import { withPgTransaction, type PgPool } from "../persistence/pg-pool.ts";
@@ -7,6 +6,8 @@ import type { SessionStore } from "../sessions/session-store.ts";
 import { assertSwarmRun, type SwarmRunFence } from "./swarm-fence.ts";
 import type { DurableMap } from "../persistence/durable-map.ts";
 import { jsonbStringify } from "../util/text.ts";
+import { claimThenBind } from "../tenants/claim.ts";
+import { currentTenant } from "../tenants/context.ts";
 
 import type { SwarmSettings } from "./swarm-settings.ts";
 import type { SandboxBackendName } from "../sandbox/sandbox-routing.ts";
@@ -109,8 +110,10 @@ export interface SwarmStore {
   get(id: string): Promise<Swarm | null>;
   create(swarm: Swarm, fence?: SwarmRunFence): Promise<Swarm>;
   update(id: string, mutate: (swarm: Swarm) => void, fence?: SwarmRunFence): Promise<Swarm>;
-  pending(afterId?: string): Promise<Array<Claimed<Swarm>>>;
+  pending(afterId?: string): Promise<PendingSwarm[]>;
 }
+
+export type PendingSwarm = Swarm & { tenantId: string };
 
 export interface SwarmStorage extends Omit<Swarm, "members" | "messages"> {
   members: Array<Omit<SwarmMember, "context"> & { contextJson: string }>;
@@ -224,11 +227,18 @@ export function createSwarmStore(
       return decode(updated);
     },
     async pending(afterId) {
-      return (await backing.acrossTenants())
-        .filter(({ id, value }) => value.pending && (afterId === undefined || id > afterId))
-        .sort((left, right) => (left.id < right.id ? -1 : Number(left.id > right.id)))
-        .slice(0, SWARM_LIMITS.sweepBatch)
-        .map(({ tenantId, value }) => ({ ...decode(value), tenantId }));
+      const query = {
+        where: { field: "pending", anyOfFold: ["true"] },
+        afterId,
+        limit: SWARM_LIMITS.sweepBatch,
+      } as const;
+      const claimed = await claimThenBind(backing.claimTenants, async () =>
+        (await backing.select(query)).map((row) => ({ ...decode(row), tenantId: currentTenant() })),
+      );
+      return claimed
+        .flat()
+        .sort((a, b) => (a.id < b.id ? -1 : Number(a.id > b.id)))
+        .slice(0, SWARM_LIMITS.sweepBatch);
     },
   };
 }

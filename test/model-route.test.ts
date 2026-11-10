@@ -1,6 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createAgent, type AgentOptions } from "../src/agent/agent-run.ts";
+import { createAgent } from "../src/agent/agent-run.ts";
+import { companyRouteKeys, createModelRoutes } from "../src/model/model-route.ts";
+import { auxiliaryModelFor } from "../src/model/pi-models.ts";
+import { DESCRIPTIVE_TITLE_PROMPT } from "../src/agent/session-title-prompt.ts";
 import type { AgentTurnInput, CompactInput } from "../src/agent/agent.ts";
 import type { Item, NewItem } from "../src/sessions/items.ts";
 import { setCustomProviders } from "../src/model/custom-providers.ts";
@@ -9,7 +12,6 @@ import { runtimeConfigBody } from "../src/api/runtime-config.ts";
 import { testConfigStore } from "./support/test-database.ts";
 import { orgScope } from "../src/config.ts";
 import { installFakeClaudeCode } from "./support/fake-claude-code.ts";
-import { companyRouteKeys } from "../src/model/model-route.ts";
 
 const GATEWAY = {
   url: "https://gateway.example/v1",
@@ -122,9 +124,11 @@ test("compaction summarizes on the session's own provider while the shared gatew
   ]);
   t.after(() => setCustomProviders([]));
   const agent = createAgent({
-    defaultModelId: "gpt-6-astra",
-    modelGateway: GATEWAY,
-    resolveProviderKeys: async () => ({ direct: "sk-direct" }),
+    routes: createModelRoutes({
+      defaultModelId: "gpt-6-astra",
+      modelGateway: GATEWAY,
+      resolveProviderKeys: async () => ({ direct: "sk-direct" }),
+    }),
   });
   await withFetch(
     (url) => (url.includes("gateway.example") ? budgetRejection() : anthropicReply("summary of the work")),
@@ -138,10 +142,12 @@ test("compaction summarizes on the session's own provider while the shared gatew
 
 test("an out-of-budget summary moves to the configured fallback on another account", async () => {
   const agent = createAgent({
-    defaultModelId: "gpt-6-astra",
-    modelGateway: GATEWAY,
-    resolveProviderKeys: async () => ({ anthropic: "sk-anthropic" }),
-    resolveFallbackRuntime: () => ({ modelId: "claude-sonnet-5" }),
+    routes: createModelRoutes({
+      defaultModelId: "gpt-6-astra",
+      modelGateway: GATEWAY,
+      resolveProviderKeys: async () => ({ anthropic: "sk-anthropic" }),
+      resolveFallbackRuntime: () => ({ modelId: "claude-sonnet-5" }),
+    }),
   });
   await withFetch(
     (url) => (url.includes("gateway.example") ? budgetRejection() : anthropicReply("fallback summary")),
@@ -160,8 +166,10 @@ const PERSONAL_KEYS = { "openai-codex": CHATGPT_LOGIN, anthropic: "sk-personal" 
 
 test("a person with a ChatGPT login and an Anthropic key falls back to an Anthropic model on their key", async () => {
   const agent = createAgent({
-    defaultModelId: "gpt-6-astra",
-    resolveFallbackRuntime: () => ({ modelId: "claude-opus-5" }),
+    routes: createModelRoutes({
+      defaultModelId: "gpt-6-astra",
+      resolveFallbackRuntime: () => ({ modelId: "claude-opus-5" }),
+    }),
   });
   await withFetch(
     (_url, body) =>
@@ -181,8 +189,10 @@ test("a person with a ChatGPT login and an Anthropic key falls back to an Anthro
 
 test("a person with a ChatGPT login falls back to an OpenAI model through that login", async () => {
   const agent = createAgent({
-    defaultModelId: "gpt-6-astra",
-    resolveFallbackRuntime: () => ({ modelId: "gpt-6-astra" }),
+    routes: createModelRoutes({
+      defaultModelId: "gpt-6-astra",
+      resolveFallbackRuntime: () => ({ modelId: "gpt-6-astra" }),
+    }),
   });
   await withFetch(
     (url) =>
@@ -208,10 +218,12 @@ test("a person with a ChatGPT login falls back to an OpenAI model through that l
 
 test("a summary that fails everywhere names each route it tried and why", async () => {
   const agent = createAgent({
-    defaultModelId: "gpt-6-astra",
-    modelGateway: GATEWAY,
-    resolveProviderKeys: async () => ({ anthropic: "sk-anthropic" }),
-    resolveFallbackRuntime: () => ({ modelId: "claude-sonnet-5" }),
+    routes: createModelRoutes({
+      defaultModelId: "gpt-6-astra",
+      modelGateway: GATEWAY,
+      resolveProviderKeys: async () => ({ anthropic: "sk-anthropic" }),
+      resolveFallbackRuntime: () => ({ modelId: "claude-sonnet-5" }),
+    }),
   });
   await withFetch(
     (url) =>
@@ -224,13 +236,13 @@ test("a summary that fails everywhere names each route it tried and why", async 
       assert.ok(error instanceof ProviderTurnError);
       assert.equal(error.code, "model_budget");
       assert.match(error.message, /shared model gateway.*Budget has been exceeded/s);
-      assert.match(error.message, /fallback .*organization's own provider key.*key revoked/s);
+      assert.match(error.message, /fallback .*organization's own provider key or subscription\).*key revoked/s);
     },
   );
 });
 
 test("a refusal with no configured fallback stays on the refused model", async () => {
-  const agent = createAgent({ apiKey: "sk-anthropic", openaiApiKey: "sk-openai" });
+  const agent = createAgent({ routes: createModelRoutes({ apiKey: "sk-anthropic", openaiApiKey: "sk-openai" }) });
   await withFetch(
     () => anthropicReply("", "refusal"),
     async (calls) => {
@@ -249,12 +261,13 @@ test("a refusal with no configured fallback stays on the refused model", async (
 });
 
 test("a fallback that fails keeps the original refusal and says what happened to the fallback", async () => {
-  const options: AgentOptions = {
-    apiKey: "sk-anthropic",
-    modelGateway: GATEWAY,
-    resolveFallbackRuntime: () => ({ modelId: "gpt-6-astra" }),
-  };
-  const agent = createAgent(options);
+  const agent = createAgent({
+    routes: createModelRoutes({
+      apiKey: "sk-anthropic",
+      modelGateway: GATEWAY,
+      resolveFallbackRuntime: () => ({ modelId: "gpt-6-astra" }),
+    }),
+  });
   await withFetch(
     (url) => (url.includes("gateway.example") ? budgetRejection() : anthropicReply("", "refusal")),
     async (calls) => {
@@ -285,8 +298,10 @@ for (const [account, anthropic, fallbackModel, verb, expectedHosts, claudeCodeCa
     }));
     t.after(claudeCode.restore);
     const agent = createAgent({
-      resolveProviderKeys: async () => ({ anthropic, openai: "sk-openai", "openai-codex": CHATGPT_LOGIN }),
-      resolveFallbackRuntime: () => ({ modelId: fallbackModel }),
+      routes: createModelRoutes({
+        resolveProviderKeys: async () => ({ anthropic, openai: "sk-openai", "openai-codex": CHATGPT_LOGIN }),
+        resolveFallbackRuntime: () => ({ modelId: fallbackModel }),
+      }),
     });
     await withFetch(
       (url) =>
@@ -319,7 +334,9 @@ test("company route keys carry the Claude Code login only for a subscription tok
 test("a Claude subscription turn honors adaptive and provider-default effort and refuses fast mode", async (t) => {
   const claudeCode = await installFakeClaudeCode(() => ({ text: "done" }));
   t.after(claudeCode.restore);
-  const agent = createAgent({ resolveProviderKeys: async () => ({ anthropic: "sk-ant-oat01-subscription" }) });
+  const agent = createAgent({
+    routes: createModelRoutes({ resolveProviderKeys: async () => ({ anthropic: "sk-ant-oat01-subscription" }) }),
+  });
   await turn(agent, "claude-opus-5-5", { effortLevel: "adaptive" });
   await turn(agent, "claude-opus-5-5", { effortLevel: "default" });
   await turn(agent, "claude-sonnet-5", { effortLevel: "default" });
@@ -343,12 +360,14 @@ test("a Claude subscription turn honors adaptive and provider-default effort and
 
 test("a company ChatGPT summary that fails never reaches a metered fallback", async () => {
   const agent = createAgent({
-    resolveProviderKeys: async () => ({
-      anthropic: "sk-ant-api03-metered",
-      openai: "sk-openai",
-      "openai-codex": CHATGPT_LOGIN,
+    routes: createModelRoutes({
+      resolveProviderKeys: async () => ({
+        anthropic: "sk-ant-api03-metered",
+        openai: "sk-openai",
+        "openai-codex": CHATGPT_LOGIN,
+      }),
+      resolveFallbackRuntime: () => ({ modelId: "claude-sonnet-5" }),
     }),
-    resolveFallbackRuntime: () => ({ modelId: "claude-sonnet-5" }),
   });
   for (const [status, type] of [
     [401, "authentication_error"],
@@ -370,9 +389,11 @@ test("a company ChatGPT summary that fails never reaches a metered fallback", as
 
 test("helper calls run on the org's utility model, not the deployment default", async () => {
   const agent = createAgent({
-    defaultModelId: "claude-opus-5-5",
-    resolveBaseModelId: () => "gpt-5.6-sol",
-    resolveProviderKeys: async () => ({ anthropic: "sk-anthropic", openai: "sk-openai" }),
+    routes: createModelRoutes({
+      defaultModelId: "claude-opus-5-5",
+      resolveBaseModelId: () => "gpt-5.6-sol",
+      resolveProviderKeys: async () => ({ anthropic: "sk-anthropic", openai: "sk-openai" }),
+    }),
   });
   await withFetch(
     () => errorReply(400, "invalid_request_error", "stop here"),
@@ -402,4 +423,53 @@ test("the runtime listing says which account each model bills", async () => {
   const personal = await runtimeConfigBody({ deps }, orgScope(), async () => null);
   assert.equal(personal.modelCatalog["claude-sonnet-5"]?.billing, "personal_account");
   assert.equal(personal.modelCatalog["gpt-6-astra"]?.billing, "personal_account");
+});
+
+test("the runtime listing bills an OpenAI model to company ChatGPT access even when a gateway also serves it", async () => {
+  const deps = {
+    config: testConfigStore("default-org"),
+    baseModelDefault: "claude-sonnet-5",
+    modelCredentials: {
+      availability: async () => ({ anthropic: true, codexOAuth: true, modelIds: new Set(["gpt-6-astra"]) }),
+    },
+  } as unknown as Parameters<typeof runtimeConfigBody>[0]["deps"];
+  await deps.config!.setWebuiModels(orgScope(), ["claude-sonnet-5", "gpt-6-astra"]);
+  const listed = await runtimeConfigBody({ deps }, orgScope());
+  assert.equal(listed.modelCatalog["gpt-6-astra"]?.billing, "org_key");
+});
+
+test("descriptive titles run the descriptive prompt on Sonnet while plain titles keep the utility model and prompt", async () => {
+  const agent = createAgent({
+    routes: createModelRoutes({
+      defaultModelId: "claude-opus-5-5",
+      resolveProviderKeys: async () => ({ anthropic: "sk-anthropic" }),
+    }),
+  });
+  const bodies: Array<Record<string, unknown>> = [];
+  await withFetch(
+    (_url, body) => {
+      bodies.push(body);
+      return anthropicReply("How did Maria sort by activity?");
+    },
+    async (calls) => {
+      assert.equal(
+        await agent.generateTitle!("User:\nmaria has her sessions sorted by activity. how do i get that"),
+        "How did Maria sort by activity",
+      );
+      assert.equal(
+        await agent.generateTitle!("User:\nmaria has her sessions sorted by activity. how do i get that", {
+          descriptive: true,
+        }),
+        "How did Maria sort by activity?",
+      );
+      assert.deepEqual(
+        calls.map((call) => call.model),
+        [auxiliaryModelFor("claude-opus-5-5"), "claude-sonnet-5-5"],
+      );
+    },
+  );
+  assert.deepEqual(
+    bodies.map((body) => JSON.stringify(body.system).includes(JSON.stringify(DESCRIPTIVE_TITLE_PROMPT).slice(1, -1))),
+    [false, true],
+  );
 });

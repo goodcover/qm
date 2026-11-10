@@ -4,6 +4,7 @@ import type { PgPool } from "../persistence/pg-pool.ts";
 import { headSlice, tailSlice } from "../util/text.ts";
 import { collectBytes } from "../util/bytes.ts";
 import { swallowAs } from "../util/errors.ts";
+import { currentTenant } from "../tenants/context.ts";
 
 const TOOL_OUTPUT_SETTING = "tool_result_inline_tokens";
 export const DEFAULT_INLINE_TOKENS = 4096;
@@ -106,17 +107,7 @@ export function createPostgresToolOutputStore(opts: {
 }): ToolOutputStore {
   const now = opts.now ?? (() => Date.now());
   let setting: { value: number; at: number } | null = null;
-  const stores = new Map<string, DurableByteStore>();
-  const tenantBytes = async (): Promise<{ id: string; bytes: DurableByteStore }> => {
-    const rows = await opts.pool.q("SELECT qm_bound_tenant()::text AS id");
-    const id = String(rows[0]?.id);
-    let bytes = stores.get(id);
-    if (!bytes) {
-      bytes = opts.bytesFor(`${TOOL_OUTPUT_PATH}${id}/`);
-      stores.set(id, bytes);
-    }
-    return { id, bytes };
-  };
+  const tenantBytes = (id: string): DurableByteStore => opts.bytesFor(`${TOOL_OUTPUT_PATH}${id}/`);
   return {
     async inlineTokens() {
       if (setting && now() - setting.at < SETTING_CACHE_MS) return setting.value;
@@ -125,8 +116,8 @@ export function createPostgresToolOutputStore(opts: {
       return setting.value;
     },
     async save(text) {
-      const { id, bytes } = await tenantBytes();
-      const put = await bytes.put(Buffer.from(text, "utf8"));
+      const id = currentTenant();
+      const put = await tenantBytes(id).put(Buffer.from(text, "utf8"));
       await opts.pool.q(
         `INSERT INTO blobs(tenant_id, sha256, size, mime, storage_key, created_at, expires_at)
          VALUES ($1::uuid, decode($2, 'hex'), $3, 'text/plain; charset=utf-8', $4,
@@ -145,7 +136,7 @@ export function createPostgresToolOutputStore(opts: {
     },
     async read(sessionId, ref) {
       const rows = await opts.pool.q(
-        `SELECT b.storage_key, i.created_at <= now() - interval '30 days' AS expired
+        `SELECT b.storage_key, i.tenant_id::text AS tenant, i.created_at <= now() - interval '30 days' AS expired
            FROM items i
       LEFT JOIN blobs b ON b.tenant_id = i.tenant_id AND b.sha256 = i.blob_sha
           WHERE i.tenant_id = qm_bound_tenant() AND i.session_id = $1 AND i.kind = 'ToolResult'
@@ -158,9 +149,9 @@ export function createPostgresToolOutputStore(opts: {
       if (row.expired === true) return { expired: true };
       if (typeof row.storage_key !== "string")
         throw new Error(`tool output ${ref.digest}: the result names a parked blob with no blobs row`);
-      const { bytes, id } = await tenantBytes();
+      const id = String(row.tenant);
       const key = String(row.storage_key).slice(`${TOOL_OUTPUT_PATH}${id}/`.length);
-      const text = await readText(bytes, key);
+      const text = await readText(tenantBytes(id), key);
       if (text === null)
         throw new Error(`tool output ${ref.digest}: parked bytes ${row.storage_key} are missing from storage`);
       return { text };

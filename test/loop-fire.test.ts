@@ -61,6 +61,7 @@ function service(
     directory?: DirectoryStore;
     resolveRecipient?: TriggerDeps["resolveRecipient"];
     files?: Parameters<typeof createLoopFireService>[0]["files"];
+    inboxQuiet?: Parameters<typeof createLoopFireService>[0]["inboxQuiet"];
   },
 ) {
   const loops = createLoopStore(testMap());
@@ -81,6 +82,7 @@ function service(
     outputs,
     grants,
     files: overrides?.files ?? fakeFiles([]).store,
+    ...(overrides?.inboxQuiet ? { inboxQuiet: overrides.inboxQuiet } : {}),
     trigger: {
       deliveries: deliveries.store as never,
       idempotency,
@@ -892,6 +894,62 @@ test("inbox sync exceptions count once and recover on a successful retry", async
   assert.equal(s.turns.length, 2);
 });
 
+test("an inbox fire skips the sync turn only when the pre-check proves nothing new", async () => {
+  let verdict: () => Promise<{ quiet: true } | { quiet: false; reason: string }> = async () => ({ quiet: true });
+  const seen: number[] = [];
+  const s = service(() => "Synced", {
+    inboxQuiet: async (_loop, items) => {
+      seen.push(items.length);
+      return verdict();
+    },
+  });
+  const loop = await makeLoop(s.loops, { surface: "inbox:slack", sources: ["slack"] });
+  const before = Date.now();
+  assert.deepEqual(await s.fire.fire(loop.id, "quiet"), {
+    status: "silent",
+    note: "inbox quiet: nothing new since the last pass",
+  });
+  assert.equal(s.turns.length, 0);
+  const afterQuiet = await s.loops.get(loop.id);
+  assert.ok((afterQuiet?.lastScanAt ?? 0) >= before);
+  assert.equal(afterQuiet?.consecutiveFailedFires, 0);
+
+  verdict = async () => ({ quiet: false, reason: "new Slack message for the user" });
+  assert.deepEqual(await s.fire.fire(loop.id, "news"), {
+    status: "silent",
+    note: "inbox sync ran: new Slack message for the user",
+  });
+  assert.equal(s.turns.length, 1);
+  assert.match(s.turns[0]?.text ?? "", /Slack inbox loop current/);
+
+  verdict = async () => {
+    throw new Error("token store down");
+  };
+  assert.deepEqual(await s.fire.fire(loop.id, "broken-check"), {
+    status: "silent",
+    note: "inbox sync ran: pre-check failed: token store down",
+  });
+  assert.equal(s.turns.length, 2);
+  assert.deepEqual(seen, [0, 0, 0]);
+
+  const plain = await makeLoop(s.loops);
+  await s.fire.fire(plain.id, "not-inbox");
+  assert.equal(seen.length, 3);
+});
+
+test("a failed inbox sync turn keeps the pre-check reason in its note", async () => {
+  const s = service(
+    () => {
+      throw new Error("connector unavailable");
+    },
+    { inboxQuiet: async () => ({ quiet: false, reason: "new Slack message for the user" }) },
+  );
+  const loop = await makeLoop(s.loops, { surface: "inbox:slack", sources: ["slack"] });
+  const result = await s.fire.fire(loop.id, "news-fails");
+  assert.equal(result.status, "failed");
+  assert.match(result.note ?? "", /connector unavailable; inbox sync ran: new Slack message for the user$/);
+});
+
 const RATE_LIMITED = new ProviderTurnError("Model provider API error (rate_limit_error): slow down", {
   code: "rate_limit",
   retryable: true,
@@ -1006,10 +1064,9 @@ function fakeFiles(entries: Array<{ name: string; body: string; ownerScopeId?: s
       return counter.opened;
     },
     store: {
-      async listOwnedByScopes(scopes: readonly string[], opts?: { nameQuery?: string; cursor?: string }) {
+      async listOwnedByScopes(scopes: readonly string[], opts?: { name?: string; cursor?: string }) {
         const matching = artifacts.filter(
-          (artifact) =>
-            scopes.includes(artifact.ownerScopeId) && (!opts?.nameQuery || artifact.name.includes(opts.nameQuery)),
+          (artifact) => scopes.includes(artifact.ownerScopeId) && (!opts?.name || artifact.name === opts.name),
         );
         const start = Number(opts?.cursor ?? 0);
         const files = matching.slice(start, start + 50);
@@ -1108,7 +1165,7 @@ test("the inbox sync pass scans since the last clean sync began, untouched by fa
   assert.ok(s.turns.at(-1)?.text?.includes(`since ${new Date(firstStart).toISOString()}`));
 });
 
-test("the voice profile loader takes only the exact file name, paging past other matches", async () => {
+test("the voice profile loader takes only the exact file name", async () => {
   const decoys = Array.from({ length: 60 }, (_, i) => ({ name: `email-voice-profile.md.bak${i}`, body: "old" }));
   const files = fakeFiles([...decoys, { name: EMAIL_VOICE_PROFILE_NAME, body: "Hard rule: opens with hey." }]);
   const loop = { owner: "josh", surface: "inbox:gmail", sources: ["gmail"] } as never;

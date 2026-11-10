@@ -2,7 +2,6 @@ import { isEmbeddingModel, type EmbeddingModel } from "./model-overlay.ts";
 import { gatewayRoot, type ModelGatewayTransportConfig } from "./provider-endpoints.ts";
 import { GATEWAY_MODEL_PREFIX, GATEWAY_PROVIDER, setGatewayModels, type GatewayModel } from "./gateway-models.ts";
 import { modelOfferedInWebui, selectableBaseModels } from "./pi-models.ts";
-import { perTenant } from "../tenants/context.ts";
 import { readBoundedText } from "../util/bytes.ts";
 
 const MAX_BYTES = 2 * 1024 * 1024;
@@ -10,6 +9,7 @@ const MAX_MODELS = 1_000;
 const TTL_MS = 5 * 60_000;
 const RETRY_MS = 30_000;
 const STALE_MS = 15 * 60_000;
+const UNRELIABLE_OUTPUT_LIMIT_FALLBACK = 65_536;
 
 function transientFailure(error: unknown): boolean {
   const status = (error as { status?: unknown } | null)?.status;
@@ -52,11 +52,15 @@ function parseModel(value: unknown, allowed: Set<string>, baseUrl: string): Gate
   }
   if (info.mode !== "chat" || info.supports_function_calling !== true) return undefined;
   const contextWindow = tokens(info.max_input_tokens);
-  const maxTokens = tokens(info.max_output_tokens);
+  const reportedMaxTokens = tokens(info.max_output_tokens);
   const input = price(info.input_cost_per_token);
   const output = price(info.output_cost_per_token);
-  if (!contextWindow || !maxTokens || maxTokens >= contextWindow || input === undefined || output === undefined)
-    return undefined;
+  if (!contextWindow || !reportedMaxTokens || input === undefined || output === undefined) return undefined;
+  const maxTokens =
+    reportedMaxTokens < contextWindow
+      ? reportedMaxTokens
+      : Math.min(UNRELIABLE_OUTPUT_LIMIT_FALLBACK, Math.floor(contextWindow / 2));
+  if (maxTokens < 1) return undefined;
   const providers = Array.isArray(info.providers) ? info.providers : [];
   const anthropic = providers.length > 0 && providers.every((provider) => provider === "anthropic");
   const openai = providers.length > 0 && providers.every((provider) => provider === "openai" || provider === "azure");
@@ -130,23 +134,22 @@ export function createGatewayCatalog(
 ) {
   const root = gatewayRoot(config.url);
   const baseUrl = `${root}/v1`;
-  const discovery = perTenant<{
+  const state: {
     routes: Readonly<Record<string, string>>;
     discovered: boolean;
     retryAt: number;
     lastSuccessAt: number;
     inFlight?: Promise<void>;
-  }>(() => ({ routes: { ...config.models }, discovered: false, retryAt: 0, lastSuccessAt: 0 }));
+  } = { routes: { ...config.models }, discovered: false, retryAt: 0, lastSuccessAt: 0 };
   const transport: ModelGatewayTransportConfig = {
     ...config,
     reservedModelIds: new Set(Object.keys(config.models)),
     refresh,
     get models() {
-      return discovery().routes;
+      return state.routes;
     },
   };
   async function refresh(): Promise<void> {
-    const state = discovery();
     if (state.inFlight) return state.inFlight;
     if (now() < state.retryAt) return;
     state.inFlight = (async () => {

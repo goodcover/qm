@@ -16,6 +16,7 @@ import { createAclStore } from "../src/acl/acl-store.ts";
 import { createResolutionService } from "../src/resolution/resolution-service.ts";
 import { createMockAgent } from "./support/mock-agent.ts";
 import { createAgent } from "../src/agent/agent-run.ts";
+import { createModelRoutes } from "../src/model/model-route.ts";
 import { anthropicStream, contextHeaders, recordRequests } from "./support/gateway-stream.ts";
 import { settle } from "./support/settle.ts";
 import { createPostgresRunSignalStore } from "../src/runs/postgres-run-signal-store.ts";
@@ -380,7 +381,7 @@ test("Open keeps unclassified personal memory out of rooms, loads room memory in
   const personal = scopeId("personal", actor.id);
   const channelScope = scopeId("channel", "C1");
   await config.setSharingPosture(scopeId("org", ORG), "open");
-  await memory.capture(personal, ["PERSONAL_OPEN_MEMORY"], Date.now(), actor.id);
+  await memory.capture(personal, ["PERSONAL_OPEN_MEMORY"], Date.now(), { actorId: actor.id, context: "conversation" });
   const channelConversation: Conversation = {
     kind: "channel",
     threadRef: "C1:memory",
@@ -638,7 +639,10 @@ for (const mode of ["off", "writable", "skip"] as const) {
       isCurrentSharedScopeMember: async () => true,
     });
     await config.setSharingPosture(scopeId("org", ORG), "open");
-    await memory.capture(scopeId("personal", actor.id), ["DO_NOT_RECALL_PRIVATE_NOTE"], Date.now(), actor.id);
+    await memory.capture(scopeId("personal", actor.id), ["DO_NOT_RECALL_PRIVATE_NOTE"], Date.now(), {
+      actorId: actor.id,
+      context: "conversation",
+    });
     for (const text of [
       "!sysprompt",
       "!memorysearch DO_NOT_RECALL_PRIVATE_NOTE",
@@ -684,7 +688,7 @@ test("Open source memory is never exported into a reusable sandbox bearer token"
   const personal = scopeId("personal", actor.id);
   const room = scopeId("channel", "C1");
   await config.setSharingPosture(scopeId("org", ORG), "open");
-  await memory.capture(personal, ["OPEN_TOKEN_PRIVATE"], Date.now(), actor.id);
+  await memory.capture(personal, ["OPEN_TOKEN_PRIVATE"], Date.now(), { actorId: actor.id, context: "conversation" });
   const result = await orchestrator.handleTurn({
     surface: "test",
     actor,
@@ -704,7 +708,7 @@ test("Open source memory is never exported into a reusable sandbox bearer token"
   assert.ok(claims);
   assert.ok(claims.memory?.read.includes(room));
   assert.equal(claims.memory?.read.includes(personal), false);
-  await memory.capture(room, ["ROOM_TOKEN_PRIVATE"], Date.now(), actor.id);
+  await memory.capture(room, ["ROOM_TOKEN_PRIVATE"], Date.now(), { actorId: actor.id, context: "conversation" });
   const dmResult = await orchestrator.handleTurn(dm("dm:U1:open-token", "!run echo ok", { origin: { kind: "human" } }));
   assert.equal(dmResult.status, "ok", dmResult.reason);
   const dmClaims = await verifyCapabilityToken(env.AGENT_API_TOKEN, "test-signing-secret");
@@ -852,14 +856,16 @@ test("carried skill and steer screens tell the model gateway which session they 
   await skills.publish(skill.id);
   const agent = createMockAgent();
   agent.screenSecurity = createAgent({
+    routes: createModelRoutes({
+      modelGateway: {
+        url: "https://gateway.test",
+        apiKey: "k",
+        apiKeyHeader: "api-key",
+        models: { "claude-haiku-4-5": "m" },
+        actorKey: "test-actor-key",
+      },
+    }),
     detectModelId: "claude-haiku-4-5",
-    modelGateway: {
-      url: "https://gateway.test",
-      apiKey: "k",
-      apiKeyHeader: "api-key",
-      models: { "claude-haiku-4-5": "m" },
-      actorKey: "test-actor-key",
-    },
   }).screenSecurity;
   const { orchestrator, config, sessions } = buildOrchestrator({
     skills,
@@ -932,15 +938,17 @@ test("a steer delivered by notification is screened in the context of the turn i
   const signals = createPostgresRunSignalStore(testDatabaseUrl());
   const { orchestrator } = buildOrchestrator({
     agent: createAgent({
-      defaultModelId: "claude-haiku-4-5",
+      routes: createModelRoutes({
+        defaultModelId: "claude-haiku-4-5",
+        modelGateway: {
+          url: "https://gateway.test",
+          apiKey: "k",
+          apiKeyHeader: "api-key",
+          models: { "claude-haiku-4-5": "m" },
+          actorKey: "test-actor-key",
+        },
+      }),
       detectModelId: "claude-haiku-4-5",
-      modelGateway: {
-        url: "https://gateway.test",
-        apiKey: "k",
-        apiKeyHeader: "api-key",
-        models: { "claude-haiku-4-5": "m" },
-        actorKey: "test-actor-key",
-      },
       signals,
     }),
   });

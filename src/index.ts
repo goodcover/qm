@@ -12,7 +12,7 @@ function shutdown(signal: string): void {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log(`[qm] ${signal} received, shutting down`);
-  stopWithBackstop(qm, config.shutdownDrainMs, "qm", () => qm.server.closeAllConnections());
+  stopWithBackstop(qm, config.shutdownDrainMs, "qm");
 }
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));

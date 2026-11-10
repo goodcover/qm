@@ -1,3 +1,4 @@
+import type { PersonaService } from "../../personas/persona-service.ts";
 import type { AdmittedWork } from "../../util/admitted-work.ts";
 import type { TraceCarrier } from "../../../plugins/chassis/src/error-reporting.ts";
 import type { GoalCreateInput } from "../../agent/goal.ts";
@@ -18,6 +19,7 @@ import type {
 import type { SurfaceContextQuery, SurfaceContextResult } from "../../reach/reach.ts";
 import type { TurnOrigin } from "../turn-origin.ts";
 import type { IdentityService } from "../../identity/identity-service.ts";
+import type { UserStore } from "../../identity/user-store.ts";
 import type { ResolutionService } from "../../resolution/resolution-service.ts";
 import type { ModelAccount, OrgBranding, ScopedConfigStore } from "../../resolution/config-store.ts";
 import type { UserModelCredentialStore } from "../../model/user-model-credential-store.ts";
@@ -42,7 +44,7 @@ import type { AuditLog } from "../../audit/audit-log.ts";
 import type { SecurityScreener } from "../../security/security-screener.ts";
 import type { BudgetTracker } from "../../ratelimit/budget.ts";
 import type { ControlService } from "../../api/control-service.ts";
-import type { Agent } from "../../agent/agent.ts";
+import type { Agent, RuntimeChoice, SessionRoute } from "../../agent/agent.ts";
 import type { AdminService } from "../../admin/admin-service.ts";
 import type { ErrorLog } from "../../admin/error-log.ts";
 import type { RunSignalStore } from "../../runs/run-signal-store.ts";
@@ -103,13 +105,14 @@ export interface OrchestratorDeps {
   swarms?: SwarmService;
   refreshModels?: () => Promise<void>;
   identity: IdentityService;
+  users: Pick<UserStore, "record" | "markApps">;
   resolution: ResolutionService;
   config?: ScopedConfigStore;
   defaultTurnWallClockMs?: number;
   userModelCredentials?: UserModelCredentialStore;
   brandingDefault?: OrgBranding;
   surfaces: SurfaceRegistry;
-  resolveBaseModelId?: () => string | undefined;
+  resolveSessionRuntime?: (route: SessionRoute) => Promise<RuntimeChoice>;
   sessions: SessionStore;
   sessionStateBus?: SessionStateBus;
   sessionSyscalls?: SessionSyscallsFactory;
@@ -158,13 +161,14 @@ export interface OrchestratorDeps {
   processes?: ProcessRegistry;
   monitors?: MonitorStore;
   crons?: CronStore;
+  notebookOnlyMemory?: (threadRef: string) => Promise<boolean>;
   webhooks?: WebhookStore;
   control?: ControlService;
   runtime?: RuntimeService;
   validateScheduledRuntime?: (
     scope: import("../../types.ts").ScopeId,
     choice: import("../../agent/agent.ts").RuntimeChoice,
-    purpose?: import("../../resolution/config-store.ts").RuntimePurpose,
+    purpose?: import("../../resolution/config-store.ts").TurnRuntimePurpose,
   ) => Promise<string | null>;
   connectorTokens?: ConnectorTokenStore;
   resolveConnectorClient?: OAuthClientResolver;
@@ -176,6 +180,7 @@ export interface OrchestratorDeps {
   deliveries?: DeliveryStore;
   directory?: DirectoryStore;
   projects?: Pick<ProjectStore, "recognizes" | "name">;
+  personas?: Pick<PersonaService, "forTurn">;
   isCurrentSharedScopeMember?: IsCurrentSharedScopeMember;
   currentScopeMembers?: import("../../resolution/scope-membership.ts").CurrentScopeMembers;
   managedGroups?: Pick<ManagedGroupDirectory, "recognizes" | "members" | "version" | "withVersion" | "slackChannel">;

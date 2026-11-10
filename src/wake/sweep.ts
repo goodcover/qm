@@ -1,7 +1,7 @@
 import { createSweeper, type Sweeper } from "../util/sweeper.ts";
 import type { LeaderLease } from "../persistence/leader-lease.ts";
+import { withTenant } from "../tenants/context.ts";
 import type { EngagedSession } from "./engaged-registry.ts";
-import { inTenantOf } from "../tenants/claim.ts";
 
 const SWEEP_LEASE_KEY = "wake:sweep";
 
@@ -28,7 +28,7 @@ export function createWakeSweep(source: SweepSource, opts: WakeSweepOptions): Wa
     const targets = await source.engagedSessions();
     let fresh = 0;
     for (const { tenantId, threadRef } of targets)
-      fresh += await inTenantOf(tenantId, () => source.sweepSession(threadRef));
+      fresh += await withTenant(tenantId, () => source.sweepSession(threadRef));
     return { swept: targets.length, fresh };
   };
 

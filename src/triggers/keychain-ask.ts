@@ -1,4 +1,3 @@
-import { inTenantOf } from "../tenants/claim.ts";
 import { cronTriggerAuthority } from "../cron/authority.ts";
 import type { Keychain, KeychainAsk, KeychainGrant } from "../credentials/keychain.ts";
 import type { AuditLog } from "../audit/audit-log.ts";
@@ -10,6 +9,7 @@ import { errMessage, swallow } from "../util/errors.ts";
 import { isTransientFailure } from "../core/turn-error.ts";
 import { cronIdOf } from "../sessions/session-store.ts";
 import { samePerson } from "../directory/person.ts";
+import { withTenant } from "../tenants/context.ts";
 
 function resolutionInput(ask: KeychainAsk, grant?: KeychainGrant): string {
   if (ask.status === "approved") {
@@ -147,29 +147,28 @@ export async function fireDropResolution(deps: TriggerDeps, drop: DropResolution
 }
 
 export function createAskExpirySweep(deps: {
-  keychain: Pick<Keychain, "unnotifiedResolvedAsks" | "markAskNotified">;
+  keychain: Keychain;
   fire: (ask: KeychainAsk) => Promise<unknown>;
   auditLog?: AuditLog;
 }): (now: number) => Promise<void> {
-  const settle = async (ask: KeychainAsk, now: number): Promise<void> => {
-    if (ask.status === "expired") {
-      deps.auditLog?.record({
-        at: now,
-        principalId: ask.ownerId,
-        action: "keychain.ask.expire",
-        resource: ask.id,
-        scopeLabel: ask.requesterScopeId,
-      });
-    }
-    try {
-      await deps.fire(ask);
-      await deps.keychain.markAskNotified(ask.id, ask.status);
-    } catch (e) {
-      swallow(`keychain: ask sweep fire failed for ${ask.id} (will retry next tick)`, e);
-    }
-  };
   return async (now) => {
     for (const ask of await deps.keychain.unnotifiedResolvedAsks(now))
-      await inTenantOf(ask.tenantId, () => settle(ask, now));
+      await withTenant(ask.tenantId, async () => {
+        if (ask.status === "expired") {
+          deps.auditLog?.record({
+            at: now,
+            principalId: ask.ownerId,
+            action: "keychain.ask.expire",
+            resource: ask.id,
+            scopeLabel: ask.requesterScopeId,
+          });
+        }
+        try {
+          await deps.fire(ask);
+          await deps.keychain.markAskNotified(ask.id, ask.status);
+        } catch (e) {
+          swallow(`keychain: ask sweep fire failed for ${ask.id} (will retry next tick)`, e);
+        }
+      });
   };
 }

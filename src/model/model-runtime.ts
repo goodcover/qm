@@ -40,7 +40,7 @@ import {
   resolveModel,
 } from "./pi-models.ts";
 import { providerTurnError } from "./provider-error.ts";
-import { perTenant } from "../tenants/context.ts";
+import { perTenant } from "../tenants/cache.ts";
 import { withCleanup } from "../util/errors.ts";
 
 export function piUsageToCallUsage(

@@ -66,12 +66,14 @@ async function world(flags: FeatureName[], next: (turn: Turn, subagent: boolean)
   const featureFlags = createFeatureFlagStore(testMap());
   for (const flag of flags) await featureFlags.setEnabled(flag, scope, true, "test");
   const sidebar: Session[] = [];
+  const signals = createPostgresRunSignalStore(testDatabaseUrl());
   const sessionSyscalls = createSessionSyscalls({
     advisoryLock: testAdvisoryLock(),
     sessions,
     runs,
     mailbox: createSessionMailbox(testMap<SessionMessage>()),
-    signals: createPostgresRunSignalStore(testDatabaseUrl()),
+    signals,
+    steerRun: async (run, signal) => ({ sent: await signals.send(run.id, signal) }),
     maxAttempts: 1,
     conversations: {
       list: async () => sidebar,
@@ -232,7 +234,7 @@ test("the sessions tool lists, starts and messages sessions through the real too
 
 for (const [surface, flags] of [
   ["web", ["persistent_subagents"]],
-  ["slack", ["responsive_spine"]],
+  ["slack", []],
 ] as const) {
   test(`a ${surface} subagent can do what its parent could, except SUBAGENT_EXCEPTIONS`, async () => {
     const w = await world([...flags], script);
