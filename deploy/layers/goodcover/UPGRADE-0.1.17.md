@@ -33,6 +33,10 @@ ancestry-preserving fast-forward, never a squash or rebase.
     (`[pi] fallback … skipped`);
   - company Claude browser requests are refused; company ChatGPT browser requests stay on the
     subscription and off the gateway.
+- **Slack turns delegate.** Slack turns by internal people now run as coordinators that hand
+  command work to subagents and have no `execute` tool. On the company Claude route each
+  subagent turn is another Claude Code query, so one request can use several queries of the
+  subscription's limits.
 - **Claude Fable 5.2** is selectable. On the company Claude subscription it runs through Claude
   Code like the other Claude models, and its fast mode is refused.
 - **MCP admin.** A new server saved without `auth` probes its URL and registers as `oauth-user`
