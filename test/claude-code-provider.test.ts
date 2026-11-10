@@ -582,6 +582,49 @@ test("QM's request hook sees every model call; its system and tools shape a fres
   assert.equal(fake.calls.length, 1);
 });
 
+test("request hook fields and forced tools Claude Code cannot send fail the step before Claude Code starts", async (t) => {
+  const fake = await installFakeClaudeCode(() => ({ text: "must not be used" }));
+  t.after(fake.restore);
+  const cases: Array<[Record<string, unknown>, RegExp]> = [
+    [{ metadata: { user_id: "hook" } }, /cannot send request fields .*: metadata$/],
+    [{ output_config: { effort: "high", format: { type: "json_schema" } } }, /: output_config\.format$/],
+    [{ tool_choice: { type: "tool", name: "missing" } }, /forces the tool missing, which this request does not serve/],
+  ];
+  for (const [added, message] of cases) {
+    const run = await piSession({ anthropic: TOKEN }, [lookupTool([])]);
+    run.session.agent.onPayload = async (payload) => ({ ...(payload as object), ...added });
+    await run.session.prompt("go");
+    await run.close();
+    const failed = lastAssistant(run.session);
+    assert.match(failed.errorMessage ?? "", message);
+    assert.equal(providerTurnError(failed).retryable, false);
+  }
+  assert.equal(fake.calls.length, 0, "Claude Code never started");
+});
+
+test("a request hook's forced tool reaches Claude Code under QM's served name, and a step without it starts a new query", async (t) => {
+  const executed: string[] = [];
+  const fake = await installFakeClaudeCode((request) =>
+    request.messages.some((message) => message.content.some((block) => block.type === "tool_result"))
+      ? { text: "done" }
+      : { tools: [{ id: "toolu_forced", name: "mcp__qm__lookup", input: { key: "kappa" } }] },
+  );
+  t.after(fake.restore);
+  const { session, close } = await piSession({ anthropic: TOKEN }, [lookupTool(executed)]);
+  let requests = 0;
+  session.agent.onPayload = async (payload) =>
+    ++requests === 1 ? { ...(payload as object), tool_choice: { type: "tool", name: "lookup" } } : undefined;
+  await session.prompt("look up kappa");
+  await close();
+  const forced = fake.calls.map(
+    (call) =>
+      (JSON.parse(String(call.options.env?.CLAUDE_CODE_EXTRA_BODY ?? "{}")) as { tool_choice?: unknown }).tool_choice,
+  );
+  assert.deepEqual(forced, [{ type: "tool", name: "mcp__qm__lookup" }, undefined]);
+  assert.deepEqual(executed, ["kappa"]);
+  assert.deepEqual(lastAssistant(session).content, [{ type: "text", text: "done" }]);
+});
+
 test("QM's thinking level reaches the wire through Claude Code as Pi's Anthropic provider sends it", async (t) => {
   const fake = await installFakeClaudeCode(() => ({ text: "ok" }));
   t.after(fake.restore);

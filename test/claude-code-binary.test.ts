@@ -10,6 +10,8 @@ import type { Options } from "@anthropic-ai/claude-agent-sdk";
 import type { Message } from "@earendil-works/pi-ai";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { sleep } from "../src/util/async.ts";
+import { completeBrowserRequest } from "../src/model/browser-completion.ts";
+import { createModelRoutes } from "../src/model/model-route.ts";
 import { resolveModel } from "../src/model/pi-models.ts";
 import {
   CLAUDE_CODE_TEST_SYSTEM,
@@ -35,6 +37,7 @@ interface Captured {
     thinking?: { type?: string; block_binding?: unknown };
     max_tokens?: number;
     output_config?: { effort?: string };
+    tool_choice?: unknown;
   };
 }
 
@@ -380,6 +383,52 @@ test("a hook QM did not configure stops the real binary before any model request
   await run.close();
   assert.match(lastAssistant(run.session).errorMessage ?? "", /SessionStart hook .*QM refuses/);
   assert.equal(api.captured.filter(isTurn).length, 0, "no model request was made");
+  assert.ok(cleanedUp(spawned), "the Claude Code process exited and its directory is gone");
+});
+
+test("a structured browser request on the company Claude subscription forces QM's result tool through the real binary", async (t) => {
+  const answer = { action: "click", selector: "#submit" };
+  const api = await mockMessagesApi(t, {
+    other: (call) =>
+      call.body.tool_choice
+        ? reply(
+            String(call.body.model),
+            { type: "tool_use", id: "toolu_browser", name: "mcp__qm__browser_result", input: answer },
+            "tool_use",
+          )
+        : reply(String(call.body.model), { type: "text", text: "I would click the submit button." }, "end_turn"),
+  });
+  const spawned = await pointClaudeCodeAt(t, api.url);
+  const modelId = "claude-sonnet-5";
+  const route = await createModelRoutes({ apiKey: TOKEN, modelId }).session({});
+  assert.equal(route.billing, "org_subscription");
+  const schema = {
+    type: "object",
+    properties: { action: { type: "string" }, selector: { type: "string" } },
+    required: ["action"],
+  };
+  const completion = await completeBrowserRequest(
+    route,
+    {
+      model: modelId,
+      messages: [
+        { role: "system", content: "You operate a web browser for QM." },
+        { role: "user", content: "Submit the signup form." },
+      ],
+      response_format: { type: "json_schema", json_schema: { name: "browser_step", schema } },
+    },
+    AbortSignal.timeout(30_000),
+  );
+  assert.deepEqual(JSON.parse(completion.choices[0]!.message.content), answer);
+  assert.equal(api.captured.length, 1, "one model request and nothing of Claude Code's own");
+  const call = api.captured[0]!;
+  assert.equal(call.headers.authorization, `Bearer ${TOKEN}`);
+  assert.deepEqual(call.body.tool_choice, { type: "tool", name: "mcp__qm__browser_result" });
+  assert.deepEqual(
+    call.body.tools?.map((tool) => tool.name),
+    ["mcp__qm__browser_result"],
+  );
+  assert.deepEqual(call.body.thinking, { type: "disabled" }, "a forced tool choice goes out with thinking off");
   assert.ok(cleanedUp(spawned), "the Claude Code process exited and its directory is gone");
 });
 
