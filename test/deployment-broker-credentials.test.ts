@@ -118,7 +118,7 @@ test("BROKER_CREDENTIALS fails fast on any malformed entry without echoing secre
   assert.throws(
     () => deploymentBrokerCredentialsFromEnv({ BROKER_CREDENTIALS: "zq7Kp2Wx" }),
     (error: Error) =>
-      /JSON array/.test(error.message) && !`${error.message} ${String(error.cause)}`.includes("zq7Kp2Wx"),
+      /not valid JSON/.test(error.message) && !`${error.message} ${String(error.cause)}`.includes("zq7Kp2Wx"),
   );
   assert.throws(
     () => loadConfig({ ...envWith([{ ...entry, secretEnv: "MISSING_KEY" }]) }),

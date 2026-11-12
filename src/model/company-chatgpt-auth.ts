@@ -1,6 +1,6 @@
 import type { AdvisoryLock } from "../persistence/advisory-lock.ts";
 import type { CredentialFile, Keychain, KeychainCredentialMeta, MaterializedCred } from "../credentials/keychain.ts";
-import { swallow } from "../util/errors.ts";
+import { parseSecretJson, swallow } from "../util/errors.ts";
 import {
   accessExpiresAt,
   asObject,
@@ -101,9 +101,9 @@ function authFromFiles(files: CredentialFile[]): { path: string; auth: JsonObjec
     if (!AUTH_FILE_PATHS.includes(normalized) && !normalized.endsWith("/auth.json")) continue;
     let value: unknown;
     try {
-      value = JSON.parse(Buffer.from(file.contentBase64, "base64").toString("utf8"));
-    } catch {
-      swallow(`chatgpt: unusable auth file ${file.path}`, new Error("not valid JSON"));
+      value = parseSecretJson(Buffer.from(file.contentBase64, "base64").toString("utf8"), "the file");
+    } catch (error) {
+      swallow(`chatgpt: unusable auth file ${file.path}`, error);
       continue;
     }
     const auth = chatgptAuthFromValue(value);

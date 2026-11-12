@@ -4,6 +4,7 @@ import type { EnvelopeStaging } from "./envelope-staging.ts";
 import { botIdentityFromEnv } from "./delivery.ts";
 import { normalizeAllowFrom, parseAllowFrom } from "./allow-from.ts";
 import { trimTrailing, trimTrailingSlashes } from "../util/text.ts";
+import { parseSecretJson } from "../util/errors.ts";
 
 export const NO_RETRY = { retryConfig: { retries: 0 } } as const;
 export const HISTORY_NO_RETRY = { ...NO_RETRY, rejectRateLimitedCalls: true } as const;
@@ -124,14 +125,7 @@ export function slackAccountConfigsFromEnv(env: Record<string, string | undefine
   if (env.DEV_INSTANCE_NO_SLACK === "1") return [];
   const raw = env.SLACK_ACCOUNTS?.trim();
   if (!raw) return [];
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch (err) {
-    throw new Error(`SLACK_ACCOUNTS is not valid JSON: ${err instanceof Error ? err.message : String(err)}`, {
-      cause: err,
-    });
-  }
+  const parsed = parseSecretJson(raw, "SLACK_ACCOUNTS");
   if (!Array.isArray(parsed)) throw new Error("SLACK_ACCOUNTS must be a JSON array of account objects");
   const out: SlackPluginConfig[] = [];
   const seenIds = new Set<string>();

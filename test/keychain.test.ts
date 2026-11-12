@@ -22,7 +22,7 @@ import {
 } from "../src/credentials/keychain.ts";
 import { type DurableMap, type DurableMapSelect } from "../src/persistence/durable-map.ts";
 import { envKey } from "../src/credentials/connector-token.ts";
-import { deriveConnectorKey } from "../src/connectors/connector-client-store.ts";
+import { deriveConnectorKey, encryptSecret } from "../src/connectors/connector-client-store.ts";
 import { mintCapabilityToken, CAPABILITY_TTL_MS, type CapabilityClaims } from "../src/auth/capability-token.ts";
 import { scopeId, type TurnRequest } from "../src/types.ts";
 import { fakeSprites } from "./support/auto-fake-sprites.ts";
@@ -764,6 +764,19 @@ test("single-grant materialize surfaces a 422 (not a raw crypto 500) when the ro
     (e: KeychainError) => e.status === 422,
     "an undecryptable row yields a clean 422, not a crash",
   );
+});
+
+test("a stored secret that is not valid JSON is skipped without logging its contents", async (t) => {
+  const creds = testMap<import("../src/credentials/keychain.ts").KeychainCredential>();
+  const k = createKeychain({ lock: testAdvisoryLock(), creds, grants: testMap(), asks: testMap(), key: KEY });
+  const meta = await k.save({ ownerId: "U1", service: "db", fields: [{ envKey: "DB_PASS", value: "pw" }] });
+  await creds.merge(meta.id, { secretEnc: encryptSecret("zq7Kp2Wx", KEY) });
+  const errors = t.mock.method(console, "error", () => {});
+  assert.deepEqual(await k.materializeOwn("U1"), []);
+  const logged = errors.mock.calls.map((call) => call.arguments.map(String).join(" "));
+  assert.equal(logged.length, 1);
+  assert.match(logged[0]!, /is not valid JSON/);
+  assert.ok(!logged[0]!.includes("zq7Kp2Wx"));
 });
 
 test("multi-input login: each field becomes its own env var, values never in metadata, materializes in order", async () => {

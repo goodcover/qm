@@ -4,6 +4,14 @@ import { WorkAdmissionClosed } from "./admitted-work.ts";
 
 export { errChain as errMessage, failureCode, swallow, swallowAs } from "../../plugins/chassis/src/errors.ts";
 
+export function parseSecretJson(text: string, what: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(`${what} is not valid JSON`);
+  }
+}
+
 export function asError(e: unknown): Error {
   return e instanceof Error ? e : new Error(errMessage(e), { cause: e });
 }

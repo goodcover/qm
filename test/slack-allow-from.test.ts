@@ -72,7 +72,11 @@ test("slackAccountConfigsFromEnv parses accounts as non-singleton email-keyed co
 
 test("slackAccountConfigsFromEnv is empty without SLACK_ACCOUNTS and fails closed on bad input", () => {
   assert.deepEqual(slackAccountConfigsFromEnv({}), []);
-  assert.throws(() => slackAccountConfigsFromEnv({ SLACK_ACCOUNTS: "{not json" }), /not valid JSON/);
+  assert.throws(
+    () => slackAccountConfigsFromEnv({ SLACK_ACCOUNTS: "zq7Kp2Wx" }),
+    (error: Error) =>
+      /not valid JSON/.test(error.message) && !`${error.message} ${String(error.cause)}`.includes("zq7Kp2Wx"),
+  );
   assert.throws(() => slackAccountConfigsFromEnv({ SLACK_ACCOUNTS: "{}" }), /JSON array/);
   assert.throws(() => slackAccountConfigsFromEnv({ SLACK_ACCOUNTS: JSON.stringify([{ botToken: "x" }]) }), /"id"/);
   assert.throws(

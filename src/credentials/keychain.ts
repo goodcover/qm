@@ -4,7 +4,7 @@ import { randomBytes } from "node:crypto";
 import { scopeId as toScopeId, parseScopeId, type Destination, type ScopeId } from "../types.ts";
 import type { DurableMap } from "../persistence/durable-map.ts";
 import { encryptSecret, decryptSecret, type SecretKey } from "../connectors/connector-client-store.ts";
-import { errMessage } from "../util/errors.ts";
+import { errMessage, parseSecretJson } from "../util/errors.ts";
 import { canonicalPerson, personIds, personKey, samePerson } from "../directory/person.ts";
 import { cronIdOf } from "../sessions/session-store.ts";
 import { hashId } from "../util/crypto.ts";
@@ -583,7 +583,7 @@ export function createKeychain(deps: {
     const raw = decryptSecret(rec.secretEnc, deps.key);
     let env: Array<{ key: string; value: string; secret?: boolean }>;
     if (rec.fields) {
-      const values = JSON.parse(raw) as Record<string, string>;
+      const values = parseSecretJson(raw, `credential ${rec.id}`) as Record<string, string>;
       env = rec.fields.map((f) => ({ key: f.envKey, value: values[f.envKey] ?? "", secret: f.secret }));
     } else {
       const envKey = rec.envKey ?? defaultEnvKey(rec.service);
@@ -603,7 +603,7 @@ export function createKeychain(deps: {
   function decryptToFiles(rec: KeychainCredential, extra?: { grantId: string; purpose: string }): MaterializedFileCred {
     const raw = decryptSecret(rec.secretEnc, deps.key);
     const files: CredentialFile[] = rec.targets
-      ? (JSON.parse(raw) as CredentialFile[])
+      ? (parseSecretJson(raw, `credential ${rec.id}`) as CredentialFile[])
       : [{ path: keychainFilePath(rec.target ?? ""), contentBase64: Buffer.from(raw, "utf8").toString("base64") }];
     return {
       credentialId: rec.id,
