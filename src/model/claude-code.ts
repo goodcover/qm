@@ -292,9 +292,8 @@ function claudeCodeTranscript(history: readonly Message[]): TranscriptMessage[] 
 function servedToolChoice(request: ClaudeCodeRequest): ClaudeCodeRequest {
   const choice = request.tool_choice;
   if (choice?.type !== "tool") return request;
-  const served = new Set(request.tools.map((tool) => tool.name));
-  const name = served.has(String(choice.name)) ? String(choice.name) : TOOL_PREFIX + String(choice.name);
-  if (!served.has(name))
+  const name = TOOL_PREFIX + String(choice.name);
+  if (!request.tools.some((tool) => tool.name === name))
     throw new ClaudeCodeFailure(`QM's request hook forces the tool ${choice.name}, which this request does not serve`, {
       type: "invalid_request_error",
     });
