@@ -300,13 +300,17 @@ test("a company refresh cannot overwrite a login replaced immediately before the
 
 test("keychain auth logs which auth file is corrupt instead of treating it as absent", async (t) => {
   const logged: string[] = [];
-  t.mock.method(console, "warn", (...args: unknown[]) => {
-    logged.push(args.map(String).join(" "));
-  });
+  for (const method of ["warn", "error"] as const)
+    t.mock.method(console, method, (...args: unknown[]) => {
+      logged.push(args.map(String).join(" "));
+    });
   const state = keychainState(authJson("acct", FRESH_EXP));
   state.files = [
-    { path: ".codex/auth.json", contentBase64: Buffer.from("{not json").toString("base64") },
-    { path: "other/auth.json", contentBase64: Buffer.from(JSON.stringify({ auth_mode: "apikey" })).toString("base64") },
+    { path: ".codex/auth.json", contentBase64: Buffer.from("zq7Kp2Wx").toString("base64") },
+    {
+      path: "other/auth.json",
+      contentBase64: Buffer.from(JSON.stringify({ auth_mode: "apikey", key: "zq7Kp2Wx" })).toString("base64"),
+    },
   ];
   const auth = keychainCompanyChatGPTAuth({
     lock: testAdvisoryLock(),
@@ -317,4 +321,5 @@ test("keychain auth logs which auth file is corrupt instead of treating it as ab
   assert.equal(await auth.accessToken(), undefined);
   assert.match(logged[0]!, /^\[swallowed\] chatgpt: unusable auth file \.codex\/auth\.json: .*JSON/);
   assert.match(logged[1]!, /^\[swallowed\] chatgpt: unusable auth file other\/auth\.json: not a ChatGPT login/);
+  assert.ok(!logged.some((line) => line.includes("zq7Kp2Wx")));
 });

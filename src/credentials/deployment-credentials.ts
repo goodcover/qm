@@ -1,4 +1,3 @@
-import { errMessage } from "../util/errors.ts";
 import { credentialInjectionError, type CredentialInjection } from "./credential-injection.ts";
 import {
   isComposioHost,
@@ -93,8 +92,8 @@ export function deploymentBrokerCredentialsFromEnv(env: NodeJS.ProcessEnv): Depl
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
-  } catch (error) {
-    throw new Error(`BROKER_CREDENTIALS must be a JSON array (${errMessage(error)})`, { cause: error });
+  } catch {
+    throw new Error("BROKER_CREDENTIALS must be a JSON array, and it is not valid JSON");
   }
   if (!Array.isArray(parsed)) throw new Error("BROKER_CREDENTIALS must be a JSON array");
   const credentials = parsed.map((entry, index) => parseEntry(entry, index, env));
