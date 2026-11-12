@@ -145,7 +145,7 @@ export function keychainCompanyChatGPTAuth(
       return {
         auth: found.auth,
         async write(next) {
-          await deps.keychain.updateFiles(
+          const overruled = await deps.keychain.updateFiles(
             bundle,
             bundle.files.map((file) =>
               file.path === found.path
@@ -154,6 +154,8 @@ export function keychainCompanyChatGPTAuth(
             ),
           );
           cached = undefined;
+          if (overruled.includes(found.path))
+            throw new Error(`the saved login changed during the refresh, so the refreshed ${found.path} was not saved`);
         },
       };
     },
