@@ -157,9 +157,10 @@ it when expired or revoked. The entry's ID is safe to keep in ops configuration.
 ## Upstream updates and CI
 
 Production runs 0.1.16-gc ([UPGRADE-0.1.16.md](UPGRADE-0.1.16.md)); ops holds the exact
-pins. The 0.1.17 source candidate is not deployed. Use [its upgrade guide](UPGRADE-0.1.17.md)
-for its single-service layout, configuration changes and database migration. The version
-notes below are historical.
+pins. The 0.1.19 source candidate is not deployed, and neither was 0.1.17. Moving production
+to 0.1.19 needs both [UPGRADE-0.1.17.md](UPGRADE-0.1.17.md) (single-service layout, configuration
+changes, the 0.1.16 database step) and [UPGRADE-0.1.19.md](UPGRADE-0.1.19.md). The version notes
+below are historical.
 
 The historical 0.1.13 source merge retained Goodcover's Codex 0.156.1 and Claude Agent SDK
 0.3.280, Plain OAuth and MCP catalog support, model reasoning capabilities,
