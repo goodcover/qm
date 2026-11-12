@@ -61,12 +61,12 @@ function fakeKeychain(state: FakeKeychainState): Keychain {
     async updateFiles(
       materialized: { ownerId: string; service: string; files: CredentialFile[]; writeback?: boolean },
       files: CredentialFile[],
-    ) {
-      if (!materialized.writeback) return;
+    ): ReturnType<Keychain["updateFiles"]> {
+      if (!materialized.writeback) return [];
       state.saves.push({ ownerId: materialized.ownerId, service: materialized.service, files });
       state.files = files;
       state.meta = { ...state.meta, fingerprint: `f${state.saves.length}`, updatedAt: state.saves.length };
-      return state.meta;
+      return [];
     },
   } as unknown as Keychain;
 }
@@ -264,6 +264,7 @@ test("a company refresh cannot recreate a login removed while the provider reque
 test("a company refresh cannot overwrite a login replaced immediately before the atomic file update", async (t) => {
   const fixture = await durableAuthFixture();
   const update = fixture.keychain.updateFiles.bind(fixture.keychain);
+  const overruled: string[][] = [];
   t.mock.method(
     fixture.keychain,
     "updateFiles",
@@ -273,10 +274,22 @@ test("a company refresh cannot overwrite a login replaced immediately before the
         service: fixture.saved.service,
         files: credFiles(authJson("acct", FRESH_EXP, "replacement-refresh")),
       });
-      await update(baseline, files);
+      const kept = await update(baseline, files);
+      overruled.push(kept);
+      return kept;
     },
   );
+  const warn = t.mock.method(console, "warn", () => {});
   const result = await fixture.make(refreshTo("acct").refresh).accessToken();
+  assert.deepEqual(overruled, [[".codex/auth.json"]]);
+  const swallowed = warn.mock.calls
+    .map((call) => String(call.arguments[0]))
+    .filter((line) => line.startsWith("[swallowed] chatgpt: company oauth refresh: "));
+  assert.equal(swallowed.length, 1);
+  assert.match(
+    swallowed[0]!,
+    /^\[swallowed\] chatgpt: company oauth refresh: the saved login changed during the refresh, so the refreshed \.codex\/auth\.json was not saved( |$)/,
+  );
   assert.equal(result, accessToken("acct", FRESH_EXP));
   const bundle = (await fixture.keychain.materializeOwnFiles(fixture.saved.ownerId))[0]!;
   const auth = JSON.parse(Buffer.from(bundle.files[0]!.contentBase64, "base64").toString("utf8")) as {
