@@ -21,6 +21,7 @@ import { createPostgresDirectoryStore } from "../src/directory/postgres-director
 import { createPostgresSessionStore } from "../src/sessions/postgres-session-store.ts";
 import { testDatabaseUrl, testMap, testDeployBackings } from "./support/test-database.ts";
 import { createPostgresGrantStore } from "../src/acl/postgres-grant-store.ts";
+import { testTenant as tenant } from "./support/test-tenant.ts";
 
 const auditLog = { record() {}, events: async () => [], tail: async () => [] };
 const GATE_SECRET = "gate-secret";
@@ -362,12 +363,12 @@ test("app shell: manage grants are checked on every navigation and version reque
 test("app shell: a manager from the creation scope can load the app and its assets without a read grant", async () => {
   const f = await widgetFixture();
   try {
-    await f.acl.revoke(f.d.ownerScopeId, `deployment:${f.d.id}`, scopeId("channel", "CBUILT"), "U1");
+    await f.acl.revoke(tenant, f.d.ownerScopeId, `deployment:${f.d.id}`, scopeId("channel", "CBUILT"), "U1");
     await f.directory.replaceChannels(
       [{ channelId: "CBUILT", name: "builders", isPrivate: true }],
       [{ channelId: "CBUILT", principalId: "U2" }],
     );
-    assert.equal(await f.app.canManageDeployment("mysite", "U2"), true);
+    assert.equal(await f.app.canManageDeployment("mysite", { actorId: "U2" }), true);
     assert.equal((await f.app.reachDeployment("mysite", "U2")).status, "denied");
     const headers = { Host: HOST, Cookie: `portal_session=${mintPortalSession("U2")}` };
     const page = await httpGet(f.port, "/", { ...headers, "Sec-Fetch-Dest": "document" });
@@ -466,4 +467,44 @@ test("app shell: annotations default off and follow the signed-in manager flag",
   } finally {
     await f.close();
   }
+});
+
+test("app shell: the version poll tells the top bar who can open the app", async () => {
+  const f = await widgetFixture();
+  try {
+    const headers = { Host: HOST, Cookie: `portal_session=${mintPortalSession("U1")}` };
+    const before = JSON.parse((await httpGet(f.port, "/__claw__/version", headers)).body).access;
+    assert.deepEqual(
+      { level: before.level, label: before.label, canEdit: before.canEdit },
+      { level: "restricted", label: "Shared", canEdit: true },
+      "the fixture app is shared with a viewer and the channel it was built in",
+    );
+    await f.app.shareDeployment(f.d.id, "org:acme", "read", { createdBy: "U1" });
+    const after = JSON.parse((await httpGet(f.port, "/__claw__/version", headers)).body).access;
+    assert.equal(after.level, "org", "a sharing change shows up on the next poll");
+    assert.equal(after.label, "Your organization");
+  } finally {
+    await f.close();
+  }
+});
+
+test("app shell: access summary wording", async () => {
+  const { appAccess } = await import("../src/deploy/app-access.ts");
+  const base = { ownerScopeId: "personal:U1", public: false, grantees: [], viewer: "U1" };
+  assert.equal(appAccess(base).label, "Restricted");
+  assert.equal(appAccess(base).detail, "Only you can open");
+  assert.equal(appAccess({ ...base, public: true, grantees: [{ scope: "org:acme" }] }).level, "public");
+  const people = appAccess({ ...base, grantees: [{ scope: "personal:a" }, { scope: "personal:b" }] });
+  assert.equal(people.label, "2 people");
+  assert.equal(people.level, "restricted");
+  const manager = appAccess({ ...base, viewer: "a", grantees: [{ scope: "personal:a" }] });
+  assert.equal(manager.canEdit, false, "only the owner edits permissions");
+  assert.equal(manager.detail, "Shared with 1 person");
+  const channel = appAccess({ ...base, ownerScopeId: "channel:C1", viewer: "a" });
+  assert.equal(channel.label, "Channel");
+  const mixed = appAccess({ ...base, grantees: [{ scope: "channel:C1" }, { scope: "personal:a" }] });
+  assert.equal(mixed.label, "Shared");
+  assert.equal(mixed.detail, "Shared with 1 channel and 1 person");
+  const org = appAccess({ ...base, grantees: [{ scope: "org:acme" }], orgName: "Acme" });
+  assert.deepEqual([org.label, org.detail], ["Acme", "Anyone signed in to Acme can open"]);
 });

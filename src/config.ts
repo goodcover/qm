@@ -12,10 +12,13 @@ import { isBearerSecret, isStrongSigningSecret } from "./auth/source-auth.ts";
 import { parseSandboxCapabilityTtlMs } from "./auth/capability-token.ts";
 import { existsSync, readdirSync } from "node:fs";
 import {
+  MODEL_PROVIDERS,
   MODEL_REQUEST_CONTEXT_HEADERS,
+  isModelProvider,
   parseProviderBaseUrl,
   providerBaseUrlsFromEnv,
   type ModelGatewayTransportConfig,
+  type ModelProvider,
   type ProviderBaseUrls,
 } from "./model/provider-endpoints.ts";
 import { join, resolve } from "node:path";
@@ -42,11 +45,8 @@ import { parseSharingPosture, type SharingPosture } from "./resolution/sharing-p
 import { slackPluginConfigFromEnv, slackAccountConfigsFromEnv, type SlackPluginConfig } from "./slack/config.ts";
 import {
   DEFAULT_CODEX_MODEL_ID,
-  MODEL_PROVIDERS,
   defaultModelForProvider,
-  isModelProvider,
   onlyProvider,
-  type ModelProvider,
   type ModelProviderAvailability,
 } from "./model/pi-models.ts";
 
@@ -76,7 +76,6 @@ export interface Config extends SandboxSettings, DeploySettings {
   modelId?: string;
   codexAuthCredential?: string;
   claudeAuthCredential?: string;
-  detectModelId?: string;
   titleModelId?: string;
   judgeModelId?: string;
   anthropicApiKey?: string;
@@ -528,7 +527,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ...(env.PI_MODEL ? { modelId: env.PI_MODEL } : {}),
     ...(codexAuthCredential ? { codexAuthCredential } : {}),
     ...(claudeAuthCredential ? { claudeAuthCredential } : {}),
-    ...(env.PI_DETECT_MODEL ? { detectModelId: env.PI_DETECT_MODEL } : {}),
     ...(env.PI_TITLE_MODEL ? { titleModelId: env.PI_TITLE_MODEL } : {}),
     ...(env.PI_JUDGE_MODEL ? { judgeModelId: env.PI_JUDGE_MODEL } : {}),
     ...(env.ANTHROPIC_API_KEY ? { anthropicApiKey: env.ANTHROPIC_API_KEY } : {}),

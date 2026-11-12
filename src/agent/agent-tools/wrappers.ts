@@ -63,7 +63,17 @@ export function withRetrySafety(tool: ToolDefinition, marks: Map<string, RetryMa
   } as ToolDefinition;
 }
 
-const RESOURCE_TOOL_NAMES = new Set(["sandbox", "background", "files", "apps", "skills", "goal", "cron", "admin"]);
+const RESOURCE_TOOL_NAMES = new Set([
+  "sandbox",
+  "background",
+  "files",
+  "apps",
+  "app_files",
+  "skills",
+  "goal",
+  "cron",
+  "admin",
+]);
 const TOOL_APPROVAL_EXEMPT = new Set(["finish_silently", "tool_search", "mcp_call", "withdraw_approval"]);
 const STRICT_TOOL_APPROVAL_REASON = "strict posture: this tool call requires human approval";
 const DECLARED_TOOL_APPROVAL_REASON = "this tool asks for approval before each call";
@@ -95,7 +105,7 @@ function approvalCallText(label: string, params: unknown): string {
 
 export function withToolApprovalGate(
   tool: ToolDefinition & ToolApprovalDeclaration,
-  kit: Pick<ToolKit, "ref" | "recordCall" | "recordResult">,
+  kit: Pick<ToolKit, "ref" | "recordCall" | "recordResult" | "approvalUnavailableResult">,
 ): ToolDefinition {
   const { ref, recordCall, recordResult } = kit;
   if (TOOL_APPROVAL_EXEMPT.has(tool.name)) return tool;
@@ -146,6 +156,11 @@ export function withToolApprovalGate(
       }
       if (callKey ? !gate?.(approvalIdentity, callKey) : gate && !gate(approvalIdentity)) {
         const reason = declaredReason ?? STRICT_TOOL_APPROVAL_REASON;
+        if (ref.approvalUnavailable) {
+          const summary = { tool: tool.name, ...(resourceAction ? { action: resourceAction } : {}), reason };
+          await recordCall(callId, { ...summary, blocked: "approval_unavailable" });
+          return kit.approvalUnavailableResult(callId, summary, reason);
+        }
         ref.pendingApprovals?.push(
           callKey
             ? {

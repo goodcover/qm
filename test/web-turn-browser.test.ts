@@ -80,7 +80,9 @@ const app = {
 } as unknown as App;
 
 const portalSession: NonNullable<ServerDeps["portalSession"]> = { ...browserSessionDeps.portalSession };
-const admin = { adminStatusOf: async ({ id }: { id: string }) => ({ isAdmin: id.startsWith("admin-") }) };
+const admin = {
+  adminStatusOf: async (_tenant: unknown, { id }: { id: string }) => ({ isAdmin: id.startsWith("admin-") }),
+};
 
 async function serve(deps: Partial<ServerDeps> = {}, t?: TestContext): Promise<string> {
   const server = createServer(app, {
@@ -249,7 +251,7 @@ test("attachments ride as blob references, junk attachments are dropped, and the
 test("app editing adds app context beside the exact message, only on the person's own app thread", async () => {
   const turn = await sentTurn({ text: "Make the title smaller", threadRef: "web:alice:app-edit:sample-app" });
   assert.equal(turn.text, "Make the title smaller");
-  assert.match(turn.conversationHeader ?? "", /deployed app "sample-app"/);
+  assert.match(turn.conversationHeader ?? "", /app "sample-app"/);
   for (const threadRef of ["web:alice:ordinary", "web:alice:app-edit:bad/name", "web:bob:app-edit:sample-app"])
     assert.equal((await sentTurn({ threadRef, conversationHeader: "injected" })).conversationHeader, undefined);
 });

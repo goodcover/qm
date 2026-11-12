@@ -304,7 +304,7 @@ test("a scratch computer carries current org skill files at the scoped paths, ne
   const usable = await failing.turn.provisionScratch();
   assert.equal(await failing.turn.provisionScratch(), usable);
   assert.equal(failing.errors.length, 1);
-  const [recorded] = failing.errors[0] as [{ code: string; message: string }];
+  const [, recorded] = failing.errors[0] as [unknown, { code: string; message: string }];
   assert.equal(recorded.code, "tree_materialize_failed");
   assert.match(recorded.message, /^org-helper: /);
 });

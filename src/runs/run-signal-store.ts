@@ -79,10 +79,13 @@ export function waitForClientResult(
       }
     };
     const timer = setTimeout(() => finish("timeout"), opts.timeoutMs);
-    const unsubscribe = signals.onSignal(runId, () => void check());
+    const checkInBackground = (): void => {
+      check().catch(swallowAs("client result check", undefined));
+    };
+    const unsubscribe = signals.onSignal(runId, checkInBackground);
     if (opts.signal?.aborted) return finish("cancelled");
     opts.signal?.addEventListener("abort", onAbort, { once: true });
-    void check();
+    checkInBackground();
   });
 }
 
@@ -159,6 +162,7 @@ export function startSignalPoll(
       });
   };
   const unsubscribe = signals.onSignal(runId, drain);
+  void deliverStop().catch((e: unknown) => opts?.onError?.(e));
   const timer = setInterval(drain, opts?.intervalMs ?? SIGNAL_POLL_MS);
   timer.unref?.();
   return async () => {
@@ -171,5 +175,6 @@ export function startSignalPoll(
       await current;
       if (!draining && inFlight === current) break;
     }
+    await Promise.allSettled([stopCheck]);
   };
 }

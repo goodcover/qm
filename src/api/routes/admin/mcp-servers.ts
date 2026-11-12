@@ -1,9 +1,3 @@
-// Admin CRUD for registered MCP servers.
-//
-// Registration is deliberately admin-only: a registered server is an outbound
-// HTTP destination every scope's agents can call, so it is governed like a
-// model-provider credential, not like a personal connector.
-
 import {
   isValidMcpServerId,
   type McpApprovalPolicy,
@@ -45,7 +39,7 @@ export async function getMcpServers(ctx: ApiCtx): Promise<void> {
   const authorized = await actor(ctx);
   if (!authorized) return;
   if (!ctx.deps.mcpServers) return sendJson(ctx.res, 404, { error: "not_found" });
-  audit(ctx.deps, {
+  audit(ctx, {
     principalId: authorized.id,
     action: "mcp-servers.read",
     resource: "mcp-servers",
@@ -77,7 +71,12 @@ export async function putMcpServer(ctx: ApiCtx): Promise<void> {
       message: "id must be 2-40 chars: lowercase letters, digits, hyphens, starting with a letter",
     });
   }
-  const b = ctx.body as Partial<McpServer> & { validate?: boolean };
+  const body = ctx.body as Partial<McpServer> & { validate?: boolean };
+  const existing = await ctx.deps.mcpServers.get(id);
+  const b: typeof body = {
+    ...existing,
+    ...Object.fromEntries(Object.entries(body).filter(([, v]) => v != null && v !== "")),
+  };
   const url = typeof b.url === "string" ? b.url.trim() : "";
   let parsed: URL;
   try {
@@ -94,7 +93,6 @@ export async function putMcpServer(ctx: ApiCtx): Promise<void> {
       message: "url must not carry credentials, query, or fragment",
     });
   }
-  const existing = await ctx.deps.mcpServers.get(id);
   let discovered: DiscoveredOAuth | undefined;
   const discover = async () => (discovered ??= await discoverOAuth(parsed));
   const probe = !b.auth && !existing && b.validate !== false && parsed.protocol === "https:";
@@ -108,7 +106,7 @@ export async function putMcpServer(ctx: ApiCtx): Promise<void> {
       message: "auth oauth is kept only for servers that already use it; register new servers with oauth-user",
     });
   }
-  const approval = b.approval ?? existing?.approval ?? "annotations";
+  const approval = b.approval ?? "annotations";
   if (!APPROVAL_POLICIES.includes(approval)) {
     return sendJson(ctx.res, 400, {
       error: "bad_request",
@@ -116,8 +114,8 @@ export async function putMcpServer(ctx: ApiCtx): Promise<void> {
     });
   }
   const oauthUser = auth === "oauth-user";
-  const catalog = (b.catalog ?? existing?.catalog) === true;
-  const attestActor = (b.attestActor ?? existing?.attestActor) === true;
+  const catalog = b.catalog === true;
+  const attestActor = b.attestActor === true;
   if ((catalog || attestActor) && oauthUser) {
     return sendJson(ctx.res, 400, {
       error: "bad_request",
@@ -127,9 +125,7 @@ export async function putMcpServer(ctx: ApiCtx): Promise<void> {
   if (oauthUser && PROVIDERS[id]) {
     return sendJson(ctx.res, 400, { error: "bad_request", message: `id ${id} is reserved by a built-in connector` });
   }
-  const credentialScope = oauthUser
-    ? "per-user"
-    : (b.credentialScope ?? existing?.credentialScope ?? (auth === "oauth" ? "per-user" : "shared"));
+  const credentialScope = oauthUser ? "per-user" : (b.credentialScope ?? (auth === "oauth" ? "per-user" : "shared"));
   if (credentialScope !== "shared" && credentialScope !== "per-user") {
     return sendJson(ctx.res, 400, { error: "bad_request", message: "credentialScope must be shared or per-user" });
   }
@@ -143,15 +139,14 @@ export async function putMcpServer(ctx: ApiCtx): Promise<void> {
         "attestActor requires catalog, shared credentials, and bearer or client-credentials auth, so only QM can assert the person",
     });
   }
-  const attestAudience = b.attestAudience ?? (attestActor ? existing?.attestAudience : undefined) ?? "personal";
+  const attestAudience = body.attestAudience ?? (attestActor ? existing?.attestAudience : undefined) ?? "personal";
   if (attestAudience !== "personal" && attestAudience !== "any") {
     return sendJson(ctx.res, 400, { error: "bad_request", message: "attestAudience must be personal or any" });
   }
   if (attestAudience === "any" && !attestActor) {
     return sendJson(ctx.res, 400, { error: "bad_request", message: "attestAudience any requires attestActor" });
   }
-  const credentialHost =
-    b.credentialHost ?? existing?.credentialHost ?? (oauthUser || auth === "oauth" ? parsed.hostname : undefined);
+  const credentialHost = b.credentialHost ?? (oauthUser || auth === "oauth" ? parsed.hostname : undefined);
   if (oauthUser && typeof credentialHost === "string" && !normalizeHost(credentialHost)) {
     return sendJson(ctx.res, 400, { error: "bad_request", message: "credentialHost must be a valid host name" });
   }
@@ -170,15 +165,15 @@ export async function putMcpServer(ctx: ApiCtx): Promise<void> {
       return sendJson(ctx.res, 400, { error: "bad_request", message: `${field} must be an HTTPS URL` });
     }
   }
-  let oauthAuthorizeUrl = httpsUrl(b.oauthAuthorizeUrl) ?? (oauthUser ? existing?.oauthAuthorizeUrl : undefined);
-  let oauthTokenUrl = httpsUrl(b.oauthTokenUrl) ?? (oauthUser ? existing?.oauthTokenUrl : undefined);
+  let oauthAuthorizeUrl = httpsUrl(b.oauthAuthorizeUrl);
+  let oauthTokenUrl = httpsUrl(b.oauthTokenUrl);
   if (auth === "oauth" && credentialHost !== parsed.hostname) {
     return sendJson(ctx.res, 400, {
       error: "bad_request",
       message: "OAuth credentialHost must match the MCP server hostname",
     });
   }
-  const credentialAccountType = b.credentialAccountType ?? existing?.credentialAccountType ?? "default";
+  const credentialAccountType = b.credentialAccountType ?? "default";
   if (!isAccountType(credentialAccountType)) {
     return sendJson(ctx.res, 400, {
       error: "bad_request",
@@ -211,28 +206,28 @@ export async function putMcpServer(ctx: ApiCtx): Promise<void> {
     credentialScope,
     ...(credentialScope === "per-user" || auth === "oauth" ? { credentialHost, credentialAccountType } : {}),
     ...(auth === "oauth" ? { oauthPrincipalId: existing?.oauthPrincipalId ?? authorized.id } : {}),
-    ...(auth === "bearer"
-      ? { bearerToken: typeof b.bearerToken === "string" && b.bearerToken ? b.bearerToken : existing?.bearerToken }
-      : {}),
+    ...(auth === "bearer" ? { bearerToken: b.bearerToken } : {}),
     ...(oauthUser
       ? {
-          clientId: typeof b.clientId === "string" && b.clientId ? b.clientId.trim() : existing?.clientId,
+          clientId: typeof b.clientId === "string" ? b.clientId.trim() : undefined,
           oauthAuthorizeUrl,
           oauthTokenUrl,
-          oauthScopes: parseScopes(b.oauthScopes) ?? existing?.oauthScopes ?? discovered?.scopes ?? [],
+          oauthScopes: parseScopes(b.oauthScopes) ?? discovered?.scopes ?? [],
         }
       : {}),
     ...(auth === "client-credentials"
       ? {
-          clientId: typeof b.clientId === "string" && b.clientId ? b.clientId : existing?.clientId,
-          clientSecret: typeof b.clientSecret === "string" && b.clientSecret ? b.clientSecret : existing?.clientSecret,
+          clientId: b.clientId,
+          clientSecret: b.clientSecret,
         }
       : {}),
+    ...(existing?.tools ? { tools: existing.tools } : {}),
+    ...(existing?.about ? { about: existing.about } : {}),
     ...(approval === "annotations" ? {} : { approval }),
     ...(catalog ? { catalog } : {}),
     ...(attestActor ? { attestActor } : {}),
     ...(attestAudience === "any" ? { attestAudience } : {}),
-    readOnly: (b.readOnly ?? existing?.readOnly) === true,
+    readOnly: b.readOnly === true,
     enabled: b.enabled !== false,
     updatedAt: Date.now(),
     updatedBy: authorized.id,
@@ -278,7 +273,7 @@ export async function putMcpServer(ctx: ApiCtx): Promise<void> {
     }
   }
   await ctx.deps.mcpServers.put(server);
-  audit(ctx.deps, {
+  audit(ctx, {
     principalId: authorized.id,
     action: "mcp-servers.update",
     resource: id,
@@ -294,7 +289,7 @@ export async function deleteMcpServer(ctx: ApiCtx): Promise<void> {
   const id = ctx.params.id ?? "";
   if (!(await ctx.deps.mcpServers.get(id))) return sendJson(ctx.res, 404, { error: "not_found" });
   await ctx.deps.mcpServers.delete(id);
-  audit(ctx.deps, {
+  audit(ctx, {
     principalId: authorized.id,
     action: "mcp-servers.delete",
     resource: id,

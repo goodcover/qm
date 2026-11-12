@@ -1,3 +1,4 @@
+import { testTenant } from "./support/test-tenant.ts";
 import { swarmFixture } from "./support/swarm-fixture.ts";
 import { withResolvedRuntime, resolveRuntimeChoice } from "../src/agent/runtime-choice.ts";
 import { test } from "node:test";
@@ -37,6 +38,7 @@ import { type Item, type NewItem, storedItem } from "../src/sessions/items.ts";
 import type { Sandbox } from "../src/sandbox/sandbox.ts";
 import { scopeId, type Conversation, type Principal } from "../src/types.ts";
 import { singleProcessDeps } from "./support/single-process.ts";
+import { orchestratorTestDeps } from "./support/orchestrator-deps.ts";
 import { createPostgresAuditLog } from "../src/admin/postgres-audit-log.ts";
 import { createPostgresErrorLog } from "../src/admin/postgres-error-log.ts";
 import { createPostgresFileArtifactStore } from "../src/files/postgres-file-artifact-store.ts";
@@ -116,7 +118,7 @@ function buildOrchestrator(
     acl,
   });
   const orch = createOrchestrator({
-    ...singleProcessDeps(),
+    ...orchestratorTestDeps(),
     config,
     identity: createIdentityService(testMap(), { externalMembers: testMap() }),
     resolution: createResolutionService(ORG, config, acl),
@@ -133,7 +135,7 @@ function buildOrchestrator(
     deploy,
     acl,
     maxContextTokens,
-    defaultTurnWallClockMs,
+    ...(defaultTurnWallClockMs !== undefined ? { defaultTurnWallClockMs } : {}),
     runtime: createRuntimeService(
       { config, baseModelDefault: "claude-sonnet-5" },
       { authorizesCapabilityScope: async () => true },
@@ -612,7 +614,9 @@ test("a runaway summarizer output does not commit a compaction checkpoint", asyn
   assert.equal(res.status, "ok");
 
   const deadline = Date.now() + 3_000;
-  while (!(await errors.list({ sessionId: sid })).some((error) => error.code === "background_compaction_failed")) {
+  while (
+    !(await errors.list(testTenant, { sessionId: sid })).some((error) => error.code === "background_compaction_failed")
+  ) {
     assert.ok(Date.now() < deadline, "background compaction never reported failure");
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
@@ -1142,7 +1146,8 @@ test("a teamed owner's swarm worker can start its default computer mid-turn", as
   const teams: TeamStore = {
     list: async () => [],
     forTurn: async () => [team],
-    isMember: async (id) => id === "alice",
+    isMember: async (_tenant, id) => id === "alice",
+    memberTeams: async (_tenant, id, ids) => new Set(id === "alice" ? ids : []),
     apply: async () => {},
   };
   const base = createMockAgent();

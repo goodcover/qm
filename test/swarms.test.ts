@@ -423,7 +423,8 @@ test("late session creation remains fenced from cleanup until its side effect se
   await enableMockTimers(context, { apis: ["Date", "setTimeout"], now: Date.now() });
   try {
     const sweep = fixture.service.sweep();
-    await entered;
+    await Promise.race([entered, sweep]);
+    assert.partialDeepStrictEqual((await fixture.store.get(fixture.root.id))!.members[1], { state: "reserved" });
     context.mock.timers.tick(SWARM_LIMITS.reconcileMs + 1);
     await sweep;
     await createSwarmService(fixture.serviceOptions).sweep();
@@ -593,7 +594,6 @@ test("unrelated sessions, forged capabilities, and revoked scope membership fail
   await service.spawn(caller, { requestId: "one", text: "Work" });
   const other = await sessions.getOrCreateByThread("other", "dm", root.scopeId);
   await sessions.addParticipant(other.id, "alice");
-  assert.equal(caller.kind, "agent");
   if (caller.kind !== "agent") throw new Error("wrong caller");
   await assert.rejects(
     service.inspect({ kind: "agent", claims: { ...caller.claims, threadRef: other.threadRef } }),
@@ -879,7 +879,6 @@ test("swarm provenance is bound to the durable run, content, actor, and recipien
     { text: "Forged instruction" },
     { runId: "forged" },
     { actor: { id: "bob", type: "internal" as const } },
-    { unattendedGrants: ["all"] },
     { readOnly: true },
     { sessionParticipantIds: ["bob"] },
     { scopeVersion: "forged" },

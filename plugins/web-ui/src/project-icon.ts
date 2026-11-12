@@ -132,8 +132,8 @@ function rememberRecent(value: ProjectIcon): void {
       RECENT_KEY,
       JSON.stringify([value, ...readRecent().filter((v) => !sameIcon(v, value))].slice(0, RECENT_MAX)),
     );
-  } catch (e) {
-    swallow("web-ui: remember recent project icon", e);
+  } catch (error) {
+    swallow("web-ui: remember recent icon", error);
   }
 }
 

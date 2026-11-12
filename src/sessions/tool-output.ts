@@ -9,10 +9,12 @@ import { currentTenant } from "../tenants/context.ts";
 const TOOL_OUTPUT_SETTING = "tool_result_inline_tokens";
 export const DEFAULT_INLINE_TOKENS = 4096;
 const CHARS_PER_TOKEN = 4;
-const TOOL_OUTPUT_RETENTION_MS = 30 * 24 * 60 * 60_000;
+export const TOOL_OUTPUT_RETENTION_DAYS = 30;
 const SETTING_CACHE_MS = 30_000;
 const TOOL_OUTPUT_PATH = "tool-output/";
 const DIGEST_DIR = "md5/";
+const UNPARKED_NOTE =
+  " The full output was not kept; rerun the call narrower (filter or paginate it) if you need the rest";
 
 export interface ToolOutputRef {
   blob: string;
@@ -49,13 +51,16 @@ export function parkedOutputKey(path: string): ParkedOutputKey | null {
   return name && !name.includes("/") ? { digest: md5Hex(name), callId: name } : null;
 }
 
+export function inlineChars(inlineTokens: number): number {
+  return inlineTokens > 0 ? inlineTokens * CHARS_PER_TOKEN : Infinity;
+}
+
 export function cutToInline(
   text: string,
   inlineTokens: number,
   where = "",
 ): { text: string; shownChars: number } | null {
-  if (inlineTokens <= 0) return null;
-  const budget = inlineTokens * CHARS_PER_TOKEN;
+  const budget = inlineChars(inlineTokens);
   if (text.length <= budget) return null;
   const head = headSlice(text, Math.floor(budget / 2));
   const tail = tailSlice(text, Math.floor(budget / 2));
@@ -71,7 +76,7 @@ export function cutToolOutput(
   return cutToInline(
     text,
     inlineTokens,
-    ` The full output is in ${TOOL_OUTPUT_PATH}${DIGEST_DIR}${md5Hex(callId)}; reading it with the files tool copies it onto the computer (kept 30 days)`,
+    ` The full output is in ${TOOL_OUTPUT_PATH}${DIGEST_DIR}${md5Hex(callId)}; reading it with the files tool copies it onto the computer (kept ${TOOL_OUTPUT_RETENTION_DAYS} days)`,
   );
 }
 
@@ -81,16 +86,29 @@ export async function inlineTokensOf(store: Pick<ToolOutputStore, "inlineTokens"
     : DEFAULT_INLINE_TOKENS;
 }
 
-export async function parkIfOverCap(
-  store: Pick<ToolOutputStore, "inlineTokens" | "save">,
+export interface InlineCut {
+  text: string;
+  unparkedText: string;
+  shownChars: number;
+}
+
+export async function cutIfOverCap(
+  store: Pick<ToolOutputStore, "inlineTokens">,
   text: string,
   callId: string,
-): Promise<{ text: string; output: ToolOutputRef } | null> {
+): Promise<InlineCut | null> {
   const inlineTokens = await inlineTokensOf(store);
   const cut = cutToolOutput(text, inlineTokens, callId);
-  if (!cut) return null;
+  return cut ? { ...cut, unparkedText: cutToInline(text, inlineTokens, UNPARKED_NOTE)!.text } : null;
+}
+
+export async function parkFullText(
+  store: Pick<ToolOutputStore, "save">,
+  text: string,
+  cut: InlineCut,
+): Promise<ToolOutputRef | null> {
   const blob = await store.save(text).catch(swallowAs("tool output: park full text", null));
-  return blob ? { text: cut.text, output: { blob, chars: text.length, shownChars: cut.shownChars } } : null;
+  return blob ? { blob, chars: text.length, shownChars: cut.shownChars } : null;
 }
 
 async function readText(bytes: DurableByteStore, blobKey: string): Promise<string | null> {
@@ -129,20 +147,20 @@ export function createPostgresToolOutputStore(opts: {
           put.sizeBytes,
           `${TOOL_OUTPUT_PATH}${id}/${put.blobKey}`,
           now(),
-          now() + TOOL_OUTPUT_RETENTION_MS,
+          now() + TOOL_OUTPUT_RETENTION_DAYS * 24 * 60 * 60_000,
         ],
       );
       return put.sha256;
     },
     async read(sessionId, ref) {
       const rows = await opts.pool.q(
-        `SELECT b.storage_key, i.tenant_id::text AS tenant, i.created_at <= now() - interval '30 days' AS expired
+        `SELECT b.storage_key, i.tenant_id::text AS tenant, i.created_at <= now() - make_interval(days => $4) AS expired
            FROM items i
       LEFT JOIN blobs b ON b.tenant_id = i.tenant_id AND b.sha256 = i.blob_sha
           WHERE i.tenant_id = qm_bound_tenant() AND i.session_id = $1 AND i.kind = 'ToolResult'
             AND md5(i.call_id) = $2 AND ($3::text IS NULL OR i.call_id = $3)
             AND i.blob_sha IS NOT NULL`,
-        [sessionId, ref.digest, ref.callId ?? null],
+        [sessionId, ref.digest, ref.callId ?? null, TOOL_OUTPUT_RETENTION_DAYS],
       );
       const row = rows[0];
       if (!row) return null;

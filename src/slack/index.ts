@@ -1,5 +1,5 @@
 import { continueInPrivate } from "./private-continuation.ts";
-import { currentTenant, withTenant } from "../tenants/context.ts";
+import { withTenant } from "../tenants/context.ts";
 import { perTenant } from "../tenants/cache.ts";
 import { externalSlackNamespace, type ExternalSlackAccess } from "./external-access.ts";
 import { registerKeychainApprovalActions } from "./keychain-approvals.ts";
@@ -62,8 +62,8 @@ const slackAccountClients = perTenant(
 export async function startSlackPlugin(
   cfg: SlackPluginConfig,
   core: SlackCoreClient,
+  tenant: string,
 ): Promise<{ stop(): Promise<void> }> {
-  const tenant = currentTenant();
   const accounts = slackAccountClients();
   const EVENTS_MODE = cfg.eventsMode ?? "socket";
   if (!cfg.botToken) {
@@ -182,6 +182,7 @@ export async function startSlackPlugin(
   };
   const app = new App({
     token: BOT_TOKEN,
+    deferInitialization: true,
     ignoreSelf: false,
     receiver: receiver(),
     logLevel: parseLogLevel(cfg.logLevel),
@@ -300,9 +301,6 @@ export async function startSlackPlugin(
         return;
       }
       if (!scope.startsWith("org:")) return;
-      // The org-wide default changed: re-ensure every channel the bot is in. The
-      // ensurer re-reads each scope's effective setting, so explicit per-channel
-      // overrides come out unchanged.
       void (async () => {
         try {
           for await (const res of app.client.paginate("conversations.list", {
@@ -330,22 +328,30 @@ export async function startSlackPlugin(
   const statusAccount = () => `${ids.ownTeamId}:${ids.botUserId}`;
   let statusSync: Promise<void> | undefined;
   const reconcileStatus = () => {
-    statusSync ??= core.sessionStatus
-      ?.reconcile(statusClient, statusAccount())
-      .catch(swallowAs("slack: session status reconciliation", undefined))
+    statusSync ??= Promise.all([
+      core.sessionStatus
+        ?.reconcile(statusClient, statusAccount())
+        .catch(swallowAs("slack: session status reconciliation", undefined)),
+      CORE_SINGLETON || cfg.externalAccess
+        ? core.taskAcknowledgements
+            ?.reconcile(statusClient)
+            .catch(swallowAs("slack: task ack reconciliation", undefined))
+        : undefined,
+    ])
+      .then(() => undefined)
       .finally(() => {
         statusSync = undefined;
       });
     return statusSync;
   };
-  const statusSweep = createSweeper(reconcileStatus, 60_000, { label: "slack session status", immediate: true });
+  const statusSweep = createSweeper(reconcileStatus, 5_000, { label: "slack session status", immediate: true });
   const handler = createTurnHandler({
     accountId: ACCOUNT_LABEL,
     ...(cfg.externalAccess ? { externalAccess: cfg.externalAccess } : {}),
     continuePrivate: (runId, task) => continueInPrivate(core, runId, task, (id) => slackAccountClients().get(id)),
-    onEngaged: (runId, channel, threadTs) => {
+    onEngaged: (runId, channel, threadTs, emoji) => {
       void core.sessionStatus
-        ?.start(statusClient, statusAccount(), runId, channel, threadTs)
+        ?.start(statusClient, statusAccount(), runId, channel, threadTs, emoji)
         .catch(swallowAs("slack: session status start", undefined))
         .finally(() => {
           void reconcileStatus();
@@ -453,6 +459,7 @@ export async function startSlackPlugin(
 
   let auth: AuthTestResponse;
   try {
+    await app.init();
     auth = await app.client.auth.test();
     ids.ownTeamId = auth.team_id ?? "";
     ids.botUserId = auth.user_id ?? "";

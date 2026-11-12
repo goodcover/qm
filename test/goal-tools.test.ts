@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createAgentTools, pauseStampAfterToolCall, type ToolContextRef } from "../src/agent/agent-tools.ts";
 import { createGrindMeter } from "../src/agent/goal.ts";
-import { emptyEndingNote } from "../src/agent/agent-run.ts";
+import { emptyEndingNote } from "../src/agent/turn-wall-clock.ts";
 import {
   GovernorUndecided,
   supersedeGoal,
@@ -749,7 +749,7 @@ test("a swarm-paused worker's next tool result ends its reply", async () => {
       userAborted: false,
       cancelled: false,
       surfaceTools: false,
-      pollFire: false,
+      replyOptional: false,
       ref: { ...ref, modelCalls: 3 },
       session: endedEmpty as unknown as Parameters<typeof emptyEndingNote>[0]["session"],
       turnWallClockMs: 0,

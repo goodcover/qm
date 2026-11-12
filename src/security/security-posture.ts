@@ -58,10 +58,6 @@ ${SECURITY_SCREEN_RUBRIC}
 
 ${SECURITY_SCREEN_OUTPUT_CONTRACT}`;
 
-/**
- * Step recorded on a captured security-screen LLM request. Screening calls are not part of any
- * turn's step sequence, so they are stamped with this sentinel.
- */
 export const SECURITY_SCREEN_STEP = -1;
 
 export interface SecurityScreenVerdict {
@@ -100,7 +96,7 @@ const INTERNAL_RESULT_TOOLS = new Set([
 ]);
 
 export function toolResultProvenance(tool: string, action?: string): ToolResultProvenance {
-  if (tool === "files") return action === "read" ? "workspace" : "internal";
+  if (tool === "files" || tool === "app_files") return action === "read" ? "workspace" : "internal";
   if (tool === "goal" || tool === "apps" || (tool === "skills" && action !== "read")) return "internal";
   if (INTERNAL_RESULT_TOOLS.has(tool)) return "internal";
   if (tool === "read") return "workspace";

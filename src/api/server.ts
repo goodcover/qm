@@ -9,6 +9,8 @@ import {
   type ServerResponse,
   type Server,
 } from "node:http";
+import type { Duplex } from "node:stream";
+import { failUpgrade, isWebSocketUpgrade, responseOnSocket } from "../../plugins/chassis/src/websocket-relay.ts";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest, type HTTPMethods } from "fastify";
 import type { App } from "./app.ts";
 import type { ServerDeps } from "./deps.ts";
@@ -23,11 +25,13 @@ import {
 import { CONTROL_PLANE_AUD, type CapabilityClaims } from "../auth/capability-token.ts";
 import { bootTenant } from "../tenants/boot.ts";
 import { capabilityToken, identityTenant, requestCapability, withRequestTenant } from "./request-tenant.ts";
+import type { Tenant } from "../tenants/context.ts";
 import { inboundKey, withInboundTenant } from "./inbound-tenant.ts";
 import { verifyPortalIdentity, PORTAL_IDENTITY_HEADER, type PortalIdentity } from "../auth/portal-identity.ts";
 import { errMessage } from "../util/errors.ts";
 import { parseScopeId, scopeId } from "../types.ts";
 import { canonicalPayload } from "../../plugins/chassis/src/source-auth-sign.ts";
+import { KEEP_ALIVE_TIMEOUT_MS, logUnansweredCloses } from "../../plugins/chassis/src/http.ts";
 import { armBodyDeadline, PayloadTooLargeError, readRawBody, sendJson, verifyOrReject } from "./http.ts";
 import {
   findRoute,
@@ -41,7 +45,7 @@ import {
 import { apiRoutes, rawRoutes } from "./routes/index.ts";
 import { proxyDeploymentSubdomain } from "./routes/deployments.ts";
 import { CAPABILITY_HEADER } from "./contract.ts";
-import { livePersonCapability } from "./artifact-share.ts";
+import { livePersonCapability, personAtKeyboard } from "./artifact-share.ts";
 import { canonicalPerson, samePerson } from "../directory/person.ts";
 import {
   apiAlias,
@@ -51,21 +55,25 @@ import {
   withBrowserActor,
 } from "./browser-session.ts";
 
+const WRITE_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+const ADMIN_WRITE_NEEDS_PERSON =
+  "admin changes need the admin at the keyboard — a cron, webhook or loop fire carries its owner's authority to read, not to change the org. Report what you would change where the run delivers and let them confirm it on a turn they send.";
+
 async function capabilityAdminDenied(
   access: AdminAccess,
   params: Record<string, string>,
   url: URL,
   claims: CapabilityClaims,
   config: ServerDeps["config"],
+  method: string,
 ): Promise<string | null> {
   if (access.agent === "anyone") return null;
   if (claims.aud !== CONTROL_PLANE_AUD) return "admin routes require the per-turn agent token";
-  if (!livePersonCapability(claims) && !(access.unattended && claims.grants?.includes(access.unattended.grant))) {
-    return access.unattended
-      ? `admin actions through the agent require a turn the admin started themselves — this autonomous run lacks the unattended grant ${access.unattended.grant}, which only a cron's org-admin owner can add, from a live turn in their own DM. Report this failure where the run delivers instead of finishing silently.`
-      : "admin actions through the agent require a turn the admin started themselves — autonomous turns (crons, webhooks) cannot use this route. Report this failure where the run delivers instead of finishing silently.";
+  if (!livePersonCapability(claims)) {
+    return "admin actions through the agent carry a person's own authority — this turn runs with none (e.g. a bot actor, an external audience, a task an automated turn wrote or a conversation owns, a background-job or swarm wake, a loop follow-up someone other than its owner sent, or a session message whose authorization chain could not be verified). Report this failure where the run delivers instead of finishing silently.";
   }
   if (typeof access.agent === "object") return access.agent.portalOnly;
+  if (WRITE_METHODS.has(method) && !personAtKeyboard(claims)) return ADMIN_WRITE_NEEDS_PERSON;
   if (access.privateRead && parseScopeId(claims.scopeId).kind !== "personal") {
     const target =
       access.privateRead === "unless-org-scope" ? (params.scope ?? url.searchParams.get("scope") ?? "") : "";
@@ -79,8 +87,6 @@ async function capabilityAdminDenied(
   }
   return null;
 }
-
-const WRITE_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 
 function needlessEscape(escaped: string): boolean {
   const char = String.fromCharCode(Number.parseInt(escaped.slice(0, 2), 16));
@@ -124,6 +130,7 @@ async function verifyCapability(
   method: string,
   pathname: string,
   required: { aud: string; bearer?: true } | null,
+  tenant: Tenant | undefined,
 ): Promise<CapabilityClaims | null> {
   const requiredAud = required?.aud ?? null;
   const capToken = capabilityToken(req, required?.bearer === true);
@@ -168,7 +175,7 @@ async function verifyCapability(
   }
   if (
     !(capability.externalSlack
-      ? await externalSlackCapabilityAllowed(capability, deps)
+      ? tenant !== undefined && (await externalSlackCapabilityAllowed(tenant, capability, deps))
       : await app.authorizesCapabilityScope({
           actorId: capability.actorId,
           scopeId: capability.scopeId,
@@ -204,6 +211,7 @@ async function gate(
   raw: string,
   route: Pick<Route, "auth" | "actor" | "admin" | "allowedInStrict" | "browser"> | undefined,
   params: Record<string, string>,
+  tenant: Tenant | undefined,
 ): Promise<GateResult | null> {
   const routeAuth = route?.auth;
   const { deps, secret, auth, requirePortalIdentity, allowUnsignedSourceAuth } = wiring;
@@ -216,7 +224,7 @@ async function gate(
   if (isPublicRoute) {
     void isPublicRoute;
   } else if (requiredAud || capToken) {
-    capability = await verifyCapability(req, res, wiring, method, pathname, requiredAuth);
+    capability = await verifyCapability(req, res, wiring, method, pathname, requiredAuth, tenant);
     if (!capability) return null;
     if (routeAuth === "either") {
       if (capability.aud !== undefined && capability.aud !== CONTROL_PLANE_AUD) {
@@ -224,13 +232,13 @@ async function gate(
         return null;
       }
       if (route?.admin) {
-        const denied = await capabilityAdminDenied(route.admin, params, url, capability, deps.config);
+        const denied = await capabilityAdminDenied(route.admin, params, url, capability, deps.config, method);
         if (denied) {
           sendJson(res, 403, { error: "forbidden", message: denied });
           return null;
         }
       }
-    } else if (!requiredAud) {
+    } else if (route && !requiredAud) {
       sendJson(res, 403, { error: "forbidden", message: "capability token not valid for this route" });
       return null;
     }
@@ -248,6 +256,7 @@ async function gate(
   ) {
     return null;
   }
+  if (!route) return { body: {}, capability, actor: null };
   let body: unknown = {};
   if (raw) {
     try {
@@ -275,7 +284,7 @@ async function gate(
     const rawToken = req.headers[PORTAL_IDENTITY_HEADER];
     const token = Array.isArray(rawToken) ? rawToken[0] : rawToken;
     if (browser) {
-      const signedIn = await browserIdentity(req, method, deps, route?.browser === "embed");
+      const signedIn = await browserIdentity(req, method, deps, route?.browser === "embed", tenant);
       if ("status" in signedIn) {
         sendJson(res, signedIn.status, { error: signedIn.error, message: signedIn.message });
         return null;
@@ -285,6 +294,8 @@ async function gate(
         return null;
       }
       actor = signedIn;
+      const release = await deps.web?.shell.release();
+      if (release) res.setHeader("x-qm-release", release);
     } else actor = token && psecret ? await verifyPortalIdentity(token, psecret, Date.now()) : null;
     if (actor && deps.identity) {
       const identity = deps.identity;
@@ -340,9 +351,21 @@ function assertedActorValues(field: string, url: URL, body: unknown): unknown[] 
   return body && typeof body === "object" && Object.hasOwn(body, name) ? [(body as Record<string, unknown>)[name]] : [];
 }
 
+const requestTenants = new WeakMap<IncomingMessage, Tenant>();
+
 function baseCtx(req: IncomingMessage, res: ServerResponse, wiring: Wiring): BaseCtx {
   const url = new URL(req.url ?? "/", "http://localhost");
-  return { req, res, ...wiring, url, pathname: url.pathname, method: req.method ?? "GET", params: {} };
+  const tenant = requestTenants.get(req);
+  return {
+    req,
+    res,
+    ...wiring,
+    url,
+    pathname: url.pathname,
+    method: req.method ?? "GET",
+    params: {},
+    ...(tenant ? { tenant } : {}),
+  };
 }
 
 function respondError(req: IncomingMessage, res: ServerResponse, err: unknown): void {
@@ -399,6 +422,7 @@ function buildFastify(wiring: Wiring, server: Server): { fastify: FastifyInstanc
         raw,
         found?.route,
         found?.params ?? {},
+        base.tenant,
       );
       if (!g) return;
       if (found) {
@@ -411,7 +435,10 @@ function buildFastify(wiring: Wiring, server: Server): { fastify: FastifyInstanc
         await run(found.route, found.params, ctx);
         return;
       }
-      sendJson(res, 404, { error: "not_found", message: `${base.method} ${base.pathname}` });
+      sendJson(res, 404, {
+        error: "not_found",
+        message: `no route ${base.method} ${base.pathname}; GET /v1/apis lists the available calls`,
+      });
     } catch (err) {
       respondError(req, res, err);
     }
@@ -456,6 +483,7 @@ function buildFastify(wiring: Wiring, server: Server): { fastify: FastifyInstanc
       raw,
       request.routeOptions.config.route,
       request.params as Record<string, string>,
+      requestTenants.get(request.raw),
     );
     if (!result) {
       reply.hijack();
@@ -511,7 +539,7 @@ function buildServer(app: App, deps: ServerOptions, allowUnsignedSourceAuth: boo
       : null;
   const wiring: Wiring = {
     app,
-    deps: { ...deps, control: createControlService(app, deps.scheduler, deps.admin) },
+    deps: { ...deps, control: createControlService(app, deps.scheduler) },
     secret: deps.signingSecret,
     auth,
     requirePortalIdentity,
@@ -524,15 +552,32 @@ function buildServer(app: App, deps: ServerOptions, allowUnsignedSourceAuth: boo
       respondError(req, res, err),
     );
   });
+  server.on("upgrade", (req: IncomingMessage, socket: Duplex, head: Buffer) => {
+    socket.on("error", () => socket.destroy());
+    void upgradeFront(req, socket, head).catch((error: unknown) => failUpgrade(socket, "deployment-websocket", error));
+  });
   const { fastify, routing } = buildFastify(wiring, server);
   const ready = Promise.resolve(fastify.ready());
   ready.catch((err: unknown) => console.error("[server] fastify initialization failed:", errMessage(err)));
   server.requestTimeout = 0;
   server.headersTimeout = 10_000;
-  server.keepAliveTimeout = 5_000;
+  server.keepAliveTimeout = KEEP_ALIVE_TIMEOUT_MS;
   server.maxConnections = 1024;
+  logUnansweredCloses(server, "core");
 
   const capabilitySecret = deps.capabilitySecret ?? deps.signingSecret;
+  async function upgradeFront(req: IncomingMessage, socket: Duplex, head: Buffer): Promise<void> {
+    const res = isWebSocketUpgrade(req) ? responseOnSocket(req, socket) : null;
+    if (!res) return void socket.destroy();
+    const base: BaseCtx = { ...baseCtx(req, res, wiring), upgrade: { socket, head } };
+    await withRequestContext("core", req, res, () =>
+      inRequestTenant(req, res, base, null, async () => {
+        if (await proxyDeploymentSubdomain(base)) return nameRequest(base.method, "/deployment-proxy/websocket");
+        sendJson(res, 404, { error: "not_found" });
+      }),
+    );
+  }
+
   async function front(req: IncomingMessage, res: ServerResponse): Promise<void> {
     let base = baseCtx(req, res, wiring);
     const alias = appHostRequest(req, deps) ? null : apiAlias(base.method, base.pathname);
@@ -542,13 +587,30 @@ function buildServer(app: App, deps: ServerOptions, allowUnsignedSourceAuth: boo
     }
     const raw = findRoute(rawRoutes, base.method, base.pathname);
     const matched = raw ? null : findRoute(apiRoutes, base.method, base.pathname);
-    const route = (raw ?? matched)?.route;
-    const inbound = inboundKey(req, deps, raw ?? matched, base.url);
+    await inRequestTenant(req, res, base, raw ?? matched, () => serve(req, res, base, raw, matched));
+  }
+
+  async function inRequestTenant(
+    req: IncomingMessage,
+    res: ServerResponse,
+    base: BaseCtx,
+    found: Matched<BaseCtx> | Matched<ApiCtx>,
+    then: () => Promise<void>,
+  ): Promise<void> {
+    const route = found?.route;
+    const next = (tenant: Tenant | undefined): Promise<void> => {
+      if (tenant) {
+        requestTenants.set(req, tenant);
+        base.tenant = tenant;
+      }
+      return then();
+    };
+    const inbound = inboundKey(req, deps, found, base.url);
     if (inbound)
       return withInboundTenant(
         app,
         inbound,
-        () => serve(req, res, base, raw, matched),
+        next,
         async () =>
           (await identityTenant(req, deps.portalIdentitySecret ?? deps.signingSecret)) ??
           (usesBrowserSession(req, route) ? (browserSessionTenant(req, deps) ?? bootTenant()) : undefined),
@@ -559,7 +621,7 @@ function buildServer(app: App, deps: ServerOptions, allowUnsignedSourceAuth: boo
       route,
       capabilitySecret,
       bootTenant(),
-      () => serve(req, res, base, raw, matched),
+      next,
       deps.portalIdentitySecret ?? deps.signingSecret,
       () => (usesBrowserSession(req, route) ? browserSessionTenant(req, deps) : undefined),
     );
@@ -584,7 +646,7 @@ function buildServer(app: App, deps: ServerOptions, allowUnsignedSourceAuth: boo
     if (raw) {
       const routeAuth = raw.route.auth;
       if (typeof routeAuth === "object") {
-        base.capability = await verifyCapability(req, res, wiring, base.method, base.pathname, routeAuth);
+        base.capability = await verifyCapability(req, res, wiring, base.method, base.pathname, routeAuth, base.tenant);
         if (!base.capability) return void req.resume();
       }
       await run(raw.route, raw.params, base);

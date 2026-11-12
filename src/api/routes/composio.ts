@@ -2,14 +2,13 @@ import { hasSlackAccount } from "./slack-composio.ts";
 import { slackReply } from "./slack-reply.ts";
 import { nativeSlackConfigured, nativeSlackConnection } from "./slack-native.ts";
 import { isBackendCredential } from "../../credentials/keychain.ts";
-import { livePersonCapability } from "../artifact-share.ts";
+import { livePersonCapability, personAtKeyboard } from "../artifact-share.ts";
 import { verifySignedPayload } from "../../auth/signed-token.ts";
 import { canonicalPerson, personIds, samePerson } from "../../directory/person.ts";
 import { PrincipalLinkError } from "../../identity/principal-links.ts";
 import { createHash } from "node:crypto";
 import { scopeId } from "../../types.ts";
 import { parseRef } from "../../acl/resource-ref.ts";
-import { currentTenant } from "../../tenants/context.ts";
 import { orgId } from "../../config.ts";
 import { externalOrgId } from "../../tenants/external-org.ts";
 import { entitledScopes } from "../../resolution/context-filter.ts";
@@ -18,7 +17,7 @@ import { redactSecrets } from "../../../plugins/chassis/src/redact-secrets.ts";
 import { createExactSecretValueMasker } from "../../security/secret-masking.ts";
 import { errMessage, httpFailure, reportFailure } from "../../util/errors.ts";
 import { activePrincipal, audit } from "./shared.ts";
-import type { ApiCtx, Route } from "./route.ts";
+import { tenantOf, type ApiCtx, type Route } from "./route.ts";
 
 export const ACCOUNT_ID = /^ca_[a-zA-Z0-9_-]+$/;
 
@@ -113,6 +112,7 @@ export async function credential(ctx: ApiCtx): Promise<{ key: string; principal:
   }
   const grants =
     (await ctx.deps.acl?.grantsOfKind(
+      tenantOf(ctx),
       "service-cred",
       audience,
       ctx.capability?.scopeId ?? personal,
@@ -272,7 +272,7 @@ const SCOPES_TTL_MS = 5 * 60_000;
 const scopeCache = new Map<string, { scopes: string[]; expiresAt: number }>();
 
 async function configuredScopes(ctx: ApiCtx, key: string, authConfigId: string): Promise<string[]> {
-  const cacheKey = JSON.stringify([currentTenant(), authConfigId]);
+  const cacheKey = JSON.stringify([tenantOf(ctx).id, authConfigId]);
   const cached = scopeCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) return cached.scopes;
   try {
@@ -341,7 +341,7 @@ async function connections(ctx: ApiCtx): Promise<void> {
 }
 
 async function disconnect(ctx: ApiCtx): Promise<void> {
-  if ((ctx.capability && !livePersonCapability(ctx.capability)) || ctx.actor?.imp)
+  if ((ctx.capability && !personAtKeyboard(ctx.capability)) || ctx.actor?.imp)
     return sendJson(ctx.res, 403, { error: "human_consent_required" });
   const access = await credential(ctx);
   if (!access) return;
@@ -354,7 +354,7 @@ async function disconnect(ctx: ApiCtx): Promise<void> {
     const { toolkit } = owned;
     if (!(await activeRun(ctx))) return;
     await request(ctx, access.key, `/connected_accounts/${encodeURIComponent(accountId)}`, undefined, 20_000, "DELETE");
-    audit(ctx.deps, {
+    audit(ctx, {
       principalId: access.principal,
       action: "composio.disconnected",
       resource: `${toolkit}/${accountId}`,
@@ -447,7 +447,7 @@ async function execute(ctx: ApiCtx): Promise<void> {
     if (!(await activeRun(ctx))) return;
     if (!composioUserIds(access.principal).includes(String(account.user_id)))
       return sendJson(ctx.res, 403, { error: "connection_not_authorized" });
-    audit(ctx.deps, {
+    audit(ctx, {
       principalId: access.principal,
       action: "composio.execute.started",
       resource,
@@ -465,7 +465,7 @@ async function execute(ctx: ApiCtx): Promise<void> {
       },
       EXECUTE_TIMEOUT_MS,
     );
-    audit(ctx.deps, {
+    audit(ctx, {
       principalId: access.principal,
       action: "composio.execute.completed",
       resource,
@@ -477,7 +477,7 @@ async function execute(ctx: ApiCtx): Promise<void> {
       error: result.error ?? null,
     });
   } catch (error) {
-    audit(ctx.deps, {
+    audit(ctx, {
       principalId: access.principal,
       action: "composio.execute.failed",
       resource,
@@ -711,7 +711,7 @@ async function completeSlack(ctx: ApiCtx): Promise<void> {
         linkedBy: access.principal,
       });
       await deps.identity?.refresh(true);
-      audit(deps, {
+      audit(ctx, {
         principalId: access.principal,
         action: "principal_link.create",
         resource: `${member.principalId} -> ${access.principal}`,

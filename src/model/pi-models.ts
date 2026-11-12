@@ -17,7 +17,12 @@ import {
   type ModelOverlay,
 } from "./model-overlay.ts";
 import { MODEL_REGISTRY, type ModelEntry } from "./model-registry.ts";
-import { providerBaseUrl, CODEX_SUBSCRIPTION_PROVIDER } from "./provider-endpoints.ts";
+import {
+  CODEX_SUBSCRIPTION_PROVIDER,
+  MODEL_PROVIDERS,
+  providerBaseUrl,
+  type ModelProvider,
+} from "./provider-endpoints.ts";
 import { type CustomRuntimeModel, isCustomModelId, resolveCustomModel } from "./custom-providers.ts";
 import type { ProviderKeys } from "./model-runtime.ts";
 
@@ -81,13 +86,6 @@ export function thinkingLevelsFor(modelId?: string): readonly string[] {
     return true;
   });
 }
-export const MODEL_PROVIDERS = ["anthropic", "openai", "openrouter"] as const;
-export type ModelProvider = (typeof MODEL_PROVIDERS)[number];
-
-export function isModelProvider(value: unknown): value is ModelProvider {
-  return typeof value === "string" && (MODEL_PROVIDERS as readonly string[]).includes(value);
-}
-
 type PiModel = Model<Api>;
 
 export function isOverlayModel(id: string): boolean {
@@ -139,22 +137,15 @@ export function overlayModelCatalog(): Array<{ id: string; name: string; provide
     .map(({ id, name, provider }) => ({ id, name, provider }));
 }
 
-export function defaultWebuiModelIds(): readonly string[] {
-  return [
-    ...DEFAULT_WEBUI_MODEL_IDS,
-    ...gatewayModelCatalog(true).map((m) => m.id),
-    ...chatOverlays()
-      .filter((m) => m.webui)
-      .map((m) => m.id),
-  ];
-}
-
 export function fastModeModelIds(): readonly string[] {
   return [
     ...FAST_MODE_MODEL_IDS.filter(modelSupportsFastMode),
     ...chatOverlays()
       .filter((m) => modelSupportsFastMode(m.id))
       .map((m) => m.id),
+    ...gatewayModelCatalog(true)
+      .map((m) => m.id)
+      .filter(modelSupportsFastMode),
   ];
 }
 
@@ -164,8 +155,6 @@ const OPENROUTER_CATALOG_MODELS = new Map<string, PiModel>();
 export function modelDisplayName(id: string): string {
   return overlayModel(id)?.name ?? REGISTRY_BY_ID.get(id)?.name ?? OPENROUTER_CATALOG_MODELS.get(id)?.name ?? id;
 }
-
-export const DEFAULT_WEBUI_MODEL_IDS: readonly string[] = MODEL_REGISTRY.filter((m) => m.webui).map((m) => m.id);
 
 export const SELECTABLE_BASE_MODELS: ReadonlyArray<{ id: string; name: string }> = MODEL_REGISTRY.filter(
   (m) => m.base,
@@ -433,6 +422,7 @@ export function modelSupportsFastMode(modelId: string | undefined): boolean {
   return (
     (overlay && !isEmbeddingModel(overlay) ? overlay.fastMode : undefined) ??
     REGISTRY_BY_ID.get(modelId)?.fastMode ??
+    resolveGatewayModel(modelId)?.fastMode ??
     false
   );
 }

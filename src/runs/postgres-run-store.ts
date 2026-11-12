@@ -1,15 +1,24 @@
+import type { Tenant } from "../tenants/context.ts";
 import { randomUUID } from "node:crypto";
 import { createPgPool } from "../persistence/pg-pool.ts";
 import { jsonbStringify, pgTextSafe } from "../util/text.ts";
 import { isObj } from "../util/objects.ts";
 import type { TurnResult } from "../types.ts";
-import type { OrchestratorInput } from "../core/orchestrator.ts";
-import type { EnqueueInput, EnqueueResult, ReapEvent, Run, RunDeliveryState, RunStop, RunStore } from "./run-store.ts";
-import type { RunPriority } from "./run-store.ts";
+import type { EnqueueInput, EnqueueResult, ReapEvent, Run, RunStop, RunStore } from "./run-store.ts";
 import { countedClaims, isTerminal, runPriority, stopErrorCode, withTraceCarrier } from "./run-store.ts";
 import { tenantTables } from "../tenants/migrations.ts";
 import { createRunWatch, NOTIFY_SESSION_AVAILABLE } from "./run-watch.ts";
-import { claimFunction, claimRows, claimThenBind, claimThenLoad, type ClaimedRow } from "../tenants/claim.ts";
+import { createRunReturns, PENDING_RETURNS } from "./run-returns.ts";
+import { createRunReads } from "./run-reads.ts";
+import { parked, rowToRun, turnOrder } from "./run-rows.ts";
+import {
+  claimFunction,
+  claimRows,
+  claimThenBind,
+  claimThenLoad,
+  servingTenant,
+  type ClaimedRow,
+} from "../tenants/claim.ts";
 
 export interface PostgresRuntime {
   runs: RunStore;
@@ -19,42 +28,6 @@ export interface PostgresRuntime {
 function isUniqueViolation(err: unknown): boolean {
   return isObj(err) && err.code === "23505";
 }
-
-function rowToRun(r: Record<string, unknown>): Run {
-  const request = JSON.parse(r.request as string) as OrchestratorInput;
-  return {
-    id: r.id as string,
-    tenantId: String(r.tenant_id),
-    sessionId: r.session_id as string,
-    status: r.status as Run["status"],
-    request,
-    result: r.result != null ? (JSON.parse(r.result as string) as TurnResult) : null,
-    deliveryState: r.delivery_state != null ? (JSON.parse(r.delivery_state as string) as RunDeliveryState) : null,
-    turnUserSeq: r.turn_user_seq != null ? Number(r.turn_user_seq) : null,
-    dedupKey: (r.idempotency_key as string | null) ?? null,
-    attempts: Number(r.attempts),
-    errorAttempts: Number(r.error_attempts),
-    maxAttempts: Number(r.max_attempts),
-    priority: Number(r.claim_priority) as RunPriority,
-    preemptions: Number(r.preemptions),
-    leaseToken: (r.lease_token as string | null) ?? null,
-    leaseExpiresAt: r.lease_expires_at === null ? null : Number(r.lease_expires_at),
-    workerId: (r.worker_id as string | null) ?? null,
-    createdAt: Number(r.created_at),
-    startedAt: r.started_at === null ? null : Number(r.started_at),
-    finishedAt: r.finished_at === null ? null : Number(r.finished_at),
-    lastStop: r.last_stop != null ? (JSON.parse(r.last_stop as string) as RunStop) : null,
-  };
-}
-
-const parked = (run: string) => `(${run}.claim_priority > 0 AND ${run}.last_stop::jsonb->>'kind' = 'parked')`;
-
-const turnOrder = (run: string) => `(CASE WHEN ${run}.claim_priority <> 0 THEN 1
-    WHEN EXISTS (
-      SELECT 1 FROM runs ahead WHERE ahead.tenant_id=${run}.tenant_id AND ahead.session_id=${run}.session_id AND ahead.status='pending'
-        AND ahead.claim_priority > 0 AND ${parked("ahead")} IS NOT TRUE
-        AND (ahead.created_at, ahead.seq) < (${run}.created_at, ${run}.seq)
-    ) THEN 1 ELSE 0 END), ${run}.created_at, ${run}.seq`;
 
 const before = (a: string, b: string) => `(CASE
     WHEN ${parked(a)} IS NOT TRUE AND ${parked(b)} IS NOT TRUE
@@ -72,26 +45,14 @@ const claimable = (
     OFFSET 0
   )`;
 
-const PENDING_RETURNS = `SELECT * FROM (
-           SELECT * FROM runs WHERE status IN ('done','failed') AND returned_at IS NULL
-           AND session_id LIKE 'agent:main:subagent:%' AND id > $2
-           UNION
-           SELECT child.* FROM runs wake JOIN runs child
-           ON child.tenant_id = wake.tenant_id AND child.id = substring(wake.idempotency_key FROM length('subagent-return:') + 1)
-           WHERE wake.status = 'pending' AND wake.attempts = 0 AND wake.turn_user_seq IS NULL
-           AND wake.idempotency_key LIKE 'subagent-return:%'
-           AND child.status IN ('done','failed') AND child.session_id LIKE 'agent:main:subagent:%'
-           AND child.id > $2
-         ) pending`;
-
-const RUN_CLAIMS = {
-  id: "runs/store/0013-claims",
+const runClaims = (id: string, gate: (column: string) => string) => ({
+  id,
   statements: [
     claimFunction(
       "claim_runs",
       "lease_until bigint, worker text, now bigint, lim integer",
       `WITH picked AS (
-         SELECT candidate.tenant_id, candidate.id FROM runs candidate WHERE ${claimable("$3")}
+         SELECT candidate.tenant_id, candidate.id FROM runs candidate WHERE ${claimable("$3")}${gate("candidate.tenant_id")}
          ORDER BY candidate.claim_priority ASC, candidate.created_at ASC, candidate.seq ASC FOR UPDATE SKIP LOCKED LIMIT $4
        )
        UPDATE runs SET status='running', lease_token=gen_random_uuid()::text, lease_expires_at=$1, worker_id=$2,
@@ -101,7 +62,7 @@ const RUN_CLAIMS = {
     claimFunction(
       "claim_available_runs",
       "now bigint",
-      `SELECT r.tenant_id, r.id FROM runs r WHERE r.status='pending' AND r.retry_after <= $1
+      `SELECT r.tenant_id, r.id FROM runs r WHERE r.status='pending' AND r.retry_after <= $1${gate("r.tenant_id")}
          AND NOT EXISTS (
            SELECT 1 FROM runs blocked WHERE blocked.tenant_id=r.tenant_id AND blocked.session_id=r.session_id
              AND (blocked.status='running' OR (blocked.status='pending' AND blocked.retry_after > $1))
@@ -110,13 +71,13 @@ const RUN_CLAIMS = {
     claimFunction(
       "claim_waiting_runs",
       "created_before bigint, now bigint",
-      `SELECT candidate.tenant_id, candidate.id FROM runs candidate WHERE ${claimable("$2")}
+      `SELECT candidate.tenant_id, candidate.id FROM runs candidate WHERE ${claimable("$2")}${gate("candidate.tenant_id")}
          AND candidate.claim_priority=0 AND candidate.created_at <= $1 LIMIT 1`,
     ),
     claimFunction(
       "claim_pending_returns",
       "lim integer, after_id text, now bigint",
-      `SELECT tenant_id, id FROM (${PENDING_RETURNS}) due WHERE retry_after <= $3 ORDER BY id LIMIT $1`,
+      `SELECT tenant_id, id FROM (${PENDING_RETURNS}) due WHERE retry_after <= $3${gate("due.tenant_id")} ORDER BY id LIMIT $1`,
     ),
     claimFunction(
       "claim_terminal_runs",
@@ -128,10 +89,13 @@ const RUN_CLAIMS = {
     claimFunction(
       "claim_expired_runs",
       "now bigint",
-      `SELECT tenant_id, id FROM runs WHERE status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= $1`,
+      `SELECT tenant_id, id FROM runs WHERE status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= $1${gate("tenant_id")}`,
     ),
   ],
-};
+});
+
+const RUN_CLAIMS = runClaims("runs/store/0013-claims", () => "");
+const SERVING_RUN_CLAIMS = runClaims("runs/store/0015-serving-claims", servingTenant);
 
 const FENCE_HOLD_MS = 600_000;
 const PREVIOUS_SCHEMA = "runs/store/0010-drop-turn-metrics";
@@ -208,6 +172,15 @@ END $base_schema$`,
       },
     ]),
     RUN_CLAIMS,
+    {
+      id: "runs/store/0014-handbacks",
+      statements: [
+        `SET LOCAL lock_timeout = '3s'`,
+        `ALTER TABLE runs ADD COLUMN IF NOT EXISTS handbacks INT NOT NULL DEFAULT 0`,
+        `UPDATE runs SET handbacks = preemptions WHERE status IN ('pending', 'running') AND handbacks < preemptions`,
+      ],
+    },
+    SERVING_RUN_CLAIMS,
   ]);
   const { query: q, close: closePool } = pg;
 
@@ -293,6 +266,8 @@ END $base_schema$`,
   }
 
   const runs: RunStore = {
+    ...createRunReads(pg),
+    ...createRunReturns(pg, loaded),
     ...watch,
     ...(Number.isFinite(maxClaims) ? { maxClaims } : {}),
 
@@ -320,11 +295,6 @@ END $base_schema$`,
         const existing = await runs.getByDedupKey(dedupKey!);
         if (existing) return { run: existing, deduped: true };
       }
-    },
-
-    async getByDedupKey(dedupKey) {
-      const { rows } = await q(`SELECT * FROM runs WHERE idempotency_key = $1`, [dedupKey]);
-      return rows[0] ? rowToRun(rows[0]) : null;
     },
 
     async claim(workerId, ttlMs, limit = 1) {
@@ -358,7 +328,7 @@ END $base_schema$`,
 
     async releaseLease(runId, leaseToken, stop, retryAfter = 0): Promise<boolean> {
       const { rowCount } = await q(
-        `UPDATE runs SET status='pending', lease_token=NULL, lease_expires_at=NULL, worker_id=NULL, last_stop=COALESCE($3, last_stop), preemptions=preemptions+$4, retry_after=GREATEST(retry_after, $5) WHERE id=$1 AND lease_token=$2 AND status='running' RETURNING ${NOTIFY_SESSION_AVAILABLE}`,
+        `UPDATE runs SET status='pending', lease_token=NULL, lease_expires_at=NULL, worker_id=NULL, last_stop=COALESCE($3, last_stop), preemptions=preemptions+$4, handbacks=handbacks+1, retry_after=GREATEST(retry_after, $5) WHERE id=$1 AND lease_token=$2 AND status='running' RETURNING ${NOTIFY_SESSION_AVAILABLE}`,
         [runId, leaseToken, stop ? JSON.stringify(stop) : null, stop?.kind === "parked" ? 1 : 0, retryAfter],
       );
       return rowCount > 0;
@@ -399,95 +369,11 @@ END $base_schema$`,
       return rowCount > 0;
     },
 
-    async setDeliveryState(runId: string, leaseToken: string | null, state: RunDeliveryState): Promise<boolean> {
-      const { rowCount } =
-        leaseToken === null
-          ? await q(
-              "UPDATE runs SET delivery_state=(COALESCE(delivery_state, '{}')::jsonb || $1::jsonb)::text WHERE id=$2",
-              [JSON.stringify(state), runId],
-            )
-          : await q(
-              "UPDATE runs SET delivery_state=(COALESCE(delivery_state, '{}')::jsonb || $1::jsonb)::text WHERE id=$2 AND lease_token=$3",
-              [JSON.stringify(state), runId, leaseToken],
-            );
-      return rowCount > 0;
-    },
-
-    async activeForThreads(threadRefs) {
-      if (!threadRefs.length) return new Map();
-      const { rows } = await q(
-        `SELECT current.* FROM unnest($1::text[]) AS threads(id)
-         CROSS JOIN LATERAL (
-           SELECT * FROM runs WHERE session_id = threads.id AND status IN ('pending', 'running')
-           ORDER BY status = 'running' DESC, ${turnOrder("runs")} LIMIT 1
-         ) current`,
-        [[...new Set(threadRefs)]],
-      );
-      return new Map(
-        rows.map((row) => {
-          const run = rowToRun(row);
-          return [run.sessionId, run];
-        }),
-      );
-    },
-    async pendingReturns(limit = 100, afterId = "", threadRefs) {
-      if (threadRefs) {
-        const { rows } = await q(`${PENDING_RETURNS} WHERE session_id = ANY($3) ORDER BY id LIMIT $1`, [
-          limit,
-          afterId,
-          threadRefs,
-        ]);
-        return rows.map(rowToRun);
-      }
-      return loaded(() => claimRows(pg, "claim_pending_returns", [limit, afterId, Date.now()]));
-    },
-    async terminalFinished(after, beforeMs, limit) {
-      return loaded(() => claimRows(pg, "claim_terminal_runs", [beforeMs, after.finishedAt, after.id, limit]));
-    },
-    async markReturned(runId) {
-      await q("UPDATE runs SET returned_at = $2 WHERE id = $1 AND status IN ('done','failed')", [runId, Date.now()]);
-    },
-    async deferReturn(runId, delayMs) {
-      await q("UPDATE runs SET retry_after = $2 WHERE id = $1 AND status IN ('done','failed')", [
-        runId,
-        Date.now() + Math.max(0, delayMs),
-      ]);
-    },
     onTerminal(listener): void {
       terminalListeners.push(listener);
     },
 
     get: getRun,
-
-    async lastFinishedForThreads(threadRefs) {
-      if (!threadRefs.length) return new Map();
-      const { rows } = await q(
-        `SELECT last.* FROM unnest($1::text[]) AS threads(id)
-         CROSS JOIN LATERAL (
-           SELECT * FROM runs WHERE session_id = threads.id AND status IN ('done', 'failed')
-           ORDER BY created_at DESC, seq DESC LIMIT 1
-         ) last`,
-        [[...new Set(threadRefs)]],
-      );
-      return new Map(
-        rows.map((row) => {
-          const run = rowToRun(row);
-          return [run.sessionId, run];
-        }),
-      );
-    },
-
-    async activeForThread(sessionId: string): Promise<Run | null> {
-      return (await runs.activeForThreads([sessionId])).get(sessionId) ?? null;
-    },
-
-    async inFlightForThread(sessionId: string): Promise<Run[]> {
-      const { rows } = await q(
-        `SELECT * FROM runs WHERE session_id = $1 AND status IN ('pending','running') ORDER BY (status = 'running') DESC, ${turnOrder("runs")}`,
-        [sessionId],
-      );
-      return rows.map(rowToRun);
-    },
 
     async editPendingText(runId: string, text: string, expectedText: string): Promise<boolean> {
       const { rowCount } = await q(
@@ -533,29 +419,14 @@ END $base_schema$`,
       return rows.length > 0;
     },
 
-    async activeSessionIds(): Promise<string[]> {
-      const { rows } = await q("SELECT DISTINCT session_id FROM runs WHERE status IN ('pending','running')");
-      return rows.map((r) => r.session_id as string);
-    },
-
-    async list({ limit = 200, threadRef }: { limit?: number; threadRef?: string } = {}): Promise<Run[]> {
-      const { rows } = threadRef
-        ? await q(
-            "SELECT * FROM runs WHERE session_id = $1 OR starts_with(session_id, $1 || ':task:') OR starts_with(session_id, $1 || ':status:') ORDER BY created_at DESC, seq DESC LIMIT $2",
-            [threadRef, limit],
-          )
-        : await q("SELECT * FROM runs ORDER BY created_at DESC, seq DESC LIMIT $1", [limit]);
-      return rows.map(rowToRun);
-    },
-
     async reapExpired(opts?: {
       maxAgeMs?: number;
-      onReap?: (event: ReapEvent) => void;
+      onReap?: (event: ReapEvent, tenant: Tenant) => void;
     }): Promise<{ requeued: number; parked: number }> {
       const now = Date.now();
       let requeued = 0;
       let parked = 0;
-      const reap = async (id: string): Promise<void> => {
+      const reap = async (id: string, tenant: Tenant): Promise<void> => {
         const run = await getRun(id);
         if (!run) return;
         const tooOld = opts?.maxAgeMs !== undefined && run.startedAt !== null && now - run.startedAt > opts.maxAgeMs;
@@ -570,14 +441,17 @@ END $base_schema$`,
         if (!r.applied) return;
         if (r.requeued) requeued++;
         else parked++;
-        opts?.onReap?.({
-          runId: run.id,
-          sessionId: run.sessionId,
-          workerId: run.workerId,
-          attempts: run.attempts,
-          errorAttempts: run.errorAttempts,
-          outcome: r.requeued ? "requeued" : "parked",
-        });
+        opts?.onReap?.(
+          {
+            runId: run.id,
+            sessionId: run.sessionId,
+            workerId: run.workerId,
+            attempts: run.attempts,
+            errorAttempts: run.errorAttempts,
+            outcome: r.requeued ? "requeued" : "parked",
+          },
+          tenant,
+        );
       };
       await claimThenBind(() => claimRows(pg, "claim_expired_runs", [now]), reap);
       return { requeued, parked };

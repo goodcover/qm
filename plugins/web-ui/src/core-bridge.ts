@@ -9,7 +9,15 @@ import type { RuntimeChange, RuntimeConfig } from "./runtime-config-cache.ts";
 import type { ChatBrowseStatus } from "./session-list.ts";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import type { Attachment } from "@earendil-works/pi-web-ui";
-import type { Api, AssistantMessage, AssistantMessageEventStream, Context, Model, Usage } from "@earendil-works/pi-ai";
+import type {
+  Api,
+  AssistantMessage,
+  AssistantMessageEventStream,
+  Context,
+  Model,
+  Usage,
+  TextContent,
+} from "@earendil-works/pi-ai";
 import type { Agent, AgentMessage, StreamFn } from "@earendil-works/pi-agent-core";
 import { errMessage, swallow } from "../../chassis/src/errors.ts";
 import { userFacingFailureText } from "../../chassis/src/failure-copy.ts";
@@ -472,12 +480,23 @@ export async function regenerateTitle(id: string): Promise<{ title: string | nul
   return api<{ title: string | null }>(`/api/sessions/${encodeURIComponent(id)}/title`, { method: "POST" });
 }
 
+export async function suggestNextPrompt(id: string): Promise<{ enabled: boolean; suggestion: string | null }> {
+  return api<{ enabled: boolean; suggestion: string | null }>(`/api/sessions/${encodeURIComponent(id)}/next-prompt`, {
+    method: "POST",
+  });
+}
+
 export async function detachSession(id: string): Promise<{ detached: true }> {
   return api<{ detached: true }>(`/api/sessions/${encodeURIComponent(id)}/detach`, { method: "POST" });
 }
 
 export async function cancelSessionGoal(id: string): Promise<{ cancelled: true }> {
   return api<{ cancelled: true }>(`/api/sessions/${encodeURIComponent(id)}/goal/cancel`, { method: "POST" });
+}
+export async function resumeSessionGoal(id: string): Promise<{ resumed: true; goal: GoalStripState }> {
+  return api<{ resumed: true; goal: GoalStripState }>(`/api/sessions/${encodeURIComponent(id)}/goal/resume`, {
+    method: "POST",
+  });
 }
 type WorkStatus = "thinking" | "working" | "complete" | "failed";
 export interface WorkBlock {
@@ -788,6 +807,13 @@ function reportSigninRequired(detail: SigninRequired): void {
   onSigninRequired?.(detail);
 }
 
+let servedRelease: string | null = null;
+
+export function servedReleaseChanged(): boolean {
+  const booted = document.querySelector<HTMLMetaElement>('meta[name="qm-release"]')?.content;
+  return Boolean(booted && servedRelease && servedRelease !== booted);
+}
+
 export async function webFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
   const startMs = Date.now();
   const request = input instanceof Request ? input : null;
@@ -801,6 +827,7 @@ export async function webFetch(input: RequestInfo | URL, init?: RequestInit): Pr
     throw error;
   }
   reportRequestTiming(url, method, startMs, response.status);
+  servedRelease = response.headers.get("x-qm-release") ?? servedRelease;
   if (response.status !== 401) return response;
   stopBrowserErrors();
   stopAnalytics();
@@ -1043,9 +1070,6 @@ export async function signalLiveRun(
     });
     return { ok: true };
   } catch (err) {
-    // The run ended before (or as) the signal arrived. For a steer, core replays the
-    // text as a fresh turn when it can; surface that outcome instead of failing so the
-    // caller can attach to the replay run or resend, rather than dropping the message.
     if (err instanceof ApiError && (err.status === 409 || err.status === 404)) {
       const body = (err.body ?? {}) as { reason?: string; why?: string; replayed?: boolean };
       return {
@@ -1443,10 +1467,6 @@ async function resumeDrive(
     stream.push({ type: "start", partial });
     stream.push({ type: "text_start", contentIndex: 0, partial });
     const st: Acc = { acc: "", startOffset: 0, lastProgressAt: now() };
-    // Keep any assistant text the transcript already showed for this in-flight
-    // run visible: seed the accumulator with it so attaching the live stream
-    // never blanks text the person has already read. The server's own partial
-    // (when longer) simply replaces it via the normal delta path.
     if (seedText?.trim()) pushDelta(stream, partial, st, seedText);
     if (initialRun && applyRun(stream, partial, st, initialRun, notify) === "terminal") return;
     await followRun(stream, partial, runId, signal, notify, st, slot, gen);
@@ -1795,7 +1815,6 @@ async function streamRunViaSse(
         }
       } else if (event.name === "run") {
         const run = event.value as RunPoll;
-        // Completion must carry the final result, including files and approvals.
         const terminal = run.status === "done" || run.status === "failed" || run.result != null;
         if (applyRun(stream, partial, st, { ...run, replyComplete: terminal }, notify) === "terminal") return "done";
         if (run.alive) st.lastProgressAt = now();
@@ -2156,6 +2175,18 @@ function isFinishedReplyItem(item: Item): boolean {
 function isWorkHistoryItem(item: Item): boolean {
   if (item.kind === "Reasoning") return isRenderableThinking(item);
   return item.kind === "ToolCall" || item.kind === "ToolResult" || item.kind === "Elicitation" || isNarration(item);
+}
+
+export function messageText(message: AgentMessage): string {
+  const content = (message as { content?: unknown }).content;
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter((c): c is TextContent => Boolean(c) && typeof c === "object" && (c as { type?: string }).type === "text")
+      .map((c) => c.text ?? "")
+      .join("\n");
+  }
+  return "";
 }
 
 export function itemsToMessages(items: Item[], model?: Model<Api>): AgentMessage[] {

@@ -59,15 +59,19 @@ export function requiresDelegation(
   );
 }
 
+export function isOwnerFire(request: Pick<OrchestratorInput, "origin" | "botActor">): boolean {
+  return request.origin.kind === "automation" && request.origin.ownerFire === true && !request.botActor;
+}
+
 export async function delegatedAuthorizationOrigin(
   request: OrchestratorInput,
-  deps: { runs: Pick<RunStore, "get">; sessions: Pick<SessionStore, "getByThread" | "getForParticipant"> },
+  deps: { runs: Pick<RunStore, "get">; sessions: Pick<SessionStore, "get" | "getByThread"> },
 ): Promise<OrchestratorInput["origin"] | undefined> {
   const seen = new Set<string>();
   let current = request;
   for (let depth = 0; depth < 32; depth++) {
     if (
-      current.origin.kind === "automation" ||
+      (current.origin.kind === "automation" && !isOwnerFire(current)) ||
       current.readOnly ||
       current.privateSessionMessage ||
       current.swarm ||
@@ -78,7 +82,7 @@ export async function delegatedAuthorizationOrigin(
       return;
     seen.add(current.delegatingRunId);
     const source = await deps.runs.get(current.delegatingRunId);
-    const sender = await deps.sessions.getForParticipant(current.sessionSenderId, request.actor.id);
+    const sender = await deps.sessions.get(current.sessionSenderId);
     const child = await deps.sessions.getByThread(current.conversation.threadRef);
     if (!source || !sender || !child) return;
     const delegated =
@@ -118,6 +122,7 @@ export async function delegatedAuthorizationOrigin(
       !isSessionTurn(parent) &&
       internal &&
       (parent.origin.kind === "human" ||
+        isOwnerFire(parent) ||
         (parent.origin.kind === "ambient" && parent.origin.live === true && parent.conversation.kind !== "dm"))
     )
       return parent.origin;
@@ -159,7 +164,6 @@ export function sessionContextOf(input: OrchestratorInput): SpawnMeta {
     origin,
     ...(input.surfaceTools ? { surfaceTools: true } : {}),
     ...(input.deliveryCandidates ? { deliveryCandidates: input.deliveryCandidates } : {}),
-    ...(input.unattendedGrants ? { unattendedGrants: [...input.unattendedGrants] } : {}),
     ...(input.surfaceOrigin?.audience === "external" ? { surfaceOrigin: input.surfaceOrigin } : {}),
     ...(input.scopeVersion ? { scopeVersion: input.scopeVersion } : {}),
     ...(input.sessionParticipantIds ? { sessionParticipantIds: input.sessionParticipantIds } : {}),
@@ -195,6 +199,7 @@ export interface SessionOpenInput {
   thinkingLevel?: string;
   fastMode?: boolean;
   isolation?: ChildIsolationMode;
+  persistent?: boolean;
 }
 
 type SessionOpenResult =
@@ -277,7 +282,6 @@ export interface SessionSyscallBinding {
     | "surface"
     | "surfaceTools"
     | "deliveryCandidates"
-    | "unattendedGrants"
     | "privateSessionMessage"
     | "sessionMessageDepth"
     | "swarm"
@@ -428,7 +432,6 @@ function childRunRequest(child: Session, meta: SpawnMeta, text: string, displayT
     actor: meta.actor,
     conversation: { ...meta.conversation, threadRef: child.threadRef },
     origin: sessionTurnOrigin(meta.origin, text),
-    ...(meta.unattendedGrants ? { unattendedGrants: [...meta.unattendedGrants] } : {}),
     text,
     displayText,
     envelopeWrapped: true,
@@ -687,7 +690,8 @@ export function createSessionSyscalls(deps: SessionSyscallDeps): SessionSyscalls
         if (byThread) return byThread;
         const children = await deps.sessions.childrenOf(binding.session.id);
         const siblings = current?.parentSessionId ? await deps.sessions.childrenOf(current.parentSessionId) : [];
-        return [...children, ...siblings].find((c) => c.title?.trim().toLowerCase() === trimmed.toLowerCase()) ?? null;
+        const named = [...children, ...siblings].filter((c) => c.title?.trim().toLowerCase() === trimmed.toLowerCase());
+        return named.find((c) => !c.spawnMeta?.retired) ?? named[0] ?? null;
       }
 
       function sidebarRefusal(): string | null {
@@ -848,7 +852,6 @@ export function createSessionSyscalls(deps: SessionSyscallDeps): SessionSyscalls
                   ...binding.request,
                   surface: binding.request.surface ?? binding.session.surface ?? "web",
                   origin: caller.origin,
-                  unattendedGrants: caller.unattendedGrants,
                   readOnly,
                   model: runtime.model,
                   thinkingLevel: runtime.thinkingLevel,
@@ -859,6 +862,7 @@ export function createSessionSyscalls(deps: SessionSyscallDeps): SessionSyscalls
                 openFingerprint: fingerprint,
                 ...(binding.request.surfaceOrigin ? { surfaceOrigin: binding.request.surfaceOrigin } : {}),
                 ...(isolation ? { isolation } : {}),
+                ...(input.persistent ? { persistent: true } : {}),
               };
               if (!existing?.spawnMeta) {
                 await deps.sessions.setParentSession(child.id, binding.session.id);
@@ -913,6 +917,12 @@ export function createSessionSyscalls(deps: SessionSyscallDeps): SessionSyscalls
                 };
               if (!(await deps.sessions.getForParticipant(target.id, binding.request.actor.id)))
                 return { ok: false, message: "you are not a participant in that session." };
+              if (target.spawnMeta?.retired && target.parentSessionId === binding.session.id)
+                return {
+                  ok: false,
+                  message:
+                    "that subagent finished and retired; open a fresh one with `open` (its result is already in your transcript).",
+                };
               if (deps.authorize && !(await deps.authorize(target, caller.actor.id)))
                 return { ok: false, message: "you no longer have access to the target session" };
               const meta = storedContext(target);
@@ -936,7 +946,6 @@ export function createSessionSyscalls(deps: SessionSyscallDeps): SessionSyscalls
                   surface: meta.surface ?? target.surface ?? "web",
                   actor: caller.actor,
                   origin: caller.origin,
-                  unattendedGrants: caller.unattendedGrants,
                   readOnly: privateMessage || caller.readOnly || meta.readOnly || target.spawnMeta?.readOnly,
                   memoryNotebookOnly: caller.memoryNotebookOnly || meta.memoryNotebookOnly,
                   botActor: caller.botActor,

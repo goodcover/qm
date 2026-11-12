@@ -22,9 +22,10 @@ import type { OrchestratorDeps } from "./types.ts";
 import type { Item } from "../../sessions/items.ts";
 import { countTokens } from "../../util/tokens.ts";
 import type { SessionRoute } from "../../agent/agent.ts";
+import type { Tenant } from "../../tenants/context.ts";
 
 const MAX_CONTEXT_TOKENS = 120_000;
-const KEEP_RECENT_TOKEN_FRACTION = 0.6;
+const COMPACTION_HEADROOM_FRACTION = 0.3;
 const DOCUMENT_TOKEN_FRACTION = 0.5;
 const RECENT_NOTICE =
   "[Context reduced without a new summary. Earlier entries are excluded, not deleted. Use history to reopen missing requests and tool calls; history does not return tool results. Check actual state before repeating actions whose outcomes are missing.]";
@@ -38,6 +39,7 @@ interface Summarized {
 }
 
 interface CompactionInput {
+  tenant: Tenant;
   session: Session;
   writer: SessionWriter;
   visibleHistory: Item[];
@@ -52,6 +54,7 @@ export interface CompactionContext {
   compactContextIfNeeded(input: CompactionInput): Promise<Item[]>;
   compactRecent(input: CompactionInput): Promise<Item[]>;
   scheduleBackgroundCompaction(input: {
+    tenant: Tenant;
     sessionId: string;
     runLeaseToken?: string;
     scopeId: string;
@@ -85,7 +88,7 @@ export function createCompaction(deps: OrchestratorDeps): CompactionContext {
     return parsed.kind === "group" && deps.managedGroups?.recognizes(parsed.ref) === true;
   };
 
-  const keepRecentTokenFraction = Math.min(KEEP_RECENT_TOKEN_FRACTION, COMPACT_SOFT_FRACTION - 0.1);
+  const keepRecentTokenFraction = COMPACT_SOFT_FRACTION - COMPACTION_HEADROOM_FRACTION;
 
   async function summarizeForCompaction(
     input: Omit<CompactionInput, "writer">,
@@ -107,14 +110,15 @@ export function createCompaction(deps: OrchestratorDeps): CompactionContext {
         session: input.session,
         history: plan.toSummarize,
         recordModelCall: (rec) => {
-          void deps.budget?.record(input.actorId, estimateCostUsd(rec.inputTokens));
+          void deps.budget?.record(input.tenant, input.actorId, estimateCostUsd(rec.inputTokens));
         },
       });
       text = validateCompactSummary(raw);
     } catch (error) {
       input.cancel?.throwIfAborted();
       if (!onFailure || (error instanceof Error && error.name === "AbortError")) throw error;
-      deps.errors?.record(
+      deps.errors.record(
+        input.tenant,
         {
           category: "turn",
           code: "compaction_summary_failed",
@@ -227,6 +231,7 @@ export function createCompaction(deps: OrchestratorDeps): CompactionContext {
   const compactionPending = new Set<string>();
 
   function scheduleBackgroundCompaction(input: {
+    tenant: Tenant;
     sessionId: string;
     runLeaseToken?: string;
     scopeId: string;
@@ -236,7 +241,8 @@ export function createCompaction(deps: OrchestratorDeps): CompactionContext {
     if (compactionPending.has(input.sessionId)) return;
     compactionPending.add(input.sessionId);
     const recordFailure = (e: unknown) =>
-      deps.errors?.record(
+      deps.errors.record(
+        input.tenant,
         {
           category: "turn",
           code: "background_compaction_failed",
@@ -257,6 +263,7 @@ export function createCompaction(deps: OrchestratorDeps): CompactionContext {
         if (!overBudgetFraction(history, maxContextTokens, COMPACT_SOFT_FRACTION)) return;
         const snapshotSeq = items.at(-1)?.seq ?? -1;
         const summarized = await summarizeForCompaction({
+          tenant: input.tenant,
           session,
           visibleHistory: history,
           scopeId: input.scopeId,

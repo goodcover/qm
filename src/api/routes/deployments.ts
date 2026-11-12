@@ -19,12 +19,13 @@ import { escapeHtml, relayStream } from "../../../plugins/chassis/src/http.ts";
 import { canonicalPayload } from "../../../plugins/chassis/src/source-auth-sign.ts";
 import { frameAncestorsDirective, sendJson, verifyOrReject } from "../http.ts";
 import { mintPortalIdentity, verifyPortalIdentity, PORTAL_IDENTITY_HEADER } from "../../auth/portal-identity.ts";
-import { audit, authorizeAdmin, isObj, orgScope } from "./shared.ts";
-import { scopeId, type Permission } from "../../types.ts";
-import type { ApiCtx, BaseCtx, Route } from "./route.ts";
+import { audit, authorizeAdmin, exportTokenAccepted, isObj, orgScope } from "./shared.ts";
+import { personalScope, scopeId, type Permission } from "../../types.ts";
+import { tenantOf, type ApiCtx, type BaseCtx, type Route } from "./route.ts";
 import { CONFIG_DEFAULTS } from "../../config.ts";
 import { verifyDeployGitAccess, viewerIdentityKey } from "../../deploy/access-token.ts";
 import { appAnnotationAsset } from "../../deploy/app-annotate.ts";
+import { appAccess } from "../../deploy/app-access.ts";
 import { APP_SHELL_PATH_PREFIX, appShellHtml } from "../../deploy/app-shell.ts";
 import type { AppViewAuthMode } from "../../deploy/page-views.ts";
 import { principalDestination } from "../../reach/reach.ts";
@@ -32,9 +33,11 @@ import { FRAME_SESSION_COOKIE, portalSession, portalSessionFrom } from "../../de
 import { appHostLabel, appNameFromLabel, labelOfAppHost } from "../../tenants/app-handle.ts";
 import { isDnsLabel } from "../../../plugins/chassis/src/dns-label.ts";
 import { tenantAppHandle } from "../../tenants/settings.ts";
-import { boundTenant } from "../../tenants/context.ts";
+import { appUrlOf } from "../../deploy/deploy-store.ts";
+import { canonicalPerson } from "../../directory/person.ts";
 import { EMBED_ANCESTORS_HINT, parseEmbedAncestors } from "../../deploy/embed-ancestors.ts";
 import { proxyHeaders } from "../../util/http-proxy.ts";
+import { relayWebSocket } from "../../../plugins/chassis/src/websocket-relay.ts";
 import { deploymentGitParts, isDeploymentGitRoute } from "../../../plugins/chassis/src/deployment-git.ts";
 
 function deploymentProxyAgent(port?: number): { agent?: SocksProxyAgent } {
@@ -154,10 +157,13 @@ async function proxyAdminDeployment(ctx: BaseCtx): Promise<void> {
     return;
   const found = await app.getDeployment(parts.id);
   const deployment = found?.id === parts.id ? found : undefined;
-  const actor = await authorizeAdmin({ req, res, deps, capability: null }, deployment?.ownerScopeId ?? orgScope(deps));
+  const actor = await authorizeAdmin(
+    { req, res, deps, capability: null, tenant: ctx.tenant },
+    deployment?.ownerScopeId ?? orgScope(deps),
+  );
   if (!actor) return;
   if (!deployment) return sendJson(res, 404, { error: "not_found" });
-  audit(deps, {
+  audit(ctx, {
     principalId: actor.id,
     action: "deployment.visit",
     resource: deployment.id,
@@ -438,11 +444,6 @@ function proxyReachHttp2(
   start(false);
 }
 
-// --- cold-start warming page -------------------------------------------------
-// AWS microVMs auto-resume on first connect, which can take many seconds. During
-// that window a browser navigation would otherwise hang for the full dial timeout
-// and then land on raw gateway JSON. For document requests we instead answer
-// quickly with a small self-refreshing "warming up" page.
 const WARM_RECENT_MS = 60_000;
 const COLD_FIRST_BYTE_TIMEOUT_MS = 4_000;
 const upstreamLastOk = new Map<string, number>();
@@ -510,7 +511,6 @@ function sendWarmingPage(res: BaseCtx["res"]): void {
   });
   res.end(WARMING_PAGE_HTML);
 }
-// -----------------------------------------------------------------------------
 
 async function proxyReach(
   ctx: BaseCtx,
@@ -550,6 +550,19 @@ async function proxyReach(
       { p: viewer, exp: Date.now() + 60_000 },
       viewerIdentityKey(ctx.secret, reach.id),
     );
+  }
+  if (ctx.upgrade) {
+    const target = {
+      tls: reach.endpoint.tls === true,
+      hostname: host,
+      port,
+      path: subPath + url.search,
+      headers,
+      timeoutMs: deps.deployDialTimeoutMs ?? CONFIG_DEFAULTS.deployDialTimeoutMs,
+      ...deploymentProxyAgent(reach.endpoint.socksProxyPort),
+    };
+    relayWebSocket(res, ctx.upgrade, target, "deployment-websocket");
+    return;
   }
   if (/(?:^|,)\s*chunked\s*$/i.test(String(req.headers["transfer-encoding"] ?? ""))) {
     const chunks: Buffer[] = [];
@@ -811,7 +824,7 @@ export async function proxyDeploymentSubdomain(ctx: BaseCtx): Promise<boolean> {
     sendJson(res, 404, { error: "not_found" });
     return true;
   }
-  if (!["GET", "HEAD", "OPTIONS"].includes(ctx.method)) {
+  if (ctx.upgrade || !["GET", "HEAD", "OPTIONS"].includes(ctx.method)) {
     const origin = req.headers.origin;
     const site = req.headers["sec-fetch-site"];
     if ((origin !== undefined && origin !== `https://${rawHost}`) || (site !== undefined && site !== "same-origin")) {
@@ -852,7 +865,7 @@ export async function proxyDeploymentSubdomain(ctx: BaseCtx): Promise<boolean> {
   if (!session && sessionSecret && embedAncestors.length) {
     session = portalSessionFrom(req.headers.cookie, FRAME_SESSION_COOKIE, sessionSecret, Date.now());
   }
-  if (session?.t !== undefined && session.t !== boundTenant()) {
+  if (session?.t !== undefined && session.t !== ctx.tenant?.id) {
     sendJson(res, 404, { error: "not_found" });
     return true;
   }
@@ -887,7 +900,7 @@ export async function proxyDeploymentSubdomain(ctx: BaseCtx): Promise<boolean> {
   url.searchParams.delete("__qm_no_shell");
   const isTopDocument = String(req.headers["sec-fetch-dest"] ?? "") === "document";
   const isShellRequest = pathname.startsWith(APP_SHELL_PATH_PREFIX);
-  const canManage = sub && !session?.appOnly ? await app.canManageDeployment(slug, sub) : false;
+  const canManage = sub && !session?.appOnly ? await app.canManageDeployment(slug, { actorId: sub }) : false;
   let authenticatedPermission: Permission | null = null;
   if (sub && deployment) {
     if (session?.appOnly) {
@@ -934,9 +947,22 @@ export async function proxyDeploymentSubdomain(ctx: BaseCtx): Promise<boolean> {
       return true;
     }
     if (isShellRequest) {
-      if (pathname === "/__claw__/version" && deployment)
-        sendJson(res, 200, { version: deployment.appliedVersion ?? deployment.currentVersion });
-      else if (annotationsEnabled && (pathname === "/__claw__/annotate.js" || pathname === "/__claw__/annotate.css")) {
+      if (pathname === "/__claw__/version" && deployment) {
+        const [draft, grantees] = await Promise.all([
+          app.deploymentLiveEdit(deployment.id).then((edit) => edit?.draft),
+          app.deploymentGrantees(deployment.id),
+        ]);
+        const orgName = (deps.config?.getBranding(orgScope(deps)) ?? deps.brandingDefault)?.orgName;
+        const { ownerScopeId } = deployment;
+        sendJson(res, 200, {
+          version: deployment.appliedVersion ?? deployment.currentVersion,
+          ...(draft ? { live: draft.reloads } : {}),
+          access: appAccess({ ownerScopeId, public: isPublic, grantees, viewer: sub!, orgName }),
+        });
+      } else if (
+        annotationsEnabled &&
+        (pathname === "/__claw__/annotate.js" || pathname === "/__claw__/annotate.css")
+      ) {
         const kind = pathname.endsWith(".js") ? "js" : "css";
         res.writeHead(200, {
           "content-type": kind === "js" ? "text/javascript; charset=utf-8" : "text/css; charset=utf-8",
@@ -980,8 +1006,9 @@ export async function proxyDeploymentSubdomain(ctx: BaseCtx): Promise<boolean> {
       status: "denied",
     };
     const hour = Math.floor(ev.at / 3_600_000);
-    if (deps.auditLog?.recordOnce) await deps.auditLog.recordOnce(`reach_denied|${viewer}|${slug}|${hour}`, ev);
-    else deps.auditLog?.record(ev);
+    if (deps.auditLog?.recordOnce)
+      await deps.auditLog.recordOnce(tenantOf(ctx), `reach_denied|${viewer}|${slug}|${hour}`, ev);
+    else deps.auditLog?.record(tenantOf(ctx), ev);
   }
   if (reach.status === "denied" && ctx.method === "POST" && pathname === REQUEST_ACCESS_PATH) {
     const d = await app.getDeployment(slug).catch(swallowAs("deployments: load deployment", null));
@@ -989,11 +1016,9 @@ export async function proxyDeploymentSubdomain(ctx: BaseCtx): Promise<boolean> {
       sendJson(res, 404, { error: "not_found" });
       return true;
     }
-    // The recipient is the app's owner: the personal home scope if it has one, else whoever created it.
     const [ownerKind, ownerRef] = String(d.ownerScopeId).split(":", 2);
     const ownerId = ownerKind === "personal" && ownerRef ? ownerRef : d.createdBy;
     const label = d.displayName ?? d.name ?? slug;
-    // One request per visitor per app per day — the idempotent outbox absorbs button mashing.
     const day = Math.floor(Date.now() / 86_400_000);
     try {
       await app.enqueueDelivery({
@@ -1276,7 +1301,7 @@ async function deploymentGitUrl(ctx: ApiCtx): Promise<void> {
   if (!capability)
     return sendJson(res, 403, { error: "forbidden", message: "a git URL requires an agent capability token" });
   if (!ctx.secret) return sendJson(res, 503, { error: "unavailable", message: "core signing secret not configured" });
-  const result = await app.deploymentGitUrlFor(params.id!, capability.actorId, {
+  const result = await app.deploymentGitUrlFor(params.id!, capability, {
     secret: ctx.secret,
     baseUrl: gitUrlBase(ctx),
   });
@@ -1304,7 +1329,8 @@ async function listDeployments(ctx: ApiCtx): Promise<void> {
   const { res, app, url, secret, capability, actor } = ctx;
   const principalId = capability?.actorId ?? actor?.p ?? url.searchParams.get("principalId");
   if (!principalId) return sendJson(res, 400, { error: "bad_request", message: "principalId required" });
-  const visible = await app.listDeploymentsForViewer(principalId);
+  const viewer = capability ?? { actorId: principalId };
+  const visible = await app.listDeploymentsForViewer(tenantOf(ctx), viewer);
   const baseUrl = gitUrlBase(ctx);
   const ownerOf = (d: { ownerScopeId?: string }) =>
     d.ownerScopeId?.startsWith("personal:") ? d.ownerScopeId.slice("personal:".length) : undefined;
@@ -1321,7 +1347,7 @@ async function listDeployments(ctx: ApiCtx): Promise<void> {
         ...(d.createdBy ? { createdByName: names.get(d.createdBy)! } : {}),
       };
       if (!secret) return named;
-      const git = await app.deploymentGitUrlFor(d.id, principalId, { secret, baseUrl });
+      const git = await app.deploymentGitUrlFor(d.id, viewer, { secret, baseUrl });
       return git ? { ...named, gitUrl: git.url } : named;
     }),
   );
@@ -1402,11 +1428,26 @@ export async function getDeployment(ctx: ApiCtx): Promise<void> {
   const principalId = capability?.actorId ?? actor?.p ?? url.searchParams.get("principalId");
   if (!principalId) return sendJson(res, 400, { error: "bad_request", message: "principalId required" });
   const stored = await app.getDeployment(params.id!);
-  const permission = stored ? await app.deploymentGitPermissionFor(stored.id, principalId) : null;
+  const viewer = capability ?? { actorId: principalId };
+  const permission = stored ? await app.deploymentGitPermissionFor(stored.id, viewer) : null;
   if (!stored || !permission) return sendJson(res, 404, { error: "not_found" });
-  const deployment = { ...deploymentView(stored), permission, webUrl: webUrlOf(stored.id) };
+  const draft = permission === "write" ? (await app.deploymentLiveEdit(stored.id))?.draft : null;
+  const deployment = {
+    ...deploymentView(stored),
+    permission,
+    webUrl: webUrlOf(stored.id),
+    ...(draft
+      ? {
+          savedEdits: {
+            savedAt: draft.savedAt,
+            ...(draft.publishAt ? { publishAt: draft.publishAt } : {}),
+            ...(draft.failure ? { publishFailure: draft.failure } : {}),
+          },
+        }
+      : {}),
+  };
   if (!secret) return sendJson(res, 200, { deployment });
-  const git = await app.deploymentGitUrlFor(deployment.id, principalId, { secret, baseUrl: gitUrlBase(ctx) });
+  const git = await app.deploymentGitUrlFor(deployment.id, viewer, { secret, baseUrl: gitUrlBase(ctx) });
   return sendJson(res, 200, { deployment: git ? { ...deployment, gitUrl: git.url } : deployment });
 }
 
@@ -1449,7 +1490,9 @@ async function redeployDeployment(ctx: ApiCtx): Promise<void> {
 
 async function callerMayManageDeployment(ctx: ApiCtx, id: string): Promise<boolean> {
   const principalId = ctx.capability?.actorId ?? ctx.actor?.p;
-  return principalId ? ctx.app.canManageDeployment(id, principalId, ctx.capability?.scopeId) : false;
+  return principalId
+    ? ctx.app.canManageDeployment(id, ctx.capability ?? { actorId: principalId }, ctx.capability?.scopeId)
+    : false;
 }
 
 export async function archiveDeployment(ctx: ApiCtx): Promise<void> {
@@ -1548,7 +1591,50 @@ async function setDeploymentAlwaysOn(ctx: ApiCtx): Promise<void> {
   }
 }
 
+const VISIBLE_DEPLOYMENTS_PRINCIPAL = "deployment-export";
+
+async function visibleDeploymentsExport(ctx: BaseCtx): Promise<void> {
+  const { res, app, deps, url } = ctx;
+  if (!exportTokenAccepted(ctx, deps.spendExportToken)) return;
+  const requested = url.searchParams.get("principalId")?.trim();
+  if (!requested) return sendJson(res, 400, { error: "bad_request", message: "principalId required" });
+  const principalId = canonicalPerson(requested);
+  const live = (await app.listDeployments()).filter((d) => d.status !== "archived");
+  const permissions = await app.deploymentGitPermissionsFor(tenantOf(ctx), live, { actorId: principalId });
+  const visible = live.flatMap((deployment, i) => {
+    const permission = permissions[i];
+    return permission ? [{ deployment, view: deploymentView(deployment), permission }] : [];
+  });
+  const viewed =
+    (await deps.appPageViews?.lastViews(
+      tenantOf(ctx),
+      principalId,
+      visible.map(({ view }) => view.id),
+    )) ?? new Map<string, number>();
+  const deployments = visible.map(({ deployment, view: d, permission }) => ({
+    id: d.id,
+    ...(d.name ? { name: d.name } : {}),
+    ...(d.displayName ? { displayName: d.displayName } : {}),
+    url: appUrlOf(deployment, { sharedWebUrl: deps.portalUrl, appsDomain: deps.deployAppsDomain }) ?? null,
+    createdBy: d.createdBy,
+    owned: d.ownerScopeId === personalScope(principalId),
+    permission,
+    ...(d.updatedAt !== undefined ? { updatedAt: d.updatedAt } : {}),
+    ...(d.lastAccessAt !== undefined ? { lastAccessAt: d.lastAccessAt } : {}),
+    ...(viewed.has(d.id) ? { viewedAt: viewed.get(d.id) } : {}),
+  }));
+  audit(ctx, {
+    principalId: VISIBLE_DEPLOYMENTS_PRINCIPAL,
+    action: "deployment.export",
+    resource: principalId,
+    scopeLabel: orgScope(deps),
+    detail: `deployments=${deployments.length}`,
+  });
+  sendJson(res, 200, { principalId, deployments });
+}
+
 export const deploymentRawRoutes: ReadonlyArray<Route<BaseCtx>> = [
+  { method: "GET", path: "/v1/deployments/export", auth: "public", handle: visibleDeploymentsExport },
   { match: isDeploymentGitRoute, auth: "public", tenant: deploymentGitTenant, handle: serveDeploymentGit },
   {
     match: (m, p) =>

@@ -6,6 +6,7 @@ import type { ApiCtx } from "../src/api/routes/route.ts";
 import { createSlackInstallationStore } from "../src/surfaces/slack-installation.ts";
 import { createManagedSlack } from "../src/surfaces/slack-managed.ts";
 import { testMap } from "./support/test-database.ts";
+import { testTenant as tenant } from "./support/test-tenant.ts";
 
 type SlackSetupStatus = {
   configured: boolean;
@@ -54,7 +55,7 @@ async function fixture(t: test.TestContext) {
   const server = createServer(async (req, res) => {
     let raw = "";
     for await (const chunk of req) raw += String(chunk);
-    const ctx = { req, res, deps, body: raw ? JSON.parse(raw) : {} } as unknown as ApiCtx;
+    const ctx = { req, res, deps, tenant, body: raw ? JSON.parse(raw) : {} } as unknown as ApiCtx;
     await (req.method === "GET" ? getSlackInstallation : startSlackInstallation)(ctx);
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));

@@ -1,4 +1,5 @@
 import type { PersonaHandover } from "../personas/persona-handover.ts";
+import type { Tenant } from "../tenants/context.ts";
 import type { PersonaService } from "../personas/persona-service.ts";
 import type { TeamStore } from "../teams/teams.ts";
 import type { CronScriptTrial } from "../cron/script.ts";
@@ -71,7 +72,7 @@ import type {
   RecipientResolution,
 } from "../directory/directory-store.ts";
 import type { Delivery, Destination } from "../types.ts";
-import type { Cron, CronFireLogEntry, CronFireNote, Webhook } from "../triggers/types.ts";
+import type { Cron, CronFireLogEntry, CronFireNote, TriggerBase, Webhook } from "../triggers/types.ts";
 import type { SurfaceContextQuery, SurfaceContextRequest, SurfaceContextResult } from "../reach/reach.ts";
 import type {
   ActiveThread,
@@ -87,7 +88,7 @@ import { type AmbientDecision } from "../surface-cache/ambient-judge.ts";
 import type { SurfaceRegistry } from "../surfaces/registry.ts";
 import type { AmbientJudgmentStore } from "../surface-cache/ambient-judgment-store.ts";
 import type { AckEmojiPickStore } from "../surface-cache/ack-emoji-pick-store.ts";
-import type { Deployment } from "../deploy/deploy-store.ts";
+import type { Deployment, DeploymentDraft } from "../deploy/deploy-store.ts";
 import type { DeploymentLayerRuntime } from "../deployment/load-layer.ts";
 import { type ArtifactHome, type ArtifactType } from "./artifact-share.ts";
 import type {
@@ -97,6 +98,7 @@ import type {
   Reach,
   ReachOptions,
   DeploymentGrantee,
+  DeploymentActor,
 } from "../deploy/deploy-service.ts";
 import { type DurableMap } from "../persistence/durable-map.ts";
 import type { AdvisoryLock } from "../persistence/advisory-lock.ts";
@@ -290,8 +292,8 @@ export interface App {
     requestId: string,
     viewer?: string,
   ): Promise<(Omit<PendingApprovalRecord, "call"> & { requestId: string; executesOnApprove?: boolean }) | null>;
-  subscribeSessionStates(cb: (event: SessionStateEvent) => void, opts?: SubscribeOptions): () => void;
-  subscribeLedgerEvents(cb: (event: OwnedLedgerEvent) => void, opts?: SubscribeOptions): () => void;
+  subscribeSessionStates(cb: (event: SessionStateEvent) => void | Promise<void>, opts?: SubscribeOptions): () => void;
+  subscribeLedgerEvents(cb: (event: OwnedLedgerEvent) => void | Promise<void>, opts?: SubscribeOptions): () => void;
   listSessionApprovals(sessionId: string, viewer: string): Promise<PendingApproval[]>;
   pendingApprovalForThread(threadRef: string, viewer?: string): Promise<TurnResult | null>;
   subscribeRun(runId: string, listener: (event: RunStreamEvent) => void, onResync?: () => void): () => void;
@@ -380,6 +382,7 @@ export interface App {
   sessionChildren(principalId: string, sessionId: string): Promise<Session[] | null>;
   sessionRow(principalId: string, ref: { id?: string; threadRef?: string }): Promise<Session | null>;
   searchResources(
+    tenant: Tenant,
     principalId: string,
     query: string,
   ): Promise<{ hits: ResourceSearchHit[]; failed: string[]; limited: string[] }>;
@@ -417,11 +420,19 @@ export interface App {
     },
   ): Promise<Session | null>;
   regenerateTitle(sessionId: string, principalId: string): Promise<{ title: string | null } | null>;
+  suggestNextPrompt(
+    sessionId: string,
+    principalId: string,
+  ): Promise<{ enabled: boolean; suggestion: string | null } | null>;
   detachSession(sessionId: string, principalId: string): Promise<{ detached: true } | null>;
   cancelSessionGoal(
     sessionId: string,
     principalId: string,
   ): Promise<{ cancelled: true } | { cancelled: false; reason: "no_open_goal" | "busy" } | null>;
+  resumeSessionGoal(
+    sessionId: string,
+    principalId: string,
+  ): Promise<{ resumed: true; goal: GoalView } | { resumed: false; reason: "no_open_goal" | "busy" } | null>;
   spawnSession(principalId: string, opts: { scopeId: ScopeId; title?: string }): Promise<{ session: Session } | null>;
   discardSession(sessionId: string, principalId: string): Promise<boolean>;
   forkSession(
@@ -429,12 +440,22 @@ export interface App {
     principalId: string,
     opts?: { upToSeq?: number; sideChat?: { entrySeq: number; quote: string; occurrence: number } },
   ): Promise<{ session: Session; items: Item[] } | null>;
-  listFilesForViewer(principalId: string, opts?: ListOwnedOptions, inScope?: ScopeId): Promise<FileListPage>;
+  listFilesForViewer(
+    tenant: Tenant,
+    principalId: string,
+    opts?: ListOwnedOptions,
+    inScope?: ScopeId,
+  ): Promise<FileListPage>;
   uploadFileForViewer(
+    tenant: Tenant,
     principalId: string,
     input: { scopeId?: ScopeId; name: string; mimetype?: string; data: AsyncIterable<Uint8Array> },
   ): Promise<FileListItem | null>;
-  listScopeResources(principalId: string, scope: ScopeId): Promise<ScopeResources | null>;
+  listScopeResources(tenant: Tenant, principalId: string, scope: ScopeId): Promise<ScopeResources | null>;
+  loopAdministration(
+    actor: Pick<CapabilityClaims, "actorId" | "botActor">,
+    loops: readonly Pick<TriggerBase, "owner" | "ownerScopeId" | "botActor">[],
+  ): Promise<boolean[]>;
   managesScope(principalId: string, scope: ScopeId): Promise<boolean>;
   currentScopeMembers(scope: ScopeId): Promise<Principal[] | undefined>;
   isCurrentSharedScopeMember(principalId: string, scope: ScopeId): Promise<boolean>;
@@ -443,9 +464,15 @@ export interface App {
   authorizesCapabilityScope(
     claims: Pick<CapabilityClaims, "actorId" | "scopeId" | "scopeVersion" | "botActor" | "liveActor" | "members">,
   ): Promise<boolean>;
-  openFileForViewer(id: string, principalId: string): Promise<OpenedFile | null>;
-  grant(g: Grant, opts?: { notify?: boolean }): Promise<void>;
-  revokeGrant(ownerScopeId: ScopeId, ref: string, granteeScopeId: ScopeId, revokedBy: string): Promise<void>;
+  openFileForViewer(tenant: Tenant, id: string, principalId: string): Promise<OpenedFile | null>;
+  grant(tenant: Tenant, g: Grant, opts?: { notify?: boolean }): Promise<void>;
+  revokeGrant(
+    tenant: Tenant,
+    ownerScopeId: ScopeId,
+    ref: string,
+    granteeScopeId: ScopeId,
+    revokedBy: string,
+  ): Promise<void>;
   promoteSkill(id: string, targetScopeId: ScopeId, actorId: string, liveActor: boolean): Promise<Skill>;
   belongsToScope(principalId: string, scope: ScopeId): Promise<boolean>;
   canManageArtifactHome(homeScopeId: ScopeId, createdBy: string, principalId: string): Promise<boolean>;
@@ -469,7 +496,7 @@ export interface App {
   ): Promise<number>;
   createCron(input: CreateCronInput, trial?: CronScriptTrial): Promise<Cron>;
   getCron(id: string): Promise<Cron | null>;
-  listCrons(): Promise<Cron[]>;
+  listCrons(ids?: readonly string[]): Promise<Cron[]>;
   listCronsForViewer(principalId: string): Promise<{ owned: Cron[]; visible: VisibleCron[] }>;
   updateCron(id: string, patch: CronPatch, trial?: CronScriptTrial): Promise<Cron | null>;
   deleteCron(id: string): Promise<void>;
@@ -564,9 +591,20 @@ export interface App {
   redeploy(id: string, input: RedeployInput): Promise<Deployment>;
   listDeployments(): Promise<Deployment[]>;
   getDeployment(idOrName: string): Promise<Deployment | null>;
-  listDeploymentsForViewer(principalId: string): Promise<ViewerDeployment[]>;
+  listDeploymentsForViewer(
+    tenant: Tenant,
+    viewer: Pick<CapabilityClaims, "actorId" | "botActor">,
+  ): Promise<ViewerDeployment[]>;
   effectiveDeploymentPermission(d: Deployment, principalId: string): Promise<Permission | null>;
-  deploymentGitPermissionFor(idOrName: string, principalId: string): Promise<"read" | "write" | null>;
+  deploymentGitPermissionFor(
+    idOrName: string,
+    viewer: Pick<CapabilityClaims, "actorId" | "botActor">,
+  ): Promise<"read" | "write" | null>;
+  deploymentGitPermissionsFor(
+    tenant: Tenant,
+    deployments: readonly Deployment[],
+    viewer: Pick<CapabilityClaims, "actorId" | "botActor">,
+  ): Promise<Array<"read" | "write" | null>>;
   listSkills(): Promise<Skill[]>;
   getSkill(id: string): Promise<Skill | null>;
   archiveSkill(id: string): Promise<Skill>;
@@ -578,7 +616,11 @@ export interface App {
     patch: { description?: string; body?: string },
     opts?: { liveActor?: boolean },
   ): Promise<Skill | "trigger_blocked" | null>;
-  restoreOwnedSkill(id: string, principalId: string): Promise<Skill | "exists" | null>;
+  restoreOwnedSkill(
+    id: string,
+    principalId: string,
+    opts?: { liveActor?: boolean },
+  ): Promise<Skill | "exists" | "trigger_blocked" | null>;
   listSkillPacks(): Promise<SkillPack[]>;
   getSkillPack(id: string): Promise<SkillPack | null>;
   registerSkillPack(input: NewSkillPack): Promise<SkillPack>;
@@ -603,14 +645,20 @@ export interface App {
   rollbackDeployment(id: string, version: number, actor?: string): Promise<void>;
   archiveDeployment(id: string): Promise<void>;
   restoreDeployment(id: string, actorId?: string): Promise<Deployment>;
-  canManageDeployment(idOrName: string, callerId: string, actingScopeId?: ScopeId): Promise<boolean>;
+  canManageDeployment(
+    idOrName: string,
+    caller: Pick<CapabilityClaims, "actorId" | "botActor">,
+    actingScopeId?: ScopeId,
+  ): Promise<boolean>;
   renameDeployment(id: string, name: string): Promise<Deployment>;
   setDeploymentDisplayName(id: string, displayName: string): Promise<Deployment>;
   setDeploymentAlwaysOn(id: string, alwaysOn: boolean): Promise<Deployment>;
   setDeploymentEmbedAncestors(id: string, embedAncestors: string[]): Promise<Deployment>;
-  setDeploymentPublic(idOrName: string, isPublic: boolean, actor: { createdBy: string }): Promise<Deployment>;
+  setDeploymentPublic(idOrName: string, isPublic: boolean, actor: DeploymentActor): Promise<Deployment>;
   setDeploymentConnectors(idOrName: string, connectors: string[], actor: { createdBy: string }): Promise<Deployment>;
   maintainDeployments(): Promise<number>;
+  publishDueLiveEdits(): Promise<number>;
+  deploymentLiveEdit(id: string): Promise<{ draft: DeploymentDraft | null } | null>;
   reachDeployment(id: string, principalId: string, opts?: ReachOptions): Promise<Reach>;
   deploymentLogsFor(
     id: string,
@@ -621,13 +669,13 @@ export interface App {
     idOrName: string,
     grantee: ScopeId,
     permission: Permission | null,
-    actor: { createdBy: string },
+    actor: DeploymentActor,
     opts?: { notify?: boolean },
   ): Promise<DeploymentGrantee[]>;
   inviteToDeployment(
     idOrName: string,
     email: string,
-    actorId: string,
+    actor: DeploymentActor,
     opts?: { notify?: boolean },
   ): Promise<{
     grantees: DeploymentGrantee[];
@@ -642,7 +690,7 @@ export interface App {
   ): Promise<T>;
   deploymentGitUrlFor(
     idOrName: string,
-    principalId: string,
+    caller: Pick<CapabilityClaims, "actorId" | "botActor">,
     opts: { secret: string; baseUrl: string; ttlMs?: number },
   ): Promise<DeploymentGitUrl | null>;
   authorizesDeploymentGitAccess(id: string, principalId: string, permission: "read" | "write"): Promise<boolean>;
@@ -701,7 +749,7 @@ export interface AppDeps {
   webhooks: WebhookStore;
   deliveries: DeliveryStore;
   directory: DirectoryStore;
-  teams?: Pick<TeamStore, "isMember">;
+  teams?: Pick<TeamStore, "isMember" | "memberTeams">;
   emailAuthMembers?: DirectoryMember[];
   projects?: ProjectStore;
   deploy: DeployService;

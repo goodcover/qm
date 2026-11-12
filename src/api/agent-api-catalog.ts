@@ -1,8 +1,5 @@
 import type { CapabilityClaims } from "../auth/capability-token.ts";
-import { livePersonCapability } from "./artifact-share.ts";
-import { adminRoutes } from "./routes/admin.ts";
-import { unattendedGrantListing } from "./routes/admin/unattended-grants.ts";
-import { UNATTENDED_ADMIN_GRANTS } from "./control-service.ts";
+import { livePersonCapability, personAtKeyboard } from "./artifact-share.ts";
 
 interface AgentApiRoute {
   method: string;
@@ -24,7 +21,7 @@ interface AgentApiFamily {
 }
 
 const CONVERSATION_UPDATE =
-  "update one of the asking person's conversations — body {archived?, pinned?, title?, color?}; archive/unarchive, pin/unpin, rename (null title clears), or set the sidebar color (#rrggbb; null clears). These are per-person.";
+  "update one of the asking person's conversations — body {archived?, pinned?, title?, color?, unread?}; archive/unarchive, pin/unpin, rename (null title clears), set the sidebar color (#rrggbb; null clears), or mark read/unread. These are per-person.";
 
 const FAMILIES: AgentApiFamily[] = [
   {
@@ -136,7 +133,7 @@ const FAMILIES: AgentApiFamily[] = [
   {
     when: (view) => view.swarmsEnabled,
     guidance:
-      "Swarm workers are ordinary sessions with private blank computers. Inspect peers and their context, then send to chosen IDs or all; shared history is visible to every member. Notifications queue unattended turns. Each swarm gets one shared board computer (inspect returns board.sandboxId) that the root and every worker reach with execute's sandbox_id; pass forumSandboxId at creation to use an existing shared computer instead. Spawn accepts model, effort and fastMode to choose the runtime for the workers it creates; children inherit it unless they choose again. POST action control with memberId and state active, paused or stopped pauses delivery to, resumes, or stops a descendant worker. To keep a worker going instead of stopping after one reply, give it a goal on spawn or send ({objective, floor?, token_cap?}): its turn then runs like a goal turn, past the swarm turn deadline, until the goal is complete, paused or out of tokens. Any member can send any worker, itself included, a goal (not the root session); send a goal again to replace a running, paused or finished one.",
+      "Start a swarm only when the person explicitly asks for a swarm; a large or parallelizable task is not a request for one, so do that work yourself or with subagents. Swarm workers are ordinary sessions with private blank computers. Inspect peers and their context, then send to chosen IDs or all; shared history is visible to every member. Notifications queue unattended turns. Each swarm gets one shared board computer (inspect returns board.sandboxId) that the root and every worker reach with execute's sandbox_id; pass forumSandboxId at creation to use an existing shared computer instead (only in a swarm a person starts; a swarm a Slack bot starts never takes one, from the bot or from a person spawning into it, and always uses its own board). Spawn accepts model, effort and fastMode to choose the runtime for the workers it creates; children inherit it unless they choose again. POST action control with memberId and state active, paused or stopped pauses delivery to, resumes, or stops a descendant worker. To keep a worker going instead of stopping after one reply, give it a goal on spawn or send ({objective, floor?, token_cap?}): its turn then runs like a goal turn, past the swarm turn deadline, until the goal is complete, paused or out of tokens. Any member can send any worker, itself included, a goal (not the root session); send a goal again to replace a running, paused or finished one.",
     routes: [
       {
         method: "GET",
@@ -148,7 +145,7 @@ const FAMILIES: AgentApiFamily[] = [
         method: "POST",
         path: "/v1/swarm",
         summary:
-          "{action:'spawn',requestId,text,count?,context?,contexts?,forumSandboxId?,settings?,backend?,goal?} spawns one or an initial pool; {action:'context',context} updates own JSON; {action:'send',requestId,text,audience,replyTo?,wake?,goal?} sends to explicit peer ids or all and wakes each recipient (wake:false leaves it in their mailboxes for their next turn); {action:'control',memberId,state:'active'|'paused'|'stopped'} controls a descendant worker. Retry the same requestId and payload for idempotency.",
+          "{action:'spawn',requestId,text,count?,context?,contexts?,forumSandboxId?,settings?,backend?,goal?} spawns one or an initial pool (a new swarm only on an explicit request for a swarm); {action:'context',context} updates own JSON; {action:'send',requestId,text,audience,replyTo?,wake?,goal?} sends to explicit peer ids or all and wakes each recipient (wake:false leaves it in their mailboxes for their next turn); {action:'control',memberId,state:'active'|'paused'|'stopped'} controls a descendant worker. Retry the same requestId and payload for idempotency.",
       },
     ],
   },
@@ -295,12 +292,6 @@ const FAMILIES: AgentApiFamily[] = [
         path: "/v1/loops/:id/items/:itemId/followup",
         summary:
           "chat about one held item — body {message}; the reply lands on the item's thread and may revise its proposal",
-      },
-      {
-        method: "POST",
-        path: "/v1/loops/:id/events",
-        summary:
-          'report new messages in conversations already on the ledger — body {events:[{sourceKey, author:"owner"|"other", at, text?, from?}]}; each event is judged by the loop\'s work stage, which may close or redraft the item',
       },
     ],
   },
@@ -519,7 +510,7 @@ const FAMILIES: AgentApiFamily[] = [
     ],
   },
   {
-    when: (v) => livePersonCapability(v.claims) && !v.claims.triggered,
+    when: (v) => personAtKeyboard(v.claims),
     routes: [
       {
         method: "GET|PUT|DELETE",
@@ -688,7 +679,7 @@ const FAMILIES: AgentApiFamily[] = [
   {
     when: (v) => v.isAdmin && livePersonCapability(v.claims),
     guidance:
-      "Admin plane: you act AS this org admin — live-authorized per call, audited under their name; confirm before any mutation (bodies/params in the admin skill). Enforced limits: content reads require a DM or effective Open sharing for the live admin (organization, personal, and conversation restrictions all apply); configuration mutations work anywhere; admin grant changes, impersonation, and identity links are portal-only. Open admin reads can expose private data to the conversation; retrieve and report only what the request needs.",
+      "Admin plane: you act AS this org admin — authorized per call under their own standing (a cron, webhook or loop fire carries its owner's authority just as a typed turn does), audited under their name; confirm before any mutation (bodies/params in the admin skill). Enforced limits: content reads require a DM or effective Open sharing for the admin (organization, personal, and conversation restrictions all apply); configuration mutations work anywhere; admin grant changes, impersonation, and identity links are portal-only. Open admin reads can expose private data to the conversation; retrieve and report only what the request needs.",
     routes: [
       { method: "GET", path: "/v1/admin/whoami", summary: "this user's admin status" },
       {
@@ -775,16 +766,6 @@ const FAMILIES: AgentApiFamily[] = [
   },
 ];
 
-const unattendedFamilies = (): AgentApiFamily[] =>
-  UNATTENDED_ADMIN_GRANTS.map((grant) => ({
-    when: (v) => !livePersonCapability(v.claims) && v.claims.grants?.includes(grant) === true,
-    guidance:
-      "This cron has a specific read-only admin grant. Use only these listed routes; flag any other admin action to a human.",
-    routes: unattendedGrantListing(adminRoutes).flatMap((entry) =>
-      entry.grant === grant ? [{ method: entry.method, path: entry.path, summary: entry.summary }] : [],
-    ),
-  }));
-
 const WHOAMI_FOR_ALL: AgentApiFamily = {
   when: (v) => !(v.isAdmin && livePersonCapability(v.claims)),
   routes: [
@@ -811,7 +792,7 @@ export function renderAgentApis(
     swarmsEnabled: features.swarmsEnabled,
     personasEnabled: features.personasEnabled,
   };
-  const visible = [...FAMILIES, ...unattendedFamilies(), WHOAMI_FOR_ALL].filter((f) => f.when?.(view) ?? true);
+  const visible = [...FAMILIES, WHOAMI_FOR_ALL].filter((f) => f.when?.(view) ?? true);
   return {
     actorId: claims.actorId,
     scopeId: claims.scopeId,

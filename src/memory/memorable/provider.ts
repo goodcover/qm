@@ -9,7 +9,6 @@ export interface MemorableProviderDeps {
   argv: readonly string[];
   env: NodeJS.ProcessEnv;
   loadItems: (sessionId: string) => Promise<Item[]>;
-  /** Redacts secret values before anything leaves the process. */
   mask?: (text: string) => string;
   injectTimeoutMs?: number;
   recordTimeoutMs?: number;

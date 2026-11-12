@@ -22,9 +22,9 @@ export async function swarmFixture(
     lock?: AdvisoryLock;
     backend?: Sandbox;
     runtime?: Pick<OrchestratorInput, "model" | "thinkingLevel" | "fastMode" | "botActor">;
-    request?: Pick<OrchestratorInput, "memoryNotebookOnly">;
+    request?: Pick<OrchestratorInput, "memoryNotebookOnly" | "scopeVersion">;
     spawnMeta?: Pick<SpawnMeta, "memoryNotebookOnly">;
-    claims?: Pick<CapabilityClaims, "memory">;
+    claims?: Pick<CapabilityClaims, "memory" | "scopeVersion">;
     channel?: string;
   } = {},
 ) {
@@ -68,6 +68,7 @@ export async function swarmFixture(
   };
   const sandboxes = createSandboxResources({
     records,
+    loads: testMap(),
     defaults: testMap(),
     backends: { modal: backend },
     defaultBackend: "modal",
@@ -118,6 +119,7 @@ export async function swarmFixture(
       threadRef: root.threadRef,
       liveActor: true,
       exp: Date.now() + 60_000,
+      ...(options.runtime?.botActor ? { botActor: true } : {}),
       ...options.claims,
     },
   };
@@ -134,7 +136,7 @@ export async function swarmFixture(
     return {
       kind: "agent",
       claims: {
-        actorId: actor.id,
+        actorId: run!.request.actor.id,
         scopeId: root.scopeId,
         runId: notification.runId!,
         sessionId: member.sessionId!,
@@ -142,6 +144,7 @@ export async function swarmFixture(
         runLeaseToken: run!.leaseToken!,
         threadRef: member.threadRef,
         exp: Date.now() + 60_000,
+        ...(run!.request.botActor ? { botActor: true } : {}),
       },
     };
   };

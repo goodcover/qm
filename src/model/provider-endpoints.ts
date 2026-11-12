@@ -5,17 +5,21 @@ import { attestableActor } from "../directory/person.ts";
 import { tenantSettings } from "../tenants/settings.ts";
 import { trimTrailingSlashes } from "../util/text.ts";
 
-export const PROVIDER_IDS = ["anthropic", "openai", "openrouter"] as const;
+export const MODEL_PROVIDERS = ["anthropic", "openai", "openrouter"] as const;
 export const CODEX_SUBSCRIPTION_PROVIDER = "openai-codex";
-type ProviderId = (typeof PROVIDER_IDS)[number];
+export type ModelProvider = (typeof MODEL_PROVIDERS)[number];
 
-const PROVIDER_BASE_URL_ENV: Record<ProviderId, string> = {
+export function isModelProvider(value: unknown): value is ModelProvider {
+  return typeof value === "string" && (MODEL_PROVIDERS as readonly string[]).includes(value);
+}
+
+const PROVIDER_BASE_URL_ENV: Record<ModelProvider, string> = {
   anthropic: "ANTHROPIC_BASE_URL",
   openai: "OPENAI_BASE_URL",
   openrouter: "OPENROUTER_BASE_URL",
 };
 
-export type ProviderBaseUrls = Partial<Record<ProviderId, string>>;
+export type ProviderBaseUrls = Partial<Record<ModelProvider, string>>;
 
 export function gatewayRoot(url: string): string {
   return trimTrailingSlashes(url).replace(/\/v1$/, "");
@@ -49,7 +53,7 @@ export function parseProviderBaseUrl(envName: string, value: string): string {
 
 export function providerBaseUrlsFromEnv(env: NodeJS.ProcessEnv): ProviderBaseUrls {
   const urls: ProviderBaseUrls = {};
-  for (const provider of PROVIDER_IDS) {
+  for (const provider of MODEL_PROVIDERS) {
     const envName = PROVIDER_BASE_URL_ENV[provider];
     const raw = env[envName];
     if (raw?.trim()) urls[provider] = parseProviderBaseUrl(envName, raw);
@@ -64,7 +68,7 @@ export function setProviderBaseUrls(urls: ProviderBaseUrls): void {
 }
 
 export function providerBaseUrl(provider: string): string | undefined {
-  return (PROVIDER_IDS as readonly string[]).includes(provider) ? configured[provider as ProviderId] : undefined;
+  return isModelProvider(provider) ? configured[provider] : undefined;
 }
 
 export class ModelUnavailableError extends Error {
@@ -93,6 +97,7 @@ export type ModelRequestPurpose =
   | "approval_summary"
   | "security_screen"
   | "ack_emoji"
+  | "next_prompt"
   | "memory_capture"
   | "memory_classification"
   | "embedding"

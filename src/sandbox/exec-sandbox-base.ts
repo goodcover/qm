@@ -24,9 +24,7 @@ export const sandboxScopeName = (prefix: string, id: string): string => {
     .replace(/[^a-z0-9-]+/g, "-")
     .replace(/^-+|-+$/g, "");
   const name = `${prefix}-${cleaned.slice(0, 40).replace(/-+$/, "") || "scope"}-${shortHash(id)}`;
-
   if (name.length <= MAX_SANDBOX_NAME) return name;
-
   const hash = shortHash(name);
   const slugBudget = MAX_SANDBOX_NAME - prefix.length - HASH_LEN - 2;
   const slug = slugBudget > 0 ? cleaned.slice(0, slugBudget).replace(/-+$/, "") : "";

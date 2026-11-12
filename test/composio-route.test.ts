@@ -16,6 +16,7 @@ import { orgId } from "../src/config.ts";
 import { createPostgresDirectoryStore } from "../src/directory/postgres-directory-store.ts";
 import { testAdvisoryLock, testDatabaseUrl, testMap, testUserStore } from "./support/test-database.ts";
 import { createPostgresGrantStore } from "../src/acl/postgres-grant-store.ts";
+import { testTenant as tenant } from "./support/test-tenant.ts";
 
 function fixture() {
   const keychain = createKeychain({
@@ -38,7 +39,7 @@ function fixture() {
     composioReturns: testMap(),
     portalUrl: "https://qm.example",
     auditLog: {
-      record: (e: { action: string; resource?: string }) => audits.push(e),
+      record: (_t: unknown, e: { action: string; resource?: string }) => audits.push(e),
     } as unknown as ServerDeps["auditLog"],
     runs: {
       get: async () => ({
@@ -89,6 +90,7 @@ function fixture() {
       res,
       url,
       body,
+      tenant,
       capability,
       actor: actor ? { p: actor, exp: Date.now() + 60_000, ...(impersonating ? { imp: "admin" } : {}) } : null,
     } as ApiCtx;
@@ -113,7 +115,7 @@ function fixture() {
       enabled,
     });
     if (granted)
-      await acl.grant({
+      await acl.grant(tenant, {
         ownerScopeId: org,
         ref: "service-cred:composio",
         granteeScopeId: org,
@@ -781,7 +783,7 @@ test("shared org connections recheck grants for every audience member", async ()
   const f = fixture();
   await f.shared(false);
   const org = scopeId("org", orgId());
-  await f.deps.acl!.grant({
+  await f.deps.acl!.grant(tenant, {
     ownerScopeId: org,
     ref: "service-cred:composio",
     granteeScopeId: "personal:alice",
