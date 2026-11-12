@@ -1,6 +1,7 @@
 import { createHash, createPrivateKey, createPublicKey } from "node:crypto";
 import type { DurableMap } from "../persistence/durable-map.ts";
 import { createSweeper } from "../util/sweeper.ts";
+import { parseSecretJson } from "../util/errors.ts";
 import { claimFlyPeer, createEcsTaskStopped, recordStoppedFlyPeers, type FlyPeerClaim } from "./fly-peer-claims.ts";
 import { startFlyPrivateTunnel, type FlyPrivateTunnel } from "./fly-private-tunnel.ts";
 
@@ -10,12 +11,7 @@ export interface FlyWireguardPeer {
 }
 
 export function parseFlyWireguardPeers(raw: string): FlyWireguardPeer[] {
-  let value: unknown;
-  try {
-    value = JSON.parse(raw);
-  } catch {
-    throw new Error("FLY_DEPLOY_WIREGUARD_PEERS must be a JSON array");
-  }
+  const value = parseSecretJson(raw, "FLY_DEPLOY_WIREGUARD_PEERS");
   if (
     !Array.isArray(value) ||
     value.length < 2 ||
