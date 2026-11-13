@@ -281,6 +281,14 @@ jobs:
           npm ci
           npm ci --prefix plugins/web-ui
           npm ci --prefix desktop --ignore-scripts
+      - name: No tracked file is ignored
+        if: needs.reuse.outputs.reusable != 'true'
+        run: |
+          ignored=$(git -c core.ignorecase=true ls-files -ci --exclude-standard)
+          if [ -n "$ignored" ]; then
+            printf 'These tracked files match .gitignore; remove them from Git:\n%s\nImages go on the PR, not in the repo (AGENTS.md). A product asset needs its own !path line in .gitignore.\n' "$ignored"
+            exit 1
+          fi
       - name: Formatting
         if: needs.reuse.outputs.reusable != 'true'
         run: npm run format:check
@@ -293,10 +301,13 @@ jobs:
       - name: Oxlint
         if: needs.reuse.outputs.reusable != 'true'
         run: npm run lint:ox
+      - name: Tenant ratchet
+        if: needs.reuse.outputs.reusable != 'true'
+        run: npm run lint:tenancy
 
   core-postgres:
     name: Core Postgres tests
-    timeout-minutes: 3
+    timeout-minutes: 10
     needs: reuse
     if: always() && !cancelled()
     runs-on: ubuntu-latest
@@ -345,6 +356,23 @@ jobs:
           # Pinned vendor CLI under test; not shipped, so the repo's release-age guard is bypassed for this install only.
           npm i --no-save --no-audit --no-fund --min-release-age=0 memorable-cli@0.5.15
           node --test test/e2e/memorable-cli.e2e.test.ts
+      - name: Upgrade from the latest published release as a managed Postgres app login
+        if: needs.reuse.outputs.reusable != 'true'
+        env:
+          DATABASE_URL: postgres://qm_installer:qm_installer@localhost:5432/qm_upgrade
+          QM_UPGRADE_APP_URL: postgres://schema_admin:schema_admin@localhost:5432/qm_upgrade
+        run: |
+          docker exec -i ${{ job.services.postgres.id }} psql -U postgres -v ON_ERROR_STOP=1 <<'SQL'
+          CREATE ROLE qm_installer LOGIN SUPERUSER PASSWORD 'qm_installer';
+          CREATE ROLE schema_admin LOGIN PASSWORD 'schema_admin';
+          CREATE DATABASE qm_upgrade;
+          GRANT CONNECT, CREATE, TEMPORARY ON DATABASE qm_upgrade TO schema_admin;
+          \c qm_upgrade
+          CREATE EXTENSION vector;
+          GRANT USAGE, CREATE ON SCHEMA public TO schema_admin;
+          SQL
+          git fetch --quiet --depth 1 https://github.com/yc-software/qm.git 'refs/tags/v*:refs/tags/v*'
+          scripts/check-published-upgrade.sh
 
   web-ui-plugin:
     name: Web UI plugin
@@ -377,9 +405,9 @@ jobs:
           npm run typecheck
           npm test
           npm run build
-      - name: Build and boot production image
+      - name: Build and boot the core image's web front door
         if: needs.reuse.outputs.reusable != 'true'
-        run: bash scripts/smoke-surface-image.sh web-ui
+        run: bash scripts/smoke-core-image.sh
 
   auth-plugin:
     name: Auth plugin
@@ -406,9 +434,6 @@ jobs:
           npm ci
           npm run typecheck
           npm test
-      - name: Build and boot production image
-        if: needs.reuse.outputs.reusable != 'true'
-        run: bash scripts/smoke-surface-image.sh auth
 
   portal-plugin:
     name: Portal plugin
@@ -438,9 +463,6 @@ jobs:
           npm ci
           npm run typecheck
           npm test
-      - name: Build and boot production image
-        if: needs.reuse.outputs.reusable != 'true'
-        run: bash scripts/smoke-surface-image.sh portal
 
   certify:
     name: Certify tested tree

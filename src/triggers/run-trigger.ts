@@ -11,7 +11,6 @@ import { reachEnqueue } from "../reach/reach.ts";
 import { isVisible, type VisibilityDirectory } from "../directory/visibility.ts";
 import type { DirectoryMember, DirectoryStore, RecipientResolution } from "../directory/directory-store.ts";
 import { samePerson } from "../directory/person.ts";
-import { grantsHomedWithOwner } from "../cron/authority.ts";
 import type { CurrentScopeMembers } from "../resolution/scope-membership.ts";
 import { isProjectGroupRef } from "../projects/project-store.ts";
 import { reportFailureAs, swallowAs } from "../util/errors.ts";
@@ -36,7 +35,10 @@ export interface TriggerDeps {
   resolveRecipient?: (query: string) => Promise<RecipientResolution>;
 }
 
-export interface TriggerSpec extends Pick<TurnRequest, "model" | "fastMode" | "attachments"> {
+export interface TriggerSpec extends Pick<
+  TurnRequest,
+  "model" | "fastMode" | "attachments" | "infrequentCron" | "memoryNotebookOnly" | "botActor"
+> {
   runtime?: import("../agent/agent.ts").RuntimeChoice | null;
   title?: string;
   owner: string;
@@ -48,13 +50,15 @@ export interface TriggerSpec extends Pick<TurnRequest, "model" | "fastMode" | "a
   destination?: Destination;
   message?: string;
   threadRef?: string;
-  unattendedGrants?: string[];
+  personaId?: string;
+  ownerFire?: boolean;
   cronScript?: CronScript;
   shadow?: boolean;
   thinkingLevel?: string;
   readOnly?: boolean;
   turnWallClockMs?: number;
   errorNotice?: (noteOrStatus: string) => string;
+  redrivesHandOff?: boolean;
   onClaimed?: () => Promise<void>;
 }
 
@@ -293,22 +297,27 @@ export async function runTrigger(deps: TriggerDeps, spec: TriggerSpec): Promise<
       text: typeof spec.input === "string" ? spec.input : spec.input(roster),
       origin: {
         kind: "automation",
+        ...(spec.ownerFire && !runsAsScope ? { ownerFire: true as const } : {}),
         ...(spec.securityScreenData !== undefined ? { screenData: spec.securityScreenData } : {}),
         ...(spec.destination ? { destination: spec.destination } : {}),
         ...(scheduled && !runsAsScope && conversation.kind !== "dm" ? { useOwnerKeychain: true } : {}),
       },
-      ...(spec.unattendedGrants && grantsHomedWithOwner(spec) ? { unattendedGrants: spec.unattendedGrants } : {}),
       ...(spec.cronScript ? { cronScript: spec.cronScript } : {}),
+      ...(spec.personaId ? { personaId: spec.personaId } : {}),
+      ...(spec.botActor ? { botActor: true } : {}),
+      ...(spec.infrequentCron ? { infrequentCron: true } : {}),
       ...(spec.runtime ? { model: spec.runtime.modelId } : {}),
       ...turnModelOptions({
         triggered: true,
         surface: spec.surface,
+        infrequentCron: spec.infrequentCron,
         thinkingLevel: spec.runtime?.effortLevel ?? spec.thinkingLevel,
         fastMode: spec.fastMode ?? spec.runtime?.fastMode,
       }),
       ...(spec.model ? { model: spec.model } : {}),
       ...(spec.attachments?.length ? { attachments: spec.attachments } : {}),
       ...(spec.readOnly ? { readOnly: true } : {}),
+      ...(spec.memoryNotebookOnly ? { memoryNotebookOnly: true } : {}),
       ...(typeof spec.turnWallClockMs === "number" ? { turnWallClockMs: spec.turnWallClockMs } : {}),
       ...(spec.destination?.type === "webhook" && deliverable && !spec.shadow
         ? { deliveryTarget: spec.destination.target }
@@ -317,7 +326,7 @@ export async function runTrigger(deps: TriggerDeps, spec: TriggerSpec): Promise<
       idempotencyKey: spec.fireKey,
     });
     if (res.status === "queued") {
-      await sendErrorNotice(userFacingFailureClause(res));
+      if (!spec.redrivesHandOff) await sendErrorNotice(userFacingFailureClause(res));
       throw new TransientTurnFailure(`turn ${res.runId ?? ""} was still waiting to finish when this process shut down`);
     }
     status = res.status;
@@ -344,7 +353,7 @@ export async function runTrigger(deps: TriggerDeps, spec: TriggerSpec): Promise<
       }
       await reachEnqueue({
         deliveries: deps.deliveries,
-        destination: spec.destination,
+        destination: res.persona ? { ...spec.destination, persona: res.persona } : spec.destination,
         text: res.reply ?? "",
         ...(res.attachments?.length ? { attachments: res.attachments } : {}),
         idempotencyKey: spec.fireKey,

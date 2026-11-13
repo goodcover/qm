@@ -1,7 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { applyTurnEffort, createAgent } from "../src/agent/agent-run.ts";
-import type { AgentOptions } from "../src/agent/agent-run.ts";
+import { createAgent } from "../src/agent/agent-run.ts";
+import { applyTurnEffort } from "../src/agent/turn-effort.ts";
+import { createModelRoutes, type ModelRouteOptions } from "../src/model/model-route.ts";
 import type { TurnLlmRequestRecord, AgentTurnInput } from "../src/agent/agent.ts";
 import { storedItem } from "../src/sessions/items.ts";
 import type { Api, Model, Usage } from "@earendil-works/pi-ai";
@@ -331,30 +332,32 @@ async function runTurn(
   fastMode: boolean,
   respond: (payload: Record<string, unknown>, index: number) => Response,
   gateway = false,
-  extra: Partial<AgentOptions> = {},
+  extra: ModelRouteOptions = {},
 ): Promise<{ rows: TurnLlmRequestRecord[]; payloads: Array<Record<string, unknown>>; betas: Array<string | null> }> {
   const rows: TurnLlmRequestRecord[] = [];
   const payloads: Array<Record<string, unknown>> = [];
   const betas: Array<string | null> = [];
   const agent = createAgent({
-    apiKey: "sk-anthropic-test",
-    openaiApiKey: "sk-openai-test",
-    ...(gateway
-      ? {
-          modelGateway: {
-            url: "https://gateway.example/v1",
-            apiKey: "sk-gateway-test",
-            apiKeyHeader: "x-gateway-key",
-            models: {
-              "gpt-6-astra": "openai/gpt-6-astra",
-              "gpt-6-astra-ultrafast": "openai/gpt-6-astra",
-              "gpt-6.1-sol-ultrafast": "openai/gpt-6.1-sol",
-              "claude-sonnet-5": "anthropic/claude-sonnet-5",
+    routes: createModelRoutes({
+      apiKey: "sk-anthropic-test",
+      openaiApiKey: "sk-openai-test",
+      ...(gateway
+        ? {
+            modelGateway: {
+              url: "https://gateway.example/v1",
+              apiKey: "sk-gateway-test",
+              apiKeyHeader: "x-gateway-key",
+              models: {
+                "gpt-6-astra": "openai/gpt-6-astra",
+                "gpt-6-astra-ultrafast": "openai/gpt-6-astra",
+                "gpt-6.1-sol-ultrafast": "openai/gpt-6.1-sol",
+                "claude-sonnet-5": "anthropic/claude-sonnet-5",
+              },
             },
-          },
-        }
-      : {}),
-    ...extra,
+          }
+        : {}),
+      ...extra,
+    }),
   });
   const realFetch = globalThis.fetch;
   globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
@@ -511,6 +514,25 @@ test("an Ultrafast turn OpenAI serves at another tier is priced at the base mode
   }
 });
 
+test("a Claude turn is priced at the speed the provider served, whatever speed was requested", async () => {
+  for (const [requested, served, cost] of [
+    [true, "fast", 0.15],
+    [true, "standard", 0.075],
+    [true, undefined, 0.15],
+    [false, "fast", 0.15],
+    [false, "standard", 0.075],
+  ] as const) {
+    const { rows, payloads } = await runTurn(
+      `opus-served-${requested}-${served ?? "silent"}`,
+      "claude-opus-5",
+      requested,
+      () => anthropicReply("done", { ...ANTHROPIC_WIRE_USAGE, ...(served ? { speed: served } : {}) }),
+    );
+    assert.equal(payloads[0]!.speed, requested ? "fast" : undefined);
+    assertUsd(rows[0]!.usage!.costUsd, cost);
+  }
+});
+
 test("a stop_reason refusal retries on the admin-configured fallback runtime", async () => {
   const { payloads } = await runTurn(
     "refusal-configured-fallback",
@@ -552,10 +574,12 @@ test("an unavailable gateway model fails the turn without fallback (no structure
 
 test("compaction retries a refused summary on the configured fallback model", async () => {
   const agent = createAgent({
-    apiKey: "sk-anthropic-test",
-    openaiApiKey: "sk-openai-test",
-    modelId: "claude-sonnet-5",
-    resolveFallbackRuntime: () => ({ modelId: "gpt-6-sol" }),
+    routes: createModelRoutes({
+      apiKey: "sk-anthropic-test",
+      openaiApiKey: "sk-openai-test",
+      modelId: "claude-sonnet-5",
+      resolveFallbackRuntime: () => ({ modelId: "gpt-6-sol" }),
+    }),
   });
   const models: unknown[] = [];
   const realFetch = globalThis.fetch;

@@ -23,9 +23,29 @@ import { createSessionParticipants, participantSessionsSql } from "./session-par
 import { LIST_COLUMNS, rowToParticipantSession, rowToSession } from "./session-rows.ts";
 import { cronIdOf, sessionOrigin } from "./session-store.ts";
 import { TENANT } from "./items.ts";
+import {
+  PARTNER_CHAT_TENANT,
+  SLACK_TENANTS,
+  SLACK_BRIDGE_TENANT,
+  TENANT_LOOKUPS,
+  tenantLookup,
+} from "../tenants/lookup.ts";
 
 export function createPostgresSessionStore(connectionString: string, opts: StoreOptions = {}): SessionStore {
   const now = opts.now ?? (() => Date.now());
+
+  async function getMany({
+    ids,
+    threadRefs,
+  }: {
+    ids: readonly string[];
+    threadRefs: readonly string[];
+  }): Promise<Session[]> {
+    if (!ids.length && !threadRefs.length) return [];
+    return (
+      await q("SELECT * FROM sessions WHERE id = ANY($1::text[]) OR thread_ref = ANY($2::text[])", [ids, threadRefs])
+    ).map(rowToSession);
+  }
 
   const descendantsOf = async (rootIds: readonly string[]): Promise<SessionDescendant[]> => {
     if (!rootIds.length) return [];
@@ -42,10 +62,18 @@ export function createPostgresSessionStore(connectionString: string, opts: Store
     return rows.map((r) => ({ id: r.id as string, rootId: r.root_id as string, threadRef: r.thread_ref as string }));
   };
 
-  const db = createPgPool(connectionString, [...DIRECTORY_MIGRATIONS, ...SESSION_MIGRATIONS]);
+  const db = createPgPool(connectionString, [
+    ...DIRECTORY_MIGRATIONS,
+    ...SESSION_MIGRATIONS,
+    TENANT_LOOKUPS,
+    SLACK_TENANTS,
+    SLACK_BRIDGE_TENANT,
+    PARTNER_CHAT_TENANT,
+  ]);
   const { pool, q } = db;
 
   return {
+    tenantLookup: tenantLookup(db),
     async getOrCreateByThread(threadRef, type, scopeId, channelName, surface, clientTools, facts): Promise<Session> {
       const heal = async (row: Record<string, unknown>): Promise<Session> => {
         const s = rowToSession(row);
@@ -101,28 +129,30 @@ export function createPostgresSessionStore(connectionString: string, opts: Store
       return heal(rows[0]!);
     },
 
+    getMany,
     async getByThread(threadRef): Promise<Session | null> {
-      const rows = await q("SELECT * FROM sessions WHERE thread_ref = $1", [threadRef]);
-      return rows[0] ? rowToSession(rows[0]) : null;
+      return (await getMany({ ids: [], threadRefs: [threadRef] }))[0] ?? null;
     },
 
     async get(id): Promise<Session | null> {
-      const rows = await q("SELECT * FROM sessions WHERE id = $1", [id]);
-      return rows[0] ? rowToSession(rows[0]) : null;
+      return (await getMany({ ids: [id], threadRefs: [] }))[0] ?? null;
     },
 
     async updateTitle(sessionId, title): Promise<void> {
       await q("UPDATE sessions SET title = $2 WHERE id = $1", [sessionId, title]);
     },
 
-    async sideChatsOf(sessionId) {
-      const rows = await q(
-        `SELECT s.* FROM sessions s WHERE s.forked_from_session_id = $1 AND s.side_chat IS NOT NULL
+    async sideChatsOf(sessionId, principalId) {
+      const condition = `s.forked_from_session_id = $${principalId === undefined ? 1 : 2} AND s.side_chat IS NOT NULL
          AND EXISTS (SELECT 1 FROM items i WHERE i.tenant_id = ${TENANT} AND i.session_id = s.id
-           AND i.seq > s.fork_boundary_seq AND i.kind = 'UserMessage') ORDER BY s.created_at`,
-        [sessionId],
+           AND i.seq > s.fork_boundary_seq AND i.kind = 'UserMessage') ORDER BY s.created_at`;
+      const rows = await q(
+        principalId === undefined
+          ? `SELECT s.* FROM sessions s WHERE ${condition}`
+          : participantSessionsSql(` AND ${condition}`),
+        principalId === undefined ? [sessionId] : [principalId, sessionId],
       );
-      return rows.map(rowToSession);
+      return rows.map(principalId === undefined ? rowToSession : rowToParticipantSession);
     },
 
     async expandSideChat(sessionId) {
@@ -158,6 +188,19 @@ export function createPostgresSessionStore(connectionString: string, opts: Store
         sessionId,
         JSON.stringify(runtime),
       ]);
+    },
+
+    async setPersona(sessionId, personaId): Promise<void> {
+      await q("UPDATE sessions SET persona_id = $2 WHERE id = $1", [sessionId, personaId]);
+    },
+
+    async threadsWithPersona(personaId, threadRefs): Promise<Set<string>> {
+      if (!threadRefs.length) return new Set();
+      const rows = await q("SELECT thread_ref FROM sessions WHERE thread_ref = ANY($1::text[]) AND persona_id = $2", [
+        threadRefs,
+        personaId,
+      ]);
+      return new Set(rows.map((r) => r.thread_ref as string));
     },
 
     async endedInFailure(sessionIds): Promise<Set<string>> {

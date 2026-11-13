@@ -9,7 +9,6 @@ export interface MemorableProviderDeps {
   argv: readonly string[];
   env: NodeJS.ProcessEnv;
   loadItems: (sessionId: string) => Promise<Item[]>;
-  /** Redacts secret values before anything leaves the process. */
   mask?: (text: string) => string;
   injectTimeoutMs?: number;
   recordTimeoutMs?: number;
@@ -52,10 +51,10 @@ export function createMemorableMemoryProvider(deps: MemorableProviderDeps): Memo
       const task = context?.query?.trim();
       if (!task) return [];
       const block = await inject(deps.argv, scopeId, task, spawnOpts, deps.injectTimeoutMs);
-      return block ? [{ text: block, score: 0.2 }] : [];
+      return block ? [{ text: block }] : [];
     },
 
-    async capture(scopeId: ScopeId, _facts, _at, _author, context) {
+    async capture(scopeId: ScopeId, _facts, _at, _by, context) {
       if (context?.mode !== "automatic" || !context.sessionId) return 0;
       const capture = redactCapture(
         captureSession(context.sessionId, scopeId, await deps.loadItems(context.sessionId)),

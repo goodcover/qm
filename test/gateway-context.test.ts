@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { renderGatewayContext } from "../src/core/orchestrator/prompt-blocks.ts";
+import { renderGatewayContext, webSurfaceLabel } from "../src/core/orchestrator/prompt-blocks.ts";
 import { buildApp } from "./support/build-app.ts";
 import type { Config } from "../src/config.ts";
 import { scopeId } from "../src/types.ts";
@@ -40,6 +40,11 @@ test("surface-supplied instructions are appended verbatim (and alone are enough 
   const only = renderGatewayContext(undefined, { instructions: "do the thing" });
   assert.match(only, /^## Where you are/);
   assert.match(only, /do the thing/);
+});
+
+test("a web chat relayed by another app says so and that web UI widgets won't render there", () => {
+  assert.equal(webSurfaceLabel("QM", false), "the QM web app");
+  assert.match(webSurfaceLabel("QM", true), /^another app that relays this chat to QM .*non-web paths/);
 });
 
 test("reactionGuidance is detection-only — never rendered into the main prompt", () => {
@@ -87,6 +92,26 @@ test("no gateway context: prompt names the surface but adds no identifier lines"
   assert.equal(res.status, "ok");
   assert.match(res.reply ?? "", /^Slack DM with U2\.$/m);
   assert.doesNotMatch(res.reply ?? "", /Identifiers for this conversation/);
+});
+
+test("a DM names the person by the name stored at sign-in, then by email, never by the raw sign-in id", async () => {
+  const { app, users } = freshApp();
+  const dmWith = async (externalId: string) => {
+    const res = await app.turn({
+      surface: "web",
+      actor: { externalId },
+      conversation: { kind: "dm", threadRef: `web:${externalId}:t1` },
+      text: "!sysprompt",
+    });
+    assert.equal(res.status, "ok", JSON.stringify(res));
+    return res.reply ?? "";
+  };
+  await users.setDisplayName("oidc:issuer:ada", "Ada Founder");
+  const named = await dmWith("oidc:issuer:ada");
+  assert.match(named, /^Web DM with Ada Founder\.$/m);
+  assert.doesNotMatch(named, /oidc:issuer:ada\./);
+  assert.match(await dmWith("grace@example.com"), /^Web DM with grace@example\.com\.$/m);
+  assert.match(await dmWith("oidc:issuer:nobody"), /^Web DM with Unknown person\.$/m);
 });
 
 test("web prompt tells cron creators to use a real notification destination", async () => {

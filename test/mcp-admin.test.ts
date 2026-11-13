@@ -12,7 +12,7 @@ import { testConfig } from "./support/test-config.ts";
 import { createMcpServerStore, type McpServer } from "../src/mcp/mcp-server-store.ts";
 import { loopbackFetch, startMcpTestServer } from "./support/mcp-test-server.ts";
 import { createMcpToolService } from "../src/mcp/mcp-tool-service.ts";
-import { discoverOAuth } from "../src/mcp/oauth-discovery.ts";
+import { discoverOAuth, registerPublicClient } from "../src/mcp/oauth-discovery.ts";
 import { errMessage } from "../src/util/errors.ts";
 import { testMap } from "./support/test-database.ts";
 
@@ -71,6 +71,15 @@ test("MCP admin validates and preserves credential scope, without returning secr
     ).status,
     403,
   );
+  assert.equal((await put({})).status, 200);
+  assert.equal((await store.get("crm"))?.readOnly, false);
+  assert.equal((await put({ readOnly: true })).status, 200);
+  assert.equal((await put({})).status, 200);
+  assert.equal((await store.get("crm"))?.readOnly, true, "an update that omits readOnly keeps it");
+  assert.equal((await put({ enabled: false })).status, 200);
+  assert.equal((await put({})).status, 200);
+  assert.equal((await store.get("crm"))?.enabled, false, "an update that omits enabled keeps it");
+  assert.equal((await put({ enabled: true })).status, 200);
   const saved = await put({
     credentialScope: "per-user",
     credentialHost: "accounts.example.com",
@@ -100,7 +109,7 @@ test("MCP admin validates and preserves credential scope, without returning secr
   assert.equal((await store.get("crm"))?.approval, undefined);
   assert.equal((await put({ attestActor: true })).status, 400);
   assert.equal(
-    (await put({ catalog: true, attestActor: true })).status,
+    (await put({ catalog: true, attestActor: true, auth: "none" })).status,
     400,
     "an unauthenticated upstream cannot trust the actor",
   );
@@ -124,6 +133,22 @@ test("MCP admin validates and preserves credential scope, without returning secr
     200,
   );
   assert.deepEqual([(await store.get("crm"))?.catalog, (await store.get("crm"))?.attestActor], [true, true]);
+  const bearer = { auth: "bearer", bearerToken: "t" };
+  assert.equal((await put({ ...bearer, attestAudience: "everywhere" })).status, 400);
+  assert.equal((await put({ ...bearer, attestAudience: "any" })).status, 200);
+  assert.equal((await store.get("crm"))?.attestAudience, "any");
+  assert.equal((await put(bearer)).status, 200);
+  assert.equal((await store.get("crm"))?.attestAudience, "any", "an update that omits the audience keeps it");
+  assert.equal((await put({ ...bearer, attestAudience: "personal" })).status, 200);
+  assert.equal((await store.get("crm"))?.attestAudience, undefined);
+  assert.equal((await put({ ...bearer, attestActor: false, attestAudience: "any" })).status, 400);
+  assert.equal((await put({ ...bearer, attestAudience: "any" })).status, 200);
+  assert.equal((await put({ ...bearer, attestActor: false })).status, 200);
+  assert.deepEqual(
+    [(await store.get("crm"))?.attestActor, (await store.get("crm"))?.attestAudience],
+    [undefined, undefined],
+    "turning attestation off drops its audience",
+  );
   assert.equal((await put({ catalog: false, attestActor: false })).status, 200);
   assert.equal(
     (await put({ auth: "oauth", credentialScope: "per-user", url: "https://mcp.plain.com/mcp" })).status,
@@ -164,6 +189,29 @@ test("MCP admin validates and preserves credential scope, without returning secr
     ).status,
     400,
   );
+  const kept = { url: "https://tools.example.com/mcp", tools: [{ name: "lookup", description: "", inputSchema: {} }] };
+  const seeds = [
+    { id: "bearer", auth: "bearer", bearerToken: "s", ...kept },
+    { id: "client", auth: "client-credentials", clientId: "i", clientSecret: "s", ...kept },
+    {
+      id: "oauth",
+      auth: "oauth-user",
+      credentialScope: "per-user",
+      credentialHost: "tools.example.com",
+      clientId: "i",
+      oauthAuthorizeUrl: "https://id.example.com/a",
+      oauthTokenUrl: "https://id.example.com/t",
+      ...kept,
+    },
+  ];
+  for (const seed of seeds) {
+    const record = { name: "N", about: "A", credentialScope: "shared", readOnly: false, enabled: true, ...seed };
+    await store.put({ ...record, updatedAt: 0, updatedBy: "a" } as McpServer);
+    const edit = { method: "PUT", headers: ADMIN, body: JSON.stringify({ validate: false, readOnly: false }) };
+    assert.equal((await fetch(url.replace(/crm$/, seed.id), edit)).status, 200);
+    const after: Record<string, unknown> = { ...(await store.get(seed.id)) };
+    assert.deepEqual(Object.fromEntries(Object.keys(record).map((k) => [k, after[k]])), record);
+  }
 });
 
 test("production wiring never uses operator fallback tokens for per-user MCP calls and refuses private MCP addresses", async (t) => {
@@ -208,37 +256,6 @@ test("production wiring never uses operator fallback tokens for per-user MCP cal
     /private network address/.test(errMessage(e)),
   );
   assert.equal(remote.requests.length, 0, "production wiring refuses a loopback MCP server");
-});
-
-test("production wiring reaches a private MCP host only when the operator lists it", async (t) => {
-  const dir = await mkdtemp(join(tmpdir(), "mcp-private-hosts-"));
-  const built = buildApp(testConfig({ dataDir: dir, mcpPrivateHosts: ["localhost"] }));
-  const remote = await startMcpTestServer(t, {
-    tools: [{ name: "query", inputSchema: { type: "object" } }],
-    call: () => ({ content: [{ type: "text", text: "metrics ok" }] }),
-  });
-  t.after(async () => {
-    built.mcpToolService.close();
-    await rm(dir, { recursive: true, force: true });
-  });
-  const server = (id: string, host: string): McpServer => ({
-    id,
-    name: id,
-    url: `http://${host}:${new URL(remote.url).port}/mcp`,
-    auth: "none",
-    readOnly: true,
-    enabled: true,
-    updatedAt: Date.now(),
-    updatedBy: "internal:admin",
-  });
-  await built.mcpServers.put(server("listed", "localhost"));
-  await built.mcpToolService.refresh();
-  assert.equal(await built.mcpToolService.call("listed_query", {}, "internal:alice"), "metrics ok");
-  const reached = remote.requests.length;
-  await assert.rejects(built.mcpToolService.probe(server("unlisted", "127.0.0.1")), (e: unknown) =>
-    /127\.0\.0\.1 is a private network address/.test(errMessage(e)),
-  );
-  assert.equal(remote.requests.length, reached);
 });
 
 test("MCP admin accepts per-user OAuth servers, discovers endpoints only from public addresses, and never shadows built-in connectors", async (t) => {
@@ -287,6 +304,40 @@ test("MCP admin accepts per-user OAuth servers, discovers endpoints only from pu
     errors: [],
   });
   assert.match((await discoverOAuth(new URL(`${issuer}/elsewhere`), metadataFetch)).errors.join("; "), /HTTP 404/);
+  const registrable = {
+    ...metadata[`${issuer}/.well-known/oauth-authorization-server/id`],
+    issuer: `${issuer}/id`,
+    response_types_supported: ["code"],
+    registration_endpoint: `${issuer}/id/register`,
+  };
+  const withRegistration = async (input: string | URL) =>
+    String(input).endsWith("/oauth-authorization-server/id") ? Response.json(registrable) : metadataFetch(input);
+  const found = await discoverOAuth(new URL(`${issuer}/mcp`), withRegistration);
+  assert.equal(found.registrable?.registration_endpoint, `${issuer}/id/register`);
+  const registrations: Array<{ url: string; body: Record<string, unknown> }> = [];
+  const registerFetch = async (input: string | URL, init?: RequestInit) => {
+    registrations.push({ url: String(input), body: JSON.parse(String(init?.body)) });
+    return Response.json({ client_id: "dcr-client", redirect_uris: ["https://qm.test/cb"] }, { status: 201 });
+  };
+  assert.equal(await registerPublicClient(found.registrable!, ["https://qm.test/cb"], registerFetch), "dcr-client");
+  assert.deepEqual(registrations, [
+    {
+      url: `${issuer}/id/register`,
+      body: {
+        client_name: "QM",
+        redirect_uris: ["https://qm.test/cb"],
+        grant_types: ["authorization_code", "refresh_token"],
+        response_types: ["code"],
+        token_endpoint_auth_method: "none",
+      },
+    },
+  ]);
+  await assert.rejects(
+    registerPublicClient(found.registrable!, ["https://qm.test/cb"], async () =>
+      Response.json({ error: "access_denied", error_description: "registration is closed" }, { status: 403 }),
+    ),
+    /registration is closed/,
+  );
 
   const plainHttp = await put("orders", { clientId: "c", url: "http://127.0.0.1/mcp" });
   assert.equal(plainHttp.status, 400);

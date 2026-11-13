@@ -50,12 +50,7 @@ mock.module("./support/mock-agent.ts", {
   },
 });
 const wiring = await import("./support/build-app.ts");
-const { orgId } = await import("../src/config.ts");
-const buildApp = (...args: Parameters<typeof wiring.buildApp>): ReturnType<typeof wiring.buildApp> => {
-  const built = wiring.buildApp(...args);
-  void built.featureFlags.setEnabled("swarms", `org:${orgId()}`, true, "test");
-  return built;
-};
+const { buildApp } = wiring;
 test.after(() => fake.cleanup());
 
 for (const kind of ["command", "security-screen"] as const) {
@@ -555,19 +550,6 @@ test("disabled swarms park queued notifications once without running the model o
   }
 });
 
-test("swarms stay off for a person until the swarms flag names their personal scope", async () => {
-  const built = wiring.buildApp(testConfig());
-  try {
-    assert.ok(built.app.swarms);
-    assert.equal(await built.app.swarms.enabledFor("U1"), false);
-    await built.featureFlags.setEnabled("swarms", "personal:U1", true, "test");
-    assert.equal(await built.app.swarms.enabledFor("U1"), true);
-    assert.equal(await built.app.swarms.enabledFor("U2"), false);
-  } finally {
-    await built.runtime.stop();
-  }
-});
-
 test("a goal assigned at spawn becomes the worker's session goal and its turn has no swarm deadline", async () => {
   const built = buildApp(testConfig({ modalSandbox: { tokenId: "test", tokenSecret: "test" } }));
   try {
@@ -676,28 +658,33 @@ test("a worker's wake:false reply waits in the root's mailbox and reaches the ro
     exerciseTurn = async (turn) => {
       if (!turn.input.startsWith("Swarm ")) return;
       const run = (await built.runs.get(turn.runId!))!;
-      await built.app.swarms!.send(
-        {
-          kind: "agent",
-          claims: {
-            actorId: "U1",
-            scopeId: turn.session.scopeId,
-            runId: run.id,
-            sessionId: turn.session.id,
-            runAttempt: run.attempts,
-            runLeaseToken: run.leaseToken!,
-            threadRef: turn.session.threadRef,
-            exp: Date.now() + 60_000,
+      for (const [requestId, text] of [
+        ["ack", "brief read"],
+        ["risk", "!security-risk status"],
+        ["lane", "lane two is clear"],
+      ])
+        await built.app.swarms!.send(
+          {
+            kind: "agent",
+            claims: {
+              actorId: "U1",
+              scopeId: turn.session.scopeId,
+              runId: run.id,
+              sessionId: turn.session.id,
+              runAttempt: run.attempts,
+              runLeaseToken: run.leaseToken!,
+              threadRef: turn.session.threadRef,
+              exp: Date.now() + 60_000,
+            },
           },
-        },
-        {
-          requestId: "ack",
-          audience: [root.id],
-          replyTo: worker.request.swarm!.messageId,
-          wake: false,
-          text: "brief read",
-        },
-      );
+          {
+            requestId: requestId!,
+            audience: [root.id],
+            replyTo: worker.request.swarm!.messageId,
+            wake: false,
+            text: text!,
+          },
+        );
     };
     built.runtime.start();
     const workerDone = await built.runs.waitFor(worker.id, 15_000);
@@ -718,7 +705,7 @@ test("a worker's wake:false reply waits in the root's mailbox and reaches the ro
     const status = await human("Status now?");
     assert.equal(status.status, "ok", JSON.stringify(status));
     assert.equal((await human("Anything else?")).status, "ok");
-    assert.match(environments[0]!, /brief read/);
+    assert.match(environments[0]!, /brief read[\s\S]*lane two is clear/);
     assert.match(environments[1]!, /brief read/, "a turn that stopped before recording it keeps it");
     assert.doesNotMatch(environments[2]!, /brief read/);
   } finally {

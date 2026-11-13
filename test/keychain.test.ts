@@ -22,7 +22,7 @@ import {
 } from "../src/credentials/keychain.ts";
 import { type DurableMap, type DurableMapSelect } from "../src/persistence/durable-map.ts";
 import { envKey } from "../src/credentials/connector-token.ts";
-import { deriveConnectorKey } from "../src/connectors/connector-client-store.ts";
+import { deriveConnectorKey, encryptSecret } from "../src/connectors/connector-client-store.ts";
 import { mintCapabilityToken, CAPABILITY_TTL_MS, type CapabilityClaims } from "../src/auth/capability-token.ts";
 import { scopeId, type TurnRequest } from "../src/types.ts";
 import { fakeSprites } from "./support/auto-fake-sprites.ts";
@@ -242,7 +242,7 @@ test("legacy retry grants remain consumed and invalidate prepared uses", async (
   });
   const prepared = await k.prepareMaterialize(grant.id, "channel:C1", "U2");
   await grants.put(grant.id, { ...grant, status: "active", usedAt: Date.now(), usedBy: "U2" });
-  assert.equal((await k.grantsForScope("channel:C1")).length, 0);
+  assert.equal((await k.grantsForScope("channel:C1", { includePersonGrants: true })).length, 0);
   for (const actor of ["U2", "U3"])
     await assert.rejects(materializeGrant(k, grant.id, "channel:C1", actor), (e: KeychainError) => e.status === 410);
   await assert.rejects(prepared.commit(), (e: KeychainError) => e.status === 410);
@@ -489,6 +489,31 @@ describe("connectors are grantable like any keychain record", () => {
     });
     assert.doesNotMatch(md, /Alex|gmail|[a-f0-9]{16}/);
   });
+});
+
+test("revoking a once-grant that is claimed mid-revoke keeps it used", async () => {
+  const grants = testMap<KeychainGrant>();
+  const k = createKeychain({ lock: testAdvisoryLock(), creds: testMap(), grants, asks: testMap(), key: KEY });
+  const cred = await k.save(GH);
+  const grant = await k.createGrant({
+    credentialId: cred.id,
+    ownerId: "U1",
+    audienceScopeId: "channel:C1",
+    mode: "once",
+    purpose: "clone once",
+  });
+  const get = grants.get.bind(grants);
+  let raced = false;
+  grants.get = async (id) => {
+    const seen = await get(id);
+    if (!raced && seen?.status === "active") {
+      raced = true;
+      await materializeGrant(k, grant.id, "channel:C1", "U2");
+    }
+    return seen;
+  };
+  assert.equal(await k.revokeGrant("U1", grant.id), true);
+  assert.equal((await get(grant.id))!.status, "used");
 });
 
 test("standing grants are reusable, revocable, and die with the credential", async () => {
@@ -739,6 +764,19 @@ test("single-grant materialize surfaces a 422 (not a raw crypto 500) when the ro
     (e: KeychainError) => e.status === 422,
     "an undecryptable row yields a clean 422, not a crash",
   );
+});
+
+test("a stored secret that is not valid JSON is skipped without logging its contents", async (t) => {
+  const creds = testMap<import("../src/credentials/keychain.ts").KeychainCredential>();
+  const k = createKeychain({ lock: testAdvisoryLock(), creds, grants: testMap(), asks: testMap(), key: KEY });
+  const meta = await k.save({ ownerId: "U1", service: "db", fields: [{ envKey: "DB_PASS", value: "pw" }] });
+  await creds.merge(meta.id, { secretEnc: encryptSecret("zq7Kp2Wx", KEY) });
+  const errors = t.mock.method(console, "error", () => {});
+  assert.deepEqual(await k.materializeOwn("U1"), []);
+  const logged = errors.mock.calls.map((call) => call.arguments.map(String).join(" "));
+  assert.equal(logged.length, 1);
+  assert.match(logged[0]!, /is not valid JSON/);
+  assert.ok(!logged[0]!.includes("zq7Kp2Wx"));
 });
 
 test("multi-input login: each field becomes its own env var, values never in metadata, materializes in order", async () => {
@@ -1110,9 +1148,9 @@ describe("/v1/keychain routes (capability-authed)", () => {
     assert.equal(saved.credential.credentialHandle, metadata.credentials[0].credentialHandle);
     assert.ok(!JSON.stringify([saved, metadata]).includes("synthetic-handle-secret"));
     const grant = await grantHere(saved.credential.id, owner, scopeId("personal", owner), "once", "use the handle");
-    const current = (await built.keychain!.grantsForScope(scopeId("personal", owner))).find(
-      ({ grant: g }) => g.id === grant.id,
-    );
+    const current = (
+      await built.keychain!.grantsForScope(scopeId("personal", owner), { includePersonGrants: true })
+    ).find(({ grant: g }) => g.id === grant.id);
     assert.equal(current?.credential.credentialHandle, saved.credential.credentialHandle);
     const prepared = await built.keychain!.prepareMaterialize(grant.id, scopeId("personal", owner), owner);
     assert.equal(prepared.materialized.kind, "env");

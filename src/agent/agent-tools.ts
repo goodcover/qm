@@ -2,7 +2,7 @@ import type { DocumentInput } from "../core/documents.ts";
 import type { TurnHandoff } from "./runtime-types.ts";
 import { type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { type Config } from "../config.ts";
-import type { ClientToolDeclaration, ScopeId } from "../types.ts";
+import type { ApprovedToolCallSpec, ClientToolDeclaration, ScopeId } from "../types.ts";
 import type { Item, NewItem } from "../sessions/items.ts";
 import type { ToolContext } from "../tools/primitives.ts";
 import { type Phase } from "../../plugins/chassis/src/error-reporting.ts";
@@ -13,6 +13,7 @@ import { createToolKit } from "./agent-tools/kit.ts";
 import { computerTools, validateSandboxTool } from "./agent-tools/computer.ts";
 import { turnTools } from "./agent-tools/turn.ts";
 import { workspaceTools } from "./agent-tools/workspace.ts";
+import { appFileTools } from "./agent-tools/app-files.ts";
 import { recallTools } from "./agent-tools/recall.ts";
 import { sessionTools } from "./agent-tools/sessions.ts";
 import { cronTools } from "./agent-tools/cron.ts";
@@ -41,8 +42,10 @@ export interface ToolContextRef {
     approvalKey?: string;
     summary?: string;
     grantModes?: { session: boolean; always: boolean };
+    call?: ApprovedToolCallSpec;
   }>;
   pausedOnApproval?: boolean;
+  approvalUnavailable?: string;
   emit?: (item: NewItem) => Promise<Item | undefined>;
   scopeLabel?: ScopeId;
   orgScopeId?: ScopeId;
@@ -59,7 +62,7 @@ export interface ToolContextRef {
   abortSignal?: AbortSignal;
   steered?: AbortSignal;
   shutdown?: AbortSignal;
-  pollFire?: boolean;
+  replyOptional?: boolean;
   silentRequested?: boolean;
   swarmHeld?: boolean;
 
@@ -90,7 +93,9 @@ export interface AgentToolsOptions {
   mcpTools?: McpToolDescriptor[];
   controlTools?: boolean;
   sandboxResources?: boolean;
+  memorySizedBackends?: string[];
   readOnly?: boolean;
+  memoryNotebookOnly?: boolean;
   surfaceTools?: boolean;
   delegateWork?: boolean;
   surfaceName?: string;
@@ -100,7 +105,7 @@ export interface AgentToolsOptions {
 
 export type CoreToolOptions = Omit<
   AgentToolsOptions,
-  "readOnly" | "surfaceTools" | "surfaceName" | "surfacePrompt" | "delegateWork" | "clientTools"
+  "readOnly" | "memoryNotebookOnly" | "surfaceTools" | "surfaceName" | "surfacePrompt" | "delegateWork" | "clientTools"
 >;
 
 export function coreToolOptions(config: Config): CoreToolOptions {
@@ -116,6 +121,7 @@ export function coreToolOptions(config: Config): CoreToolOptions {
 }
 
 const READ_ONLY_TOOL_NAMES = new Set(["memory", "history", "finish_silently", "runtime", "sessions", "subagents"]);
+const SCHEDULING_TOOL_NAMES = new Set(["cron", "webhook", "goal"]);
 
 export function endedOnPurpose(ref: {
   runtimeHandoff?: unknown;
@@ -132,6 +138,8 @@ export function pauseStampAfterToolCall(
   return async () => (endedOnPurpose(ref) ? { terminate: true } : undefined);
 }
 
+const APP_EDIT_TOOL_NAMES = new Set(["app_files", "apps", "execute", "skills", "files", "history"]);
+
 export function createAgentTools(ref: ToolContextRef, opts?: AgentToolsOptions): ToolDefinition[] {
   const controlTools = !!opts?.controlTools;
   const surfaceTools = !!opts?.surfaceTools;
@@ -147,7 +155,7 @@ export function createAgentTools(ref: ToolContextRef, opts?: AgentToolsOptions):
   const { surface } = surfaceTool(kit);
   const { createGoal, getGoal, updateGoal } = goalTools(kit);
   const { clientTools } = pageClientTools(kit);
-  const { attach, finishSilently, context, runtime } = turnTools(kit);
+  const { attach, finishSilently, context, runtime, withdrawApproval } = turnTools(kit);
 
   const tools = [
     ...(!delegateWork ? [{ ...execute, handlesAbort: true }] : []),
@@ -167,6 +175,7 @@ export function createAgentTools(ref: ToolContextRef, opts?: AgentToolsOptions):
       publish,
       ...(controlTools ? { share: sharingTool("deploy") } : {}),
     }),
+    ...(ref.current?.appFiles ? [resourceTool("app_files", appFileTools(kit))] : []),
     memory,
     history,
     ...(!delegateWork ? [background] : []),
@@ -189,6 +198,7 @@ export function createAgentTools(ref: ToolContextRef, opts?: AgentToolsOptions):
     ...(controlTools || surfaceTools ? [guidance] : []),
     ...(surfaceTools ? [surface] : [attach]),
     finishSilently,
+    withdrawApproval,
     { ...resourceTool("goal", { create: createGoal, get: getGoal, update: updateGoal }), handlesAbort: true },
     runtime,
     context,
@@ -196,9 +206,13 @@ export function createAgentTools(ref: ToolContextRef, opts?: AgentToolsOptions):
   ];
   const { inline, inlineTools, connectorTools } = mcpTools(kit, new Set(tools.map((t) => t.name)));
   tools.push(...inlineTools, ...connectorTools);
-  const active = opts?.readOnly
-    ? tools.filter((t) => READ_ONLY_TOOL_NAMES.has(t.name) || inline.has(t.name) || connectorTools.includes(t))
-    : tools;
+  const active = tools.filter(
+    (t) =>
+      (!ref.current?.appFiles || APP_EDIT_TOOL_NAMES.has(t.name)) &&
+      (opts?.readOnly
+        ? READ_ONLY_TOOL_NAMES.has(t.name) || inline.has(t.name) || connectorTools.includes(t)
+        : !(opts?.memoryNotebookOnly && SCHEDULING_TOOL_NAMES.has(t.name))),
+  );
   const clientNames = new Set(clientTools.map((tool) => tool.name));
   return active.map((tool) => {
     const wrapped = withRuntimeBarrier(

@@ -1,3 +1,4 @@
+import { recordErrorInBinding, type ErrorEvent } from "../admin/error-log.ts";
 import { isSessionTurn } from "../core/turn-origin.ts";
 import { replayableRequest } from "../core/orchestrator/turn-helpers.ts";
 import {
@@ -23,7 +24,7 @@ import type { ErrorLog } from "../admin/error-log.ts";
 import type { LeaderLease } from "../persistence/leader-lease.ts";
 import type { Delivery, PendingApproval, ScopeId, TurnRequest, TurnResult } from "../types.ts";
 import type { SurfaceContextRequest, SurfaceContextResult } from "../reach/reach.ts";
-import { scopeId } from "../types.ts";
+import { scopeActor, scopeId } from "../types.ts";
 import type { MemoryService } from "../memory/memory-service.ts";
 import type { CachedMessage, ReadMessagesOpts, SurfaceCache, IngestEvent } from "../surface-cache/surface-cache.ts";
 import type { AckEmojiPickStore } from "../surface-cache/ack-emoji-pick-store.ts";
@@ -42,6 +43,7 @@ import type { RuntimeChoice } from "../agent/agent.ts";
 import { modelDisplayName } from "../model/pi-models.ts";
 import type { ConversationEvent } from "../loops/sources/adapter.ts";
 import { slackConversationRef } from "../loops/sources/slack.ts";
+import { ambientTenant } from "../tenants/context.ts";
 
 interface SlackRunHooks {
   onReplying?(): void;
@@ -58,7 +60,14 @@ interface StoredApprovalView extends Omit<PendingApproval, "reason"> {
 }
 
 interface DirectoryPush {
-  members?: Array<{ principalId: string; displayName: string; type: "internal"; slackId?: string; avatarUrl?: string }>;
+  members?: Array<{
+    principalId: string;
+    displayName: string;
+    type: "internal";
+    slackId?: string;
+    avatarUrl?: string;
+    isBot?: boolean;
+  }>;
   channels?: Array<{ channelId: string; name: string; isPrivate?: boolean; isExternal?: boolean }>;
   channelMembers?: Array<{ channelId: string; principalId: string }>;
   channelRosterIds?: string[];
@@ -168,15 +177,21 @@ const RUN_FALLBACK_POLL_MS = 1_000;
 const RUN_STALL_BUDGET_MS = 300_000;
 
 export function createSlackCoreClient(deps: SlackCoreClientDeps): SlackCoreClient {
+  const recordDeliveryError = (e: Omit<ErrorEvent, "ts">): void => recordErrorInBinding(deps.errors, e);
   const lease = deps.leaderLease;
-  const orgScope = (): ScopeId => scopeId("org", configOrgId());
+  const orgScope: ScopeId = scopeId("org", configOrgId());
 
   return {
     decideDeploymentAccess: (value, actor, approve) =>
-      decideDeploymentAccess(deps.app, deps.identity, value, actor, approve),
+      decideDeploymentAccess(ambientTenant(), deps.app, deps.identity, value, actor, approve),
     ...(deps.keychainApprovals ? { keychainApprovals: deps.keychainApprovals } : {}),
     ...(deps.taskAcknowledgements
-      ? { taskAcknowledgements: createTaskAcknowledgements(deps.taskAcknowledgements, lease, deps) }
+      ? {
+          taskAcknowledgements: createTaskAcknowledgements(deps.taskAcknowledgements, lease, {
+            runs: deps.runs,
+            ...(deps.statusActivity?.work ? { work: deps.statusActivity.work } : {}),
+          }),
+        }
       : {}),
     ...(deps.sessionStatus && deps.featureFlags
       ? {
@@ -191,21 +206,21 @@ export function createSlackCoreClient(deps: SlackCoreClientDeps): SlackCoreClien
         }
       : {}),
     async externalSlackParticipants() {
-      return (await deps.config.getExternalSlackParticipantsDurable(orgScope())) === true;
+      return (await deps.config.getExternalSlackParticipantsDurable(orgScope)) === true;
     },
 
     async ackEmojiOverride() {
-      return await deps.config.getAckEmojiDurable(orgScope());
+      return await deps.config.getAckEmojiDurable(orgScope);
     },
 
     async publishEmojiCatalog(emoji) {
-      await deps.config.setSlackEmojiCatalog(orgScope(), emoji);
+      await deps.config.setSlackEmojiCatalog(orgScope, emoji);
     },
 
     async surfaceHeaderFacts(scope) {
       const [choice, branding] = await Promise.all([
-        resolveRuntimeChoice(deps.config, orgScope(), scope, deps.runtimeFallback),
-        resolveBranding(deps.config, orgScope(), deps.brandingDefault),
+        resolveRuntimeChoice(deps.config, orgScope, scope, deps.runtimeFallback),
+        resolveBranding(deps.config, orgScope, deps.brandingDefault),
       ]);
       return {
         ...(branding.selfLabel ? { agentLabel: branding.selfLabel } : {}),
@@ -241,7 +256,7 @@ export function createSlackCoreClient(deps: SlackCoreClientDeps): SlackCoreClien
     },
 
     async readFileArtifact(artifactId, viewerId) {
-      const opened = await deps.app.openFileForViewer(artifactId, viewerId);
+      const opened = await deps.app.openFileForViewer(ambientTenant(), artifactId, viewerId);
       if (!opened) throw new Error(`file artifact ${artifactId} not found (or not visible to ${viewerId})`);
       return buffer(opened.stream);
     },
@@ -253,7 +268,8 @@ export function createSlackCoreClient(deps: SlackCoreClientDeps): SlackCoreClien
     async noteSurfaceHistoryGap(container, note) {
       if (!deps.memory) return;
       const kind = (await deps.surfaceCache?.containerState(container))?.kind;
-      await deps.memory.capture(scopeId(kind === "group" ? "group" : "channel", container), [note], Date.now());
+      const scope = scopeId(kind === "group" ? "group" : "channel", container);
+      await deps.memory.capture(scope, [note], Date.now(), { actorId: scopeActor(scope), context: "maintenance" });
     },
 
     async readSurfaceMessages(container, opts) {
@@ -430,7 +446,7 @@ export function createSlackCoreClient(deps: SlackCoreClientDeps): SlackCoreClien
     },
 
     async reportDeliveryUndeliverable(id, reason) {
-      deps.errors?.record({
+      recordDeliveryError({
         category: "delivery",
         code: "delivery_undeliverable",
         message: `delivery ${id} cannot be delivered (${reason}) — retrying until the TTL expires it`,
@@ -441,7 +457,7 @@ export function createSlackCoreClient(deps: SlackCoreClientDeps): SlackCoreClien
     async failDelivery(id, reason) {
       const failed = await deps.app.failDelivery(id, reason);
       if (!failed) return;
-      deps.errors?.record({
+      recordDeliveryError({
         category: "delivery",
         code: "delivery_failed",
         message:
@@ -452,7 +468,7 @@ export function createSlackCoreClient(deps: SlackCoreClientDeps): SlackCoreClien
     },
 
     async reportSlowDeliveryDrain(info) {
-      deps.errors?.record({
+      recordDeliveryError({
         category: "delivery",
         code: "delivery_drain_slow",
         message: `drain cycle took ${Math.round(info.durationMs / 1000)}s for ${info.rows} rows`,

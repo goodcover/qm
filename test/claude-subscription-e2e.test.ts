@@ -4,6 +4,7 @@ import { test, type TestContext } from "node:test";
 import { buildApp } from "./support/build-app.ts";
 import { testConfig } from "./support/test-config.ts";
 import { createAgent } from "../src/agent/agent-run.ts";
+import { createModelRoutes } from "../src/model/model-route.ts";
 import { hashId } from "../src/util/crypto.ts";
 import { anthropicMessage } from "./support/gateway-stream.ts";
 import { historyThenAnswer, installFakeClaudeCode } from "./support/fake-claude-code.ts";
@@ -105,7 +106,10 @@ test("a personal Claude subscription turn runs end to end on Pi with OAuth beare
   const seen = fakeAnthropic(t);
 
   const built = buildApp(testConfig({ anthropicApiKey: "sk-ant-api03-company" }), {
-    agent: createAgent({ captureRequests: false, resolveProviderKeys: async () => ({}) }),
+    agent: createAgent({
+      routes: createModelRoutes({ resolveProviderKeys: async () => ({}) }),
+      captureRequests: false,
+    }),
   });
   await built.userModelCredentials.setOAuth("U1", "anthropic", {
     accessToken: SUBSCRIPTION_TOKEN,

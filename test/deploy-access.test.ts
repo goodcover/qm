@@ -24,6 +24,8 @@ import { createPostgresDirectoryStore } from "../src/directory/postgres-director
 import { createPostgresSessionStore } from "../src/sessions/postgres-session-store.ts";
 import { testAdvisoryLock, testDatabaseUrl, testDeployBackings, testMap } from "./support/test-database.ts";
 import { createPostgresGrantStore } from "../src/acl/postgres-grant-store.ts";
+import { companyTest } from "./support/app-handle.ts";
+import { testTenant as tenant } from "./support/test-tenant.ts";
 
 const owner = "alice@example.com";
 const requester = "bob@example.com";
@@ -94,7 +96,7 @@ async function fixture(t: { after(fn: () => void): void }) {
     value,
     auditLog,
     decide: (id = owner, approve = true, extra: Partial<ActorAssertion> = {}) =>
-      decideDeploymentAccess(app, identity, value, { externalId: id, ...extra }, approve),
+      decideDeploymentAccess(tenant, app, identity, value, { externalId: id, ...extra }, approve),
   };
 }
 
@@ -132,7 +134,7 @@ test("malformed or scope-injecting button payloads are rejected", () => {
     assert.throws(() => parseDeployAccess(value));
 });
 
-test("approve is audited and idempotent, preserves manage access, and respects transfers/revokes", async (t) => {
+companyTest("approve is audited and idempotent, preserves manage access, and respects transfers/revokes", async (t) => {
   const f = await fixture(t);
   assert.match(await f.decide(), /^Approved\./);
   await f.decide();
@@ -140,8 +142,8 @@ test("approve is audited and idempotent, preserves manage access, and respects t
   const notices = await f.notices();
   assert.equal(notices.length, 1);
   assert.equal(notices[0]!.destination.target, requester);
-  assert.match(notices[0]!.text, /gave you access.*https:\/\/mysite.apps.example.com\//);
-  assert.ok((await f.auditLog.events()).some((e) => e.action === "grant"));
+  assert.match(notices[0]!.text, /gave you access.*https:\/\/acme1-mysite.apps.example.com\//);
+  assert.ok((await f.auditLog.events(tenant)).some((e) => e.action === "grant"));
   await f.share(null);
   assert.deepEqual(await f.grants(), []);
   await assert.rejects(f.decide(requester), /owner/);
@@ -175,7 +177,10 @@ test("tampering the deployment ID cannot authorize another owner's app", async (
   const other = await f.app.deploy(publishInput(requester, "other"));
   const value = JSON.stringify({ ...request, deploymentId: other.id });
   for (const approve of [true, false])
-    await assert.rejects(decideDeploymentAccess(f.app, f.identity, value, { externalId: owner }, approve), /owner/);
+    await assert.rejects(
+      decideDeploymentAccess(tenant, f.app, f.identity, value, { externalId: owner }, approve),
+      /owner/,
+    );
 });
 
 test("decline only notifies and leaves access unchanged; duplicate clicks dedupe", async (t) => {
@@ -207,7 +212,7 @@ test("direct share paths notify only after successful grants; org, self and revo
   assert.equal((await f.share("write")).find((g) => g.scope === person(requester))?.permission, "write");
 });
 
-test("notify:false grants access on every direct share path without a DM or invitation email", async (t) => {
+companyTest("notify:false grants access on every direct share path without a DM or invitation email", async (t) => {
   const f = await fixture(t);
   const sent: string[] = [];
   const app = createApp({
@@ -238,7 +243,7 @@ test("notify:false grants access on every direct share path without a DM or invi
   assert.deepEqual(invited.invitation, {
     emailSent: false,
     emailProblem: "notify was false",
-    appUrl: "https://mysite.apps.example.com/",
+    appUrl: "https://acme1-mysite.apps.example.com/",
   });
   assert.deepEqual(await f.deploy.deploymentGrantees(f.d.id), [
     { scope: person(requester), permission: "write" },
@@ -266,7 +271,7 @@ test("button dispatch classifies the clicker, settles the card, and keeps failed
       directory: { classifyActor: async (_c: unknown, id: string) => ({ externalId: id }) } as never,
       core: {
         decideDeploymentAccess: (value: string, actor: ActorAssertion, approve: boolean) =>
-          decideDeploymentAccess(f.app, f.identity, value, actor, approve),
+          decideDeploymentAccess(tenant, f.app, f.identity, value, actor, approve),
       } as never,
     },
   );

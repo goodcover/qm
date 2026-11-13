@@ -141,6 +141,11 @@ interface WireThinking {
   block_binding?: unknown;
 }
 
+interface WireToolChoice {
+  type: string;
+  name?: string;
+}
+
 interface ClaudeCodeRequest {
   model: string;
   system: string;
@@ -150,7 +155,20 @@ interface ClaudeCodeRequest {
   thinking?: WireThinking;
   output_config?: { effort?: EffortLevel };
   speed?: string;
+  tool_choice?: WireToolChoice;
 }
+
+const SENT_FIELDS: Record<keyof ClaudeCodeRequest, true> = {
+  model: true,
+  system: true,
+  messages: true,
+  tools: true,
+  max_tokens: true,
+  thinking: true,
+  output_config: true,
+  speed: true,
+  tool_choice: true,
+};
 
 interface Step {
   stream: AssistantMessageEventStream;
@@ -181,6 +199,7 @@ interface Live {
   markExited: () => void;
   dir: string;
   session: string;
+  toolChoice: WireToolChoice | undefined;
   closing?: Promise<void>;
   closed: boolean;
   finished: boolean;
@@ -270,15 +289,38 @@ function claudeCodeTranscript(history: readonly Message[]): TranscriptMessage[] 
   return out;
 }
 
-function isRequest(value: unknown): value is ClaudeCodeRequest {
+function servedToolChoice(request: ClaudeCodeRequest): ClaudeCodeRequest {
+  const choice = request.tool_choice;
+  if (choice?.type !== "tool") return request;
+  const name = TOOL_PREFIX + String(choice.name);
+  if (!request.tools.some((tool) => tool.name === name))
+    throw new ClaudeCodeFailure(`QM's request hook forces the tool ${choice.name}, which this request does not serve`, {
+      type: "invalid_request_error",
+    });
+  return { ...request, tool_choice: { ...choice, name } };
+}
+
+function sendable(value: unknown): ClaudeCodeRequest {
   const request = value as Partial<ClaudeCodeRequest> | null;
-  return (
-    !!request &&
-    typeof request.model === "string" &&
-    typeof request.system === "string" &&
-    Array.isArray(request.messages) &&
-    Array.isArray(request.tools)
-  );
+  if (
+    !request ||
+    typeof request.model !== "string" ||
+    typeof request.system !== "string" ||
+    !Array.isArray(request.messages) ||
+    !Array.isArray(request.tools)
+  )
+    throw new Error("QM's request hook returned a payload the claude-code route cannot send");
+  const unsent = [
+    ...Object.keys(request).filter((key) => !Object.hasOwn(SENT_FIELDS, key)),
+    ...Object.keys(request.output_config ?? {})
+      .filter((key) => key !== "effort")
+      .map((key) => `output_config.${key}`),
+  ];
+  if (unsent.length)
+    throw new ClaudeCodeFailure(`Claude Code cannot send request fields QM's request hook set: ${unsent.join(", ")}`, {
+      type: "invalid_request_error",
+    });
+  return servedToolChoice(request as ClaudeCodeRequest);
 }
 
 function lastUserBlocks(messages: readonly TranscriptMessage[]): ContentBlock[] {
@@ -407,7 +449,7 @@ function sdkThinking(thinking: WireThinking): ThinkingConfig {
   return { type: "enabled", ...(thinking.budget_tokens ? { budgetTokens: thinking.budget_tokens } : {}), ...display };
 }
 
-function thinkingOptions(
+function wireOptions(
   model: Model<Api>,
   request: ClaudeCodeRequest,
 ): { options: Pick<Options, "thinking" | "effort">; env: Record<string, string> } {
@@ -419,11 +461,15 @@ function thinkingOptions(
     effort: request.output_config?.effort ?? API_DEFAULT_EFFORT,
   };
   const betas = headers.headers?.["anthropic-beta"];
+  const extraBody = {
+    ...(bound?.block_binding ? { thinking: bound } : {}),
+    ...(request.tool_choice ? { tool_choice: request.tool_choice } : {}),
+  };
   return {
     options,
     env: {
       ...(betas ? { ANTHROPIC_BETAS: betas } : {}),
-      ...(bound?.block_binding ? { CLAUDE_CODE_EXTRA_BODY: JSON.stringify({ thinking: bound }) } : {}),
+      ...(Object.keys(extraBody).length ? { CLAUDE_CODE_EXTRA_BODY: JSON.stringify(extraBody) } : {}),
     },
   };
 }
@@ -873,6 +919,7 @@ export function createClaudeCodeConnection(): ClaudeCodeConnection {
       markExited,
       dir,
       session: randomUUID(),
+      toolChoice: request.tool_choice,
       closed: false,
       finished: false,
     };
@@ -888,13 +935,13 @@ export function createClaudeCodeConnection(): ClaudeCodeConnection {
       session.save();
     }
     const longest = Math.max(0, ...request.tools.map((tool) => tool.description.length));
-    const thinking = thinkingOptions(model, request);
+    const wire = wireOptions(model, request);
     const options: Options = {
       abortController: target.abort,
       cwd: work,
       env: {
         ...claudeCodeEnv(token, dir, longest, request.max_tokens ?? model.maxTokens, streamOptions?.cacheRetention),
-        ...thinking.env,
+        ...wire.env,
       },
       systemPrompt: request.system,
       model: request.model,
@@ -911,7 +958,7 @@ export function createClaudeCodeConnection(): ClaudeCodeConnection {
       extraArgs: { "disable-slash-commands": null },
       ...(request.tools.length ? { mcpServers: { [SERVER]: toolServer(request.tools, target) } } : {}),
       ...(history.length ? { resume: sessionId } : { sessionId }),
-      ...thinking.options,
+      ...wire.options,
       spawnClaudeCodeProcess: spawnTracked(target),
     };
     if (target.closed || connectionClosed) return closeLive(target, "QM ended the turn");
@@ -960,16 +1007,16 @@ export function createClaudeCodeConnection(): ClaudeCodeConnection {
       };
       const continuing = continues(live, messages) ? live : undefined;
       void (async () => {
-        const shaped = options?.onPayload ? await options.onPayload(request, model) : undefined;
-        if (shaped !== undefined && !isRequest(shaped))
-          throw new Error("QM's request hook returned a payload the claude-code route cannot send");
-        if ((shaped ?? request).speed === "fast")
+        const shaped = await options?.onPayload?.(request, model);
+        const sent = sendable(shaped === undefined ? request : shaped);
+        if (sent.speed === "fast")
           throw new ClaudeCodeFailure(
             "Fast mode draws on Claude extra usage, which the Claude subscription route refuses; turn fast mode off for this model",
             { type: "invalid_request_error", code: "fast_mode_unavailable" },
           );
-        if (continuing) attach(continuing, step, shaped ?? request, messages, options?.signal);
-        else await start(model, shaped ?? request, token!, step, options);
+        if (continuing && JSON.stringify(continuing.toolChoice) === JSON.stringify(sent.tool_choice))
+          attach(continuing, step, sent, messages, options?.signal);
+        else await start(model, sent, token!, step, options);
       })().catch((error) => {
         const failure = asError(error);
         if (live?.step === step) fail(live, failure);

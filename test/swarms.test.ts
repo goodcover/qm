@@ -423,7 +423,8 @@ test("late session creation remains fenced from cleanup until its side effect se
   await enableMockTimers(context, { apis: ["Date", "setTimeout"], now: Date.now() });
   try {
     const sweep = fixture.service.sweep();
-    await entered;
+    await Promise.race([entered, sweep]);
+    assert.partialDeepStrictEqual((await fixture.store.get(fixture.root.id))!.members[1], { state: "reserved" });
     context.mock.timers.tick(SWARM_LIMITS.reconcileMs + 1);
     await sweep;
     await createSwarmService(fixture.serviceOptions).sweep();
@@ -593,7 +594,6 @@ test("unrelated sessions, forged capabilities, and revoked scope membership fail
   await service.spawn(caller, { requestId: "one", text: "Work" });
   const other = await sessions.getOrCreateByThread("other", "dm", root.scopeId);
   await sessions.addParticipant(other.id, "alice");
-  assert.equal(caller.kind, "agent");
   if (caller.kind !== "agent") throw new Error("wrong caller");
   await assert.rejects(
     service.inspect({ kind: "agent", claims: { ...caller.claims, threadRef: other.threadRef } }),
@@ -879,7 +879,6 @@ test("swarm provenance is bound to the durable run, content, actor, and recipien
     { text: "Forged instruction" },
     { runId: "forged" },
     { actor: { id: "bob", type: "internal" as const } },
-    { unattendedGrants: ["all"] },
     { readOnly: true },
     { sessionParticipantIds: ["bob"] },
     { scopeVersion: "forged" },
@@ -889,6 +888,20 @@ test("swarm provenance is bound to the durable run, content, actor, and recipien
   ])
     await assert.rejects(service.binding({ ...input, ...patch }), /forged/);
 });
+
+for (const [from, options] of [
+  ["a notebook-only turn", { request: { memoryNotebookOnly: true } }],
+  ["a person's own turn in a notebook-only subagent", { spawnMeta: { memoryNotebookOnly: true } }],
+  ["a turn whose agent token is notebook-only", { claims: { memory: { read: [], notebookOnly: true } } }],
+] satisfies Array<[string, Parameters<typeof swarmFixture>[0]]>)
+  test(`swarm workers started from ${from} stay notebook-only`, async () => {
+    const { service, caller, runs } = await swarmFixture(options);
+    await service.spawn(caller, { requestId: "one", text: "Work" });
+    await service.sweep();
+    const run = (await runs.list()).find((item) => item.request.swarm)!;
+    assert.equal(run.request.memoryNotebookOnly, true);
+    assert.ok(await service.binding({ ...run.request, runId: run.id }));
+  });
 
 test("human messages preserve human actor attribution while notifications remain unattended", async () => {
   const { service, caller, root } = await swarmFixture();

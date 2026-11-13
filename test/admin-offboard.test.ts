@@ -1,4 +1,5 @@
 import "./support/auto-fake-sprites.ts";
+import { testTenant } from "./support/test-tenant.ts";
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -173,7 +174,7 @@ test("offboarding previews, then disables, revokes, archives and retires what th
     assert.equal((await sandboxResources.get(computer.id)).state, "retired");
     assert.equal(await sandboxResources.resolve("personal:U1"), null, "the default was cleared first");
 
-    const events = await s.built.auditLog.events();
+    const events = await s.built.auditLog.events(testTenant);
     for (const change of applied.changes)
       assert.ok(
         events.some(
@@ -188,6 +189,12 @@ test("offboarding previews, then disables, revokes, archives and retires what th
       );
     const detail: any = await (await fetch(`${s.base}/v1/admin/users/U1`, { headers: ADMIN })).json();
     assert.equal(detail.deactivated, true);
+    assert.equal(applied.user.offboardedBy, "admin-alice");
+    assert.equal(typeof applied.user.offboardedAt, "number");
+    assert.equal(detail.user.offboardedBy, "admin-alice", "the person's page shows who offboarded them");
+    const listed: any = await (await fetch(`${s.base}/v1/admin/users`, { headers: ADMIN })).json();
+    const row = listed.users.find((u: any) => u.principalId === "U1");
+    assert.deepEqual([row?.offboarded, row?.deactivated], [true, true], "the users list marks them");
 
     const again: any = await (await s.offboard("U1", {})).json();
     assert.deepEqual(
@@ -202,6 +209,29 @@ test("offboarding previews, then disables, revokes, archives and retires what th
     assert.equal((await app.getCron(personalCron.id))!.archived, true, "reactivation restores only sign-in");
     const after: any = await (await fetch(`${s.base}/v1/admin/users/U1`, { headers: ADMIN })).json();
     assert.equal(after.deactivated, false);
+    assert.deepEqual(
+      [after.user?.offboardedAt, after.user?.offboardedBy],
+      [undefined, undefined],
+      "reactivation clears offboarding",
+    );
+    assert.ok(
+      (await s.built.auditLog.events(testTenant)).some((e) => e.action === "principal.reactivate"),
+      "the audit log keeps the history",
+    );
+  } finally {
+    await s.close();
+  }
+});
+
+test("if the offboarding record can't be written, offboarding fails before changing anything", async () => {
+  const s = await start();
+  try {
+    s.built.admin.users.markOffboarded = async () => {
+      throw new Error("store down");
+    };
+    const r = await s.offboard("U1", { apply: true });
+    assert.notEqual(r.status, 200);
+    assert.equal(s.built.identity.classify("U1").type, "internal", "sign-in stays on");
   } finally {
     await s.close();
   }

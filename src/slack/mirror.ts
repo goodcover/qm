@@ -1,4 +1,4 @@
-import { isOwnStatusCard } from "./message-gating.ts";
+import { isBotAuthored, isOwnStatusCard } from "./message-gating.ts";
 import { swallow } from "../util/errors.ts";
 import { decodeSlackEntities, mentionsBot } from "./lib.ts";
 import { mentionedUserIds } from "./mrkdwn.ts";
@@ -63,7 +63,7 @@ export function slackMessageToIngestEvent(
         ...(file.size !== undefined ? { size: file.size } : {}),
         mimetype: file.mimetype,
       })),
-    ...(m.bot_id || m.bot_profile ? { bot: true } : {}),
+    ...(isBotAuthored(m) ? { bot: true } : {}),
     ...(mentionsBot(String(m.text ?? ""), ids.botUserId) ? { mentionsSelf: true } : {}),
     ...((opts.editedAt ?? Number(m.edited?.ts) * 1000) > 0
       ? { editedAt: Math.round(opts.editedAt ?? Number(m.edited?.ts) * 1000) }
@@ -75,17 +75,23 @@ export function slackMessageToIngestEvent(
 }
 
 export function createMirror(deps: {
+  account: string;
   core: SlackCoreClient;
   ids: BotIdentity;
   directory: Directory;
   externalParticipantsEnabled(): Promise<boolean>;
 }): Mirror {
-  const { core, ids, directory, externalParticipantsEnabled } = deps;
+  const { account, core, ids, directory, externalParticipantsEnabled } = deps;
   const ambientRoomGate = new Map<string, { allowed: boolean; at: number }>();
 
   async function pushSurfaceEvents(events: IngestEvent[]): Promise<void> {
     if (!events.length) return;
-    await core.ingestSurfaceEvents(events, { name: ids.botHandle, mentionId: ids.botUserId });
+    const source =
+      ids.ownTeamId && ids.botUserId ? { account, workspace: ids.ownTeamId, assistant: ids.botUserId } : undefined;
+    await core.ingestSurfaceEvents(source ? events.map((e) => ({ ...e, source })) : events, {
+      name: ids.botHandle,
+      mentionId: ids.botUserId,
+    });
   }
 
   async function resolveMentionNames(client: any, text: string): Promise<Record<string, string>> {

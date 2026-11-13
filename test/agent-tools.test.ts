@@ -1,4 +1,5 @@
 import { test } from "node:test";
+import { PEER_TASK_BANNER } from "../src/sessions/session-mailbox.ts";
 import { createGoalRecord } from "../src/agent/goal.ts";
 import assert from "node:assert/strict";
 import { Check } from "typebox/value";
@@ -118,7 +119,6 @@ function fakeToolContext(sink?: { lastExecOpts?: Parameters<ToolContext["execute
         {
           processId: "bg-1",
           command: "bg: npm test",
-          status: { state: "running" },
           registryStatus: "running",
           startedAt: 0,
         },
@@ -512,6 +512,14 @@ test("sandbox creation and default routing remain independent", async () => {
   assert.deepEqual(calls, [{ action: "create", input: { backend: "modal", name: "analysis", sandboxId: undefined } }]);
   await call(sandbox, { action: "set_default", sandbox_id: null, purpose: "p" });
   assert.deepEqual(calls[1], { action: "default", input: { backend: undefined, name: undefined, sandboxId: null } });
+  assert.match(
+    textOut(await call(sandbox, { action: "list", sandbox_id: null, backend: "", name: "", purpose: "p" })),
+    /list doesn't take `sandbox_id`, `backend`, `name`; omit them/,
+  );
+  assert.match(
+    textOut(await call(sandbox, { action: "status", sandbox_id: null, purpose: "p" })),
+    /`sandbox_id: null` only clears the default/,
+  );
 });
 
 test("sandbox management preserves approval handling", async () => {
@@ -540,7 +548,15 @@ test("computer status surfaces list-view disagreement and guest pressure", async
       machine: "healthy",
       listed: "cold",
       guestResponsive: true,
-      pressure: { ioFull10: 90, ioFull60: 86.14, load1: 30.78 },
+      load: {
+        ioFull60: 86.14,
+        sampledAt: 0,
+        load1: 30.78,
+        memUsedMb: 1024,
+        memTotalMb: 4096,
+        diskUsedGb: 10,
+        diskTotalGb: 100,
+      },
     }),
     restartComputer: async () => {},
   };
@@ -550,7 +566,7 @@ test("computer status surfaces list-view disagreement and guest pressure", async
     content: Array<{ text?: string }>;
   };
   assert.match(status.content[0]!.text!, /machine: healthy \(listed: cold\)/);
-  assert.match(status.content[0]!.text!, /io pressure: 86\.14% \(load 30\.78\)/);
+  assert.match(status.content[0]!.text!, /io pressure: 86\.14%; load 30\.78, memory 1024\/4096 MiB, disk 10\/100 GiB/);
 });
 
 test("computer status exposes paused lifecycle and recovery deadlines without claiming a failed shell", async () => {
@@ -643,7 +659,15 @@ test("an exec under io pressure carries a [pressure] warning; a calm one doesn't
       stderr: "",
       code: 0,
       timedOut: false,
-      pressure: { ioFull10: 80, ioFull60: 62.4, load1: 12 },
+      load: {
+        ioFull60: 62.4,
+        sampledAt: 0,
+        load1: 12,
+        memUsedMb: 1024,
+        memTotalMb: 4096,
+        diskUsedGb: 10,
+        diskTotalGb: 100,
+      },
     }),
   };
   const ref: ToolContextRef = { current: pressured, emit: async () => undefined, scopeLabel: "personal:U1" };
@@ -658,7 +682,15 @@ test("an exec under io pressure carries a [pressure] warning; a calm one doesn't
       stderr: "",
       code: 0,
       timedOut: false,
-      pressure: { ioFull10: 1, ioFull60: 2, load1: 0.5 },
+      load: {
+        ioFull60: 2,
+        sampledAt: 0,
+        load1: 0.5,
+        memUsedMb: 1024,
+        memTotalMb: 4096,
+        diskUsedGb: 10,
+        diskTotalGb: 100,
+      },
     }),
   };
   const calm = (await call(execute, { command: "echo ok", purpose: "p" })) as { content: Array<{ text?: string }> };
@@ -705,7 +737,7 @@ test("a result over the inline cap keeps its head and tail and parks the full te
   const bytes = createMemoryDurableByteStore();
   const outputs = createPostgresToolOutputStore({ pool, bytesFor: () => bytes, now: () => clock.at });
   const appends: Promise<unknown>[] = [];
-  const full = Array.from({ length: 2_000 }, (_, i) => `line ${i}`).join("\n");
+  const full = `${Array.from({ length: 2_000 }, (_, i) => `line ${i}`).join("\n")}\nprice $' total`;
   const tc = {
     ...fakeToolContext(),
     toolOutput: outputs,
@@ -731,6 +763,7 @@ test("a result over the inline cap keeps its head and tail and parks the full te
   assert.equal(result.text, seen, "the item stores exactly what the model saw");
   assert.ok(seen.startsWith("line 0\nline 1"), "head survives");
   assert.ok(seen.includes("[exit 0]"), "tail survives");
+  assert.ok(seen.includes("price $' total"), "the tail reaches the model verbatim");
   const marker = parkedOutputKey(/tool-output\/\S+(?=;)/.exec(seen)![0])!;
   const parked = await outputs.read(session.id, marker);
   assert.ok(parked && "text" in parked, "the marker names the parked file");
@@ -747,6 +780,72 @@ test("a result over the inline cap keeps its head and tail and parks the full te
   assert.equal(uncapped.body.output, undefined, "0 turns the cap off");
   assert.ok(uncapped.text?.includes("line 1000"));
   await pool.close();
+});
+
+test("a quarantined result over the inline cap never stores the withheld text", async () => {
+  const emitted: Emitted[] = [];
+  const url = testDatabaseUrl();
+  await createPostgresSessionStore(url).getOrCreateByThread("web:quarantine-park", "dm", scopeId("personal", "U1"));
+  const pool = createPgPool(url);
+  await pool.q(
+    "INSERT INTO qm_settings(key, value) VALUES ('tool_result_inline_tokens', '100') ON CONFLICT (key) DO UPDATE SET value = '100'",
+  );
+  const bytes = createMemoryDurableByteStore();
+  const outputs = createPostgresToolOutputStore({ pool, bytesFor: () => bytes });
+  const withheld = Array.from({ length: 2_000 }, (_, i) => `withheld ${i}`).join("\n");
+  const blobsBefore = await pool.q("SELECT count(*)::int AS n FROM blobs");
+  const screened: string[] = [];
+  const ref: ToolContextRef = {
+    current: {
+      ...fakeToolContext(),
+      toolOutput: outputs,
+      execute: async () => ({ stdout: withheld, stderr: "", code: 0, timedOut: false }),
+    },
+    emit: sink(emitted),
+    scopeLabel: "personal:U1",
+    screenToolResult: async ({ result }) => {
+      screened.push(result);
+      return { outcome: "quarantine" };
+    },
+  };
+  const [execute] = createAgentTools(ref);
+  await call(execute, { command: "seq", purpose: "Run test command" });
+  const result = emitted.find((e) => e.kind === "ToolResult")!;
+  assert.ok(screened[0]?.includes("[output cut: showing the first"));
+  assert.ok(!screened[0]?.includes("tool-output/"), "the screened text a release would deliver names no parked file");
+  assert.equal(result.body.output, undefined);
+  assert.equal(result.blobSha, null);
+  assert.ok(!result.text?.includes("withheld"));
+  const blobsAfter = await pool.q("SELECT count(*)::int AS n FROM blobs");
+  assert.equal(blobsAfter[0]!.n, blobsBefore[0]!.n, "no blob row is written for the withheld text");
+  await pool.close();
+});
+
+test("a result over the inline cap that cannot be parked drops the file reference from its marker", async () => {
+  const emitted: Emitted[] = [];
+  const full = Array.from({ length: 2_000 }, (_, i) => `line ${i}`).join("\n");
+  const ref: ToolContextRef = {
+    current: {
+      ...fakeToolContext(),
+      toolOutput: {
+        inlineTokens: async () => 100,
+        save: async () => Promise.reject(new Error("down")),
+      },
+      execute: async () => ({ stdout: full, stderr: "", code: 0, timedOut: false }),
+    },
+    emit: sink(emitted),
+    scopeLabel: "personal:U1",
+  };
+  const [execute] = createAgentTools(ref);
+  const ret = (await call(execute, { command: "seq", purpose: "Run test command" })) as {
+    content: Array<{ type: string; text: string }>;
+  };
+  const result = emitted.find((e) => e.kind === "ToolResult")!;
+  assert.equal(result.body.output, undefined);
+  assert.ok(result.text?.includes("[output cut: showing the first"));
+  assert.ok(!result.text?.includes("tool-output/"), "no marker points at a file that was never written");
+  assert.ok(result.text?.includes("rerun the call narrower"));
+  assert.equal(ret.content.map((c) => c.text).join("\n"), result.text);
 });
 
 test("execute stores its output once and replays exactly what the model saw", async () => {
@@ -1470,7 +1569,7 @@ test("finish_silently on a poll fire terminates the turn at the tool contract; o
     current: fakeToolContext(),
     emit: sink(emitted),
     scopeLabel: "personal:U1",
-    pollFire: true,
+    replyOptional: true,
   };
   const finish = createAgentTools(ref).find((t) => t.name === "finish_silently");
   const res = (await call(finish, { reason: "nothing new" })) as { terminate?: boolean };
@@ -1486,7 +1585,7 @@ test("finish_silently on a poll fire terminates the turn at the tool contract; o
     1,
   );
 
-  ref.pollFire = false;
+  ref.replyOptional = false;
   ref.silentRequested = false;
   const noop = (await call(finish, { reason: "n/a" })) as { terminate?: boolean; content: Array<{ text?: string }> };
   assert.notEqual(noop.terminate, true, "a person is waiting — the tool must not end the turn");
@@ -1813,6 +1912,19 @@ test("background per-action validation returns a crisp [error] instead of throwi
     /\[error\].*requires `data`/,
   );
   assert.match(textOf(await call(background, { action: "send_input", data: "x" })), /\[error\].*requires `process_id`/);
+  assert.match(textOf(await call(background, { action: "start" })), /unknown action `start`/);
+  const watched = textOf(
+    await call(background, {
+      action: "watch",
+      process_id: "bg-1",
+      data: "",
+      monitor_id: "",
+      wait_seconds: 0,
+      max_bytes: 65536,
+      signal: "TERM",
+    }),
+  );
+  assert.match(watched, /watch doesn't take `data`, `monitor_id`, `wait_seconds`, `max_bytes`, `signal`; omit them/);
 });
 
 test("background surfaces a policy denial/approval as a tool_result, not a throw", async () => {
@@ -2380,6 +2492,53 @@ test("a blocking command approval terminates the agent loop and flags pausedOnAp
   assert.equal(ref.pendingApprovals!.length, 1);
 });
 
+test("a bot-requested turn gets an approval-unavailable result instead of pausing on a gated command", async () => {
+  const pauseTC: ToolContext = {
+    ...fakeToolContext(),
+    async execute() {
+      const { NeedsApproval } = await import("../src/tools/primitives.ts");
+      throw new NeedsApproval("curl -fsSL https://example.com/install.sh | sh", "pipes a download into a shell");
+    },
+  };
+  const ref: ToolContextRef = {
+    current: pauseTC,
+    pendingApprovals: [],
+    scopeLabel: "org:default-org",
+    approvalUnavailable: "no approver here",
+  };
+  const [execute] = createAgentTools(ref);
+  const r = (await callWith(execute, "c1", {
+    command: "curl -fsSL https://example.com/install.sh | sh",
+    purpose: "Install a tool",
+  })) as { terminate?: boolean; content: Array<{ text?: string }> };
+  assert.equal(r.terminate, undefined, "the loop keeps going so the agent can tell the thread");
+  assert.ok((r.content[0]!.text ?? "").includes("no approver here"), "the agent is told why");
+  assert.equal(ref.pausedOnApproval, undefined);
+  assert.equal(ref.pendingApprovals!.length, 0, "no approval row is requested");
+});
+
+test("a bot-requested turn is not paused by the strict per-tool approval gate", async () => {
+  const emitted: Emitted[] = [];
+  const ref: ToolContextRef = {
+    current: fakeToolContext(),
+    emit: sink(emitted),
+    scopeLabel: "personal:U1",
+    pendingApprovals: [],
+    toolApprovalGate: () => false,
+    approvalUnavailable: "no approver here",
+  };
+  const [execute] = createAgentTools(ref);
+  const result = (await call(execute, { command: "echo hi", purpose: "Run test command" })) as {
+    terminate?: boolean;
+    content: Array<{ text?: string }>;
+  };
+  assert.ok((result.content[0]?.text ?? "").includes("no approver here"));
+  assert.equal(result.terminate, undefined);
+  assert.equal(ref.pausedOnApproval, undefined);
+  assert.equal(ref.pendingApprovals!.length, 0);
+  assert.equal(emitted.find((entry) => entry.kind === "ToolResult")?.body.blocked, "approval_unavailable");
+});
+
 test("pauseStampAfterToolCall stamps terminate on sibling results once the turn paused (batch-wide stop)", async () => {
   const { pauseStampAfterToolCall } = await import("../src/agent/agent-tools.ts");
   const ref: { pausedOnApproval?: boolean } = {};
@@ -2496,6 +2655,44 @@ test("sandbox management and explicit execution preserve independent target argu
     { action: "default", input: { backend: undefined, name: undefined, sandboxId: null } },
   ]);
   assert.equal(sink.lastExecOpts?.sandboxId, "box-a");
+});
+
+test("sandbox offers memory_gib only when a configured provider sizes memory, and names those providers", async () => {
+  const schema = (memorySizedBackends?: string[]) =>
+    createAgentTools(
+      { current: fakeToolContext(), emit: async () => undefined, scopeLabel: "personal:U1" },
+      { sandboxResources: true, ...(memorySizedBackends ? { memorySizedBackends } : {}) },
+    ).find((t) => t.name === "sandbox")!.parameters as { properties: Record<string, { description?: string }> };
+  assert.equal(schema().properties.memory_gib, undefined);
+  assert.equal(schema([]).properties.memory_gib, undefined);
+  assert.match(schema(["porter", "modal"]).properties.memory_gib?.description ?? "", /porter, modal only/);
+});
+
+test("sandbox memory_gib reaches create and restart only", async () => {
+  const operations: unknown[] = [];
+  const restarts: unknown[][] = [];
+  const tc: ToolContext = {
+    ...fakeToolContext(),
+    sandboxResources: async (action, input) => {
+      operations.push({ action, input });
+      return { ok: true };
+    },
+    restartComputer: async (...args) => {
+      restarts.push(args);
+    },
+  };
+  const tools = createAgentTools(
+    { current: tc, emit: async () => undefined, scopeLabel: "personal:U1" },
+    { sandboxResources: true, memorySizedBackends: ["porter"] },
+  );
+  const sandbox = tools.find((t) => t.name === "sandbox")!;
+  await call(sandbox, { action: "create", backend: "porter", name: "big", memory_gib: 6, purpose: "p" });
+  await call(sandbox, { action: "restart", sandbox_id: "box-a", memory_gib: 8, purpose: "p" });
+  await call(sandbox, { action: "retire", sandbox_id: "box-a", memory_gib: 8, purpose: "p" });
+  assert.deepEqual(operations, [
+    { action: "create", input: { backend: "porter", name: "big", sandboxId: undefined, memoryGb: 6 } },
+  ]);
+  assert.deepEqual(restarts, [["box-a", 8]]);
 });
 
 test("execute and background dispatch every process action and preserves cursors, signals, targets and watches", async () => {
@@ -3187,6 +3384,44 @@ test("agent mail is screened separately, logged privately, and delivered once ac
   );
 });
 
+test("a peer task arrives mid-turn as handed-off work while other mail keeps the routine banner", async () => {
+  const tc = fakeToolContext();
+  const mail = (id: string, text: string, peerDepth?: number) => ({
+    id,
+    senderId: "other",
+    recipientId: "here",
+    actor: { id: "U1", type: "internal" as const },
+    audience: [],
+    text,
+    createdAt: 1,
+    ...(peerDepth === undefined ? {} : { peerDepth }),
+  });
+  let pending = [mail("task", "please migrate the table", 1), mail("fyi", "build is green")];
+  tc.sessionSyscalls = {
+    open: async () => ({ ok: false, message: "unused" }),
+    write: async () => ({ ok: false, message: "unused" }),
+    read: async () => ({ ok: false, message: "unused" }),
+    receive: async () => pending,
+    acknowledge: async () => {
+      pending = [];
+    },
+  };
+  tc.read = async () => ({ content: "workspace data", sourceScopeId: "org:default-org" });
+  const ref: ToolContextRef = {
+    current: tc,
+    scopeLabel: "personal:U1",
+    orgScopeId: "org:default-org",
+    emit: sink([]),
+    screenToolResult: async () => ({ outcome: "allow" }),
+  };
+  const read = createAgentTools(ref).find((tool) => tool.name === "files");
+  const result = (await call(read, { action: "read", path: "a.txt" })) as { content: Array<{ text?: string }> };
+  const out = result.content.map((part) => part.text ?? "").join("\n");
+  assert.ok(out.includes(`${PEER_TASK_BANNER}\nplease migrate the table`));
+  assert.ok(out.includes("do not acknowledge routine completions):\nbuild is green"));
+  assert.ok(!out.includes("do not acknowledge routine completions):\nplease migrate the table"));
+});
+
 test("quarantined mail remains pending for release and mailbox failures preserve carrier output", async () => {
   const tc = fakeToolContext();
   let pending = true;
@@ -3361,6 +3596,7 @@ test("subagents send_message wakes by default and says what happened", async () 
   const replies: Array<Awaited<ReturnType<NonNullable<typeof tc.sessionSyscalls>["write"]>>> = [
     { ok: true, sessionId: "child", title: "child", delivered: "queued_turn", busy: false },
     { ok: true, sessionId: "child", title: "child", delivered: "queued_turn", busy: true },
+    { ok: true, sessionId: "child", title: "child", delivered: "steered", busy: true },
     { ok: true, sessionId: "child", title: "child", delivered: "queued_message", busy: false },
     { ok: true, sessionId: "child", title: "child", delivered: "queued_message", busy: true },
     {
@@ -3392,6 +3628,10 @@ test("subagents send_message wakes by default and says what happened", async () 
     /^Queued for "child": it is busy and starts on this when its current turn ends/,
   );
   assert.equal(
+    await send({}),
+    `Delivered into "child"'s running turn; it sees this at its next step. Don't re-send it.`,
+  );
+  assert.equal(
     await send({ wake: false }),
     `Left in "child"'s mailbox. It is idle and won't see this until something wakes it.`,
   );
@@ -3405,6 +3645,7 @@ test("subagents send_message wakes by default and says what happened", async () 
   assert.deepEqual(
     writes.map(({ wake, interrupt }) => [wake, interrupt]),
     [
+      [true, undefined],
       [true, undefined],
       [true, undefined],
       [false, undefined],
@@ -4008,12 +4249,19 @@ test("subagents and sessions are separate tools with one noun each", async () =>
   assert.match(textOut(await call(sessions, { action: "list" })), /peer \(peer\) — idle/);
   assert.match(textOut(await call(sessions, { action: "new", text: "hi", title: "t" })), /Started session "made"/);
   assert.match(textOut(await call(sessions, { action: "fork" })), /Forked this conversation into session "made"/);
-  assert.match(textOut(await call(sessions, { action: "send_message", target: "peer", text: "fyi" })), /queued/);
+  assert.match(
+    textOut(await call(sessions, { action: "send_message", target: "peer", text: "fyi" })),
+    /Left in "peer"'s mailbox/,
+  );
+  await call(sessions, { action: "send_message", target: "peer", text: "later", wake: false });
   assert.match(textOut(await call(sessions, { action: "read" })), /requires `target`/);
   assert.deepEqual(starts, [{ fork: false, text: "hi", title: "t" }, { fork: true }]);
   assert.deepEqual(
     writes.map(({ wake, target, text }) => ({ wake, target, text })),
-    [{ wake: undefined, target: "peer", text: "fyi" }],
+    [
+      { wake: true, target: "peer", text: "fyi" },
+      { wake: false, target: "peer", text: "later" },
+    ],
   );
 });
 

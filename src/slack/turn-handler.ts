@@ -6,6 +6,7 @@ import {
 } from "./external-access.ts";
 import type { SlackRateLimitNotice } from "./rate-limit-notice.ts";
 import type { SlackHistoryReader } from "./history.ts";
+import type { SlackIdentityMode } from "./identity.ts";
 import { slackFailureText } from "./turn-flow.ts";
 import { errMessage, reportFailure, reportFailureAs, swallowAs } from "../util/errors.ts";
 import {
@@ -117,6 +118,15 @@ export interface TurnHandler {
   botHasStakeInThread(client: any, channel: string, threadTs: string, before?: string): Promise<boolean>;
 }
 
+export function botAuthoredActor(
+  actor: ActorAssertion,
+  inc: { botAuthored?: boolean; userId: string | undefined },
+  identityMode: SlackIdentityMode,
+): ActorAssertion {
+  const unresolved = identityMode === "email" && !!inc.userId && actor.externalId === inc.userId;
+  return inc.botAuthored && unresolved && !actor.isBot ? { ...actor, isBot: true } : actor;
+}
+
 function channelType(kind: SlackConversationKind, conversationKind: SlackConversationKind): string {
   if (kind === "dm") return "im";
   return conversationKind === "group" ? "mpim" : "channel";
@@ -136,7 +146,7 @@ export function createTurnHandler(deps: {
   externalAccess?: ExternalSlackAccess;
   continuePrivate?: (runId: string, task: string) => Promise<void>;
   rateLimitNotice?: SlackRateLimitNotice;
-  onEngaged?: (runId: string, channel: string, threadTs?: string) => void;
+  onEngaged?: (runId: string, channel: string, threadTs?: string, emoji?: Promise<string>) => void;
   onSettled?: () => void;
   core: SlackCoreClient;
   flow: TurnFlow;
@@ -207,10 +217,14 @@ export function createTurnHandler(deps: {
         ...(inc.prefetched.timezone ? { timezone: inc.prefetched.timezone } : {}),
       };
     else classified = await classifyUserCached(client, inc.userId);
-    const actor = classified.actor;
-    if (deps.externalAccess && (actor.isExternalGuest || actor.isBot || !inc.userId || inc.synthetic)) return;
+    if (
+      deps.externalAccess &&
+      (classified.actor.isExternalGuest || classified.actor.isBot || !inc.userId || inc.synthetic)
+    )
+      return;
     if (deps.externalAccess && inc.unprompted) inc = { ...inc, unprompted: false };
-    if (deps.allowActor && !deps.allowActor(actor)) return;
+    if (deps.allowActor && !deps.allowActor(classified.actor)) return;
+    const actor = botAuthoredActor(classified.actor, inc, ids.identityMode);
     const timezone = classified.timezone;
     const text = resolveMentions(
       decodeSlackEntities(inc.rawText).trim(),
@@ -253,14 +267,19 @@ export function createTurnHandler(deps: {
       return firstTs;
     };
 
+    const postEphemeral = async (msg: string, threadTs?: string): Promise<void> => {
+      await client.chat
+        .postEphemeral({
+          channel: inc.channel,
+          user: inc.userId,
+          text: msg,
+          ...(threadTs ? { thread_ts: threadTs } : {}),
+        })
+        .catch(swallowAs("slack: chat.postEphemeral", undefined));
+    };
     const ephemeralOrSay = async (msg: string): Promise<void> => {
-      if (inc.kind === "channel") {
-        await client.chat
-          .postEphemeral({ channel: inc.channel, user: inc.userId, text: msg })
-          .catch(swallowAs("slack: chat.postEphemeral", undefined));
-      } else {
-        await postReply(msg);
-      }
+      if (inc.kind === "channel") await postEphemeral(msg);
+      else await postReply(msg);
     };
 
     if (inc.kind === "dm") {
@@ -538,7 +557,8 @@ export function createTurnHandler(deps: {
           : {
               onReplying: () => {
                 if (acknowledges) startAck();
-                if (queuedRunId && replyThreadTs) deps.onEngaged?.(queuedRunId, inc.channel, replyThreadTs);
+                if (queuedRunId && replyThreadTs)
+                  deps.onEngaged?.(queuedRunId, inc.channel, replyThreadTs, ack?.emoji());
               },
             }),
         onQueued: async (runId) => {
@@ -589,11 +609,9 @@ export function createTurnHandler(deps: {
       }
     }
 
-    // This message was folded into a run that was already live. The handler that OWNS that run
-    // delivers its reply; delivering here too is how one answer got posted twice. Settle this
-    // trigger's own ack and stand down.
     if (result.steered) {
       await settleAck();
+      if (result.stopped) await postEphemeral("Stopped.", replyThreadTs);
       return;
     }
 
@@ -625,7 +643,7 @@ export function createTurnHandler(deps: {
       if (inc.kind === "channel" && replyThreadTs) threads.mark(inc.channel, replyThreadTs, true);
       const { text: replyBody, reactions } = cleanAgentReplyForSlack(result.reply ?? "");
       const hasNonText = !!(result.attachments?.length || reactions.length || result.pendingApprovals?.length);
-      let reply = result.stopped ? "Stopped." : "(no response)";
+      let reply = result.stopped ? "" : "(no response)";
       if (replyBody) reply = toSlackMrkdwn(replyBody);
       else if (hasNonText) reply = "";
       const postText = reply;
@@ -712,6 +730,7 @@ export function createTurnHandler(deps: {
       if (delivery === "silent") {
         await finishTaskAck();
         if (queuedRunId && result.refusalKind === "security_quarantine") inFlightRuns.delete(queuedRunId);
+        else if (queuedRunId) ackRunDelivery(queuedRunId);
         console.error(
           `[slack-plugin] unprompted turn ${result.status} (staying quiet) ch=${inc.channel} ts=${inc.ts}: ${result.reason ?? "refused"}`,
         );
@@ -768,19 +787,22 @@ export function createTurnHandler(deps: {
     channel: string,
     ts: string,
     full: boolean,
-  ): Promise<{ text: string; threadTs?: string; reactions: ReactionTally[]; authorId?: string } | undefined> {
+  ): Promise<
+    { text: string; threadTs?: string; reactions: ReactionTally[]; authorId?: string; own: boolean } | undefined
+  > {
     try {
       const res = await client.reactions.get({ channel, timestamp: ts, full });
       const m = res?.message;
       if (!m) return undefined;
       return {
+        own: Boolean((ids.botUserId && m.user === ids.botUserId) || (ids.ownBotId && m.bot_id === ids.ownBotId)),
         text: decodeSlackEntities(slackMessageContent(m).text.trim()),
         ...(m.thread_ts && m.thread_ts !== ts ? { threadTs: String(m.thread_ts) } : {}),
         reactions: reactionTallies(m.reactions),
         ...(m.user ? { authorId: String(m.user) } : {}),
       };
-    } catch {
-      return undefined;
+    } catch (error) {
+      return swallowAs("slack: reacted message read", undefined)(error);
     }
   }
 
@@ -797,20 +819,22 @@ export function createTurnHandler(deps: {
     if (!reactorId || !channel || !messageTs || !emoji) return;
 
     const isDM = channel.startsWith("D");
-    const onBotMessage = Boolean(ids.botUserId && evt.item_user === ids.botUserId);
     const onFollowedRoot = threads.get(channel, messageTs) === true;
-    if (
-      !shouldSurfaceReaction({
+    const surfaces = (onBotMessage: boolean) =>
+      shouldSurfaceReaction({
         itemType: evt.item?.type,
         reactorId,
         botUserId: ids.botUserId,
         isDM,
         onBotMessage,
         onFollowedRoot,
-      })
-    ) {
-      return;
-    }
+      });
+    if (!surfaces(true)) return;
+    const reacted = evt.item_user ? undefined : getReactedMessage(client, channel, messageTs, added);
+    const onBotMessage = evt.item_user
+      ? Boolean(ids.botUserId && evt.item_user === ids.botUserId)
+      : Boolean((await reacted)?.own);
+    if (!surfaces(onBotMessage)) return;
 
     const flightKey = `${channel}:${messageTs}:${emoji}:${reactorId}:${added ? "+" : "-"}`;
     if (reactionsInFlight.has(flightKey)) return;
@@ -846,7 +870,7 @@ export function createTurnHandler(deps: {
           }
           const reactorName = reactor.displayName || "Someone";
 
-          const msg = await getReactedMessage(client, channel, messageTs, added);
+          const msg = await (reacted ?? getReactedMessage(client, channel, messageTs, added));
           let authorName: string | undefined;
           if (!onBotMessage && msg?.authorId && msg.authorId !== reactorId) {
             authorName = (await classifyActor(client, msg.authorId)).displayName;

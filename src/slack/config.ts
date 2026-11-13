@@ -3,6 +3,8 @@ import type { Receiver } from "@slack/bolt";
 import type { EnvelopeStaging } from "./envelope-staging.ts";
 import { botIdentityFromEnv } from "./delivery.ts";
 import { normalizeAllowFrom, parseAllowFrom } from "./allow-from.ts";
+import { trimTrailing, trimTrailingSlashes } from "../util/text.ts";
+import { parseSecretJson } from "../util/errors.ts";
 
 export const NO_RETRY = { retryConfig: { retries: 0 } } as const;
 export const HISTORY_NO_RETRY = { ...NO_RETRY, rejectRateLimitedCalls: true } as const;
@@ -19,7 +21,6 @@ export interface SlackPluginConfig {
   externalAccess?: ExternalSlackAccess;
   historyLimit?: number;
   installationId?: string;
-  tenantId?: string;
   sharedServiceUrl?: string;
   receiverFactory?: (staging?: EnvelopeStaging) => Receiver;
   botToken: string;
@@ -51,37 +52,13 @@ export function parseAckEmoji(raw: string | undefined): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
   for (const part of (raw ?? "").split(/[\s,]+/)) {
-    const name = part.replace(/^:+/, "").replace(/:+$/, "").trim().toLowerCase();
+    const name = trimTrailing(part.replace(/^:+/, ""), (char) => char === ":")
+      .trim()
+      .toLowerCase();
     if (!name || seen.has(name) || !/^[a-z0-9_+-]+$/.test(name)) continue;
     seen.add(name);
     out.push(name);
   }
-  return out;
-}
-
-const DEPLOYMENT_SLACK_KEYS = [
-  "SLACK_USER_TOKEN",
-  "SLACK_COPILOT_BOT_TOKEN",
-  "SLACK_SIGNING_SECRET",
-  "SLACK_ALLOW_FROM",
-  "SLACK_DENY_MESSAGE",
-  "SLACK_IDENTITY_EMAIL",
-  "SLACK_EXTERNAL_ACCESS",
-  "SLACK_EVENTS_PORT",
-];
-
-export function storedSlackEnv(
-  env: Record<string, string | undefined>,
-  stored: { botToken: string; appToken?: string },
-  install: boolean,
-): Record<string, string | undefined> {
-  const out: Record<string, string | undefined> = {
-    ...env,
-    SLACK_BOT_TOKEN: stored.botToken,
-    SLACK_APP_TOKEN: stored.appToken,
-    SLACK_EVENTS_MODE: stored.appToken ? "socket" : env.SLACK_EVENTS_MODE,
-  };
-  if (!install) for (const key of DEPLOYMENT_SLACK_KEYS) delete out[key];
   return out;
 }
 
@@ -117,7 +94,7 @@ export function slackPluginConfigFromEnv(
     ...opt("ackCapMs", num(env.SLACK_ACK_CAP_MS)),
     ...opt("userToken", env.SLACK_USER_TOKEN),
     ...opt("copilotBotToken", env.SLACK_COPILOT_BOT_TOKEN),
-    ...opt("webUiPublicUrl", env.WEB_UI_PUBLIC_URL),
+    ...opt("webUiPublicUrl", env.PUBLIC_WEB_URL),
     ...opt("sharedServiceUrl", env.QM_SLACK_SERVICE_URL),
     ...opt("identityEmail", env.SLACK_IDENTITY_EMAIL),
     ...(() => {
@@ -140,7 +117,7 @@ export function slackPluginConfigFromEnv(
 }
 
 export function normalizeSlackApiUrl(raw: string): string {
-  const trimmed = raw.replace(/\/+$/, "");
+  const trimmed = trimTrailingSlashes(raw);
   return trimmed.endsWith("/api") ? `${trimmed}/` : `${trimmed}/api/`;
 }
 
@@ -148,14 +125,7 @@ export function slackAccountConfigsFromEnv(env: Record<string, string | undefine
   if (env.DEV_INSTANCE_NO_SLACK === "1") return [];
   const raw = env.SLACK_ACCOUNTS?.trim();
   if (!raw) return [];
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch (err) {
-    throw new Error(`SLACK_ACCOUNTS is not valid JSON: ${err instanceof Error ? err.message : String(err)}`, {
-      cause: err,
-    });
-  }
+  const parsed = parseSecretJson(raw, "SLACK_ACCOUNTS");
   if (!Array.isArray(parsed)) throw new Error("SLACK_ACCOUNTS must be a JSON array of account objects");
   const out: SlackPluginConfig[] = [];
   const seenIds = new Set<string>();
@@ -177,7 +147,7 @@ export function slackAccountConfigsFromEnv(env: Record<string, string | undefine
       SLACK_IDENTITY_EMAIL: str(a.identityEmail) ?? "1",
       SLACK_LOG_LEVEL: env.SLACK_LOG_LEVEL,
       SLACK_HISTORY_LIMIT: env.SLACK_HISTORY_LIMIT,
-      WEB_UI_PUBLIC_URL: env.WEB_UI_PUBLIC_URL,
+      PUBLIC_WEB_URL: env.PUBLIC_WEB_URL,
       QM_SLACK_SERVICE_URL: env.QM_SLACK_SERVICE_URL,
     };
     const config = slackPluginConfigFromEnv(accountEnv);

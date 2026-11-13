@@ -187,6 +187,15 @@ describe("group-DM (mpim) membership (addressed by participant set, §10)", () =
     assert.equal(await d.groupMembership("G-1", "U-alice"), false);
   });
 
+  it("a single registered group neither marks the org synced nor fences out the next full sync", async () => {
+    const d = createPostgresDirectoryStore(testDatabaseUrl());
+    await d.upsertGroup("G-1", ["U-alice"]);
+    assert.equal(await d.groupMembership("G-1", "U-alice"), true);
+    assert.equal(await d.groupMembership("G-2", "U-alice"), undefined);
+    assert.equal(await d.replaceGroups([{ groupId: "G-2", principalId: "U-alice" }], Date.now() - 60_000), true);
+    assert.equal(await d.groupMembership("G-2", "U-alice"), true);
+  });
+
   it("replaceGroups is a full per-org swap", async () => {
     const d = await dir();
     await d.replaceGroups([{ groupId: "G-3", principalId: "U-alice" }]);
@@ -335,15 +344,20 @@ describe("private-channel membership (authorizes private-channel sends, §10)", 
     assert.equal(await d.channelMembership("C-one", "U-keep"), true);
   });
 
-  it("uses one Slack Connect roster without making a private room an ordinary send target", async () => {
+  it("treats a private Slack Connect room like any private room for its own members", async () => {
     const d = createPostgresDirectoryStore(testDatabaseUrl());
     await d.replaceChannels(
       [{ channelId: "C-connect", name: "connect", isPrivate: true, isExternal: true }],
       [{ channelId: "C-connect", principalId: "U-member" }],
     );
     assert.equal(await d.channelMembership("C-connect", "U-member"), true);
-    assert.equal(await d.channelMember("C-connect", "U-member"), false);
-    assert.deepEqual(await d.listChannelsFor("U-member"), []);
+    assert.equal(await d.channelMember("C-connect", "U-member"), true);
+    assert.equal(await d.channelMember("C-connect", "U-other"), false);
+    assert.deepEqual(
+      (await d.listChannelsFor("U-member")).map((c) => c.channelId),
+      ["C-connect"],
+    );
+    assert.equal(await d.conversationMembers("channel", "C-connect"), undefined);
   });
 
   it("partially replaces only the channel rosters known by the source", async () => {
@@ -382,17 +396,6 @@ describe("private-channel membership (authorizes private-channel sends, §10)", 
     );
     assert.equal(await d.channelMembership("C-one", "U-leaving"), false);
     assert.equal(await d.channelMembership("C-one", "U-keep"), true);
-  });
-
-  it("uses one Slack Connect roster without making a private room an ordinary send target", async () => {
-    const d = createPostgresDirectoryStore(testDatabaseUrl());
-    await d.replaceChannels(
-      [{ channelId: "C-connect", name: "connect", isPrivate: true, isExternal: true }],
-      [{ channelId: "C-connect", principalId: "U-member" }],
-    );
-    assert.equal(await d.channelMembership("C-connect", "U-member"), true);
-    assert.equal(await d.channelMember("C-connect", "U-member"), false);
-    assert.deepEqual(await d.listChannelsFor("U-member"), []);
   });
 });
 

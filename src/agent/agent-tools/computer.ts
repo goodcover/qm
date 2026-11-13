@@ -1,4 +1,5 @@
 import { Check } from "typebox/value";
+import { IO_SATURATED_FULL60 } from "../../sandbox/load-probe.ts";
 import { isObj } from "../../util/objects.ts";
 import { MaskedExecutionError } from "../../security/secret-masking.ts";
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -15,8 +16,6 @@ import { text, type ToolKit } from "./kit.ts";
 function fmtStatus(s: { state: "running" } | { state: "exited"; code: number }): string {
   return s.state === "exited" ? `exited ${s.code}` : "running";
 }
-
-const PRESSURE_WARN_FULL60 = 50;
 
 export function computerTools(kit: ToolKit) {
   const { ref, opts, logResult, recordCall, recordResult, blockOnApproval } = kit;
@@ -108,8 +107,8 @@ export function computerTools(kit: ToolKit) {
         : "";
       const localExec = !route?.scratch && !scratchReroute;
       const pressureNote =
-        localExec && r.pressure && r.pressure.ioFull60 >= PRESSURE_WARN_FULL60
-          ? `\n[pressure] this computer's disk is saturated (io ${r.pressure.ioFull60}%, load ${r.pressure.load1}) — sequence heavy work, move self-contained runs to scope:"scratch", or check sandbox action=status`
+        localExec && r.load && (r.load.ioFull60 ?? 0) >= IO_SATURATED_FULL60
+          ? `\n[pressure] this computer's disk is saturated (io ${r.load.ioFull60}%, load ${r.load.load1}) — sequence heavy work, move self-contained runs to scope:"scratch", or check sandbox action=status`
           : "";
       return recordResult(
         callId,
@@ -202,6 +201,7 @@ export function computerTools(kit: ToolKit) {
     "restart",
     ...(opts?.sandboxResources ? ["list", "create", "set_default", "retire"] : []),
   ];
+  const memorySizedBackends = opts?.sandboxResources ? (opts.memorySizedBackends ?? []) : [];
   const sandboxManagement = defineTool({
     name: "sandbox",
     label: "sandbox",
@@ -216,11 +216,22 @@ export function computerTools(kit: ToolKit) {
       ),
       backend: Type.Optional(Type.String({ description: "create: provider from list." })),
       name: Type.Optional(Type.String({ description: "create: display name." })),
+      ...(memorySizedBackends.length
+        ? {
+            memory_gib: Type.Optional(
+              Type.Integer({
+                minimum: 1,
+                description: `create/restart: GiB of memory; ${memorySizedBackends.join(", ")} only. Omit for the default size; restart keeps the computer's size.`,
+              }),
+            ),
+          }
+        : {}),
       purpose: Type.String({ description: "As for execute." }),
     }),
     async execute(callId, params) {
       const tc = ref.current;
       if (!tc) return text("[error] no active tool context");
+      const memoryGib = (params as { memory_gib?: number }).memory_gib;
       await recordCall(callId, {
         tool: "sandbox",
         action: params.action,
@@ -228,6 +239,7 @@ export function computerTools(kit: ToolKit) {
         ...(params.sandbox_id !== undefined ? { sandbox_id: params.sandbox_id } : {}),
         ...(params.backend ? { backend: params.backend } : {}),
         ...(params.name ? { name: params.name } : {}),
+        ...(memoryGib !== undefined ? { memory_gib: memoryGib } : {}),
       });
       try {
         if (["list", "create", "set_default", "retire"].includes(params.action)) {
@@ -238,13 +250,14 @@ export function computerTools(kit: ToolKit) {
               backend: params.backend,
               name: params.name,
               sandboxId: params.sandbox_id,
+              ...(memoryGib !== undefined ? { memoryGb: memoryGib } : {}),
             },
           );
           return recordResult(callId, { tool: "sandbox", action: params.action }, text(JSON.stringify(result)));
         }
         if (params.sandbox_id === null) throw new Error("null only clears a default");
         if (params.action === "restart") {
-          await tc.restartComputer(params.sandbox_id);
+          await tc.restartComputer(params.sandbox_id, memoryGib);
           return recordResult(
             callId,
             { tool: "sandbox", action: "restart", restarted: true },
@@ -254,9 +267,8 @@ export function computerTools(kit: ToolKit) {
         const s = await tc.computerStatus(params.sandbox_id);
         const verdict = computerVerdict(s);
         const machineLine = s.listed && s.listed !== s.machine ? `${s.machine} (listed: ${s.listed})` : s.machine;
-        const pressureLine = s.pressure ? `; io pressure: ${s.pressure.ioFull60}% (load ${s.pressure.load1})` : "";
-        const resourcesLine = s.resources
-          ? `; cpu ${s.resources.cpuUsedPct}%, memory ${s.resources.memUsedMb}/${s.resources.memTotalMb} MiB, disk ${s.resources.diskUsedGb}/${s.resources.diskTotalGb} GiB`
+        const loadLine = s.load
+          ? `${s.load.ioFull60 === null ? "" : `; io pressure: ${s.load.ioFull60}%`}; load ${s.load.load1}, memory ${s.load.memUsedMb}/${s.load.memTotalMb} MiB, disk ${s.load.diskUsedGb}/${s.load.diskTotalGb} GiB`
           : "";
         let shellLine = s.guestResponsive ? "answering" : `NOT answering${s.probeError ? ` (${s.probeError})` : ""}`;
         if (s.lifecycleState === "paused") shellLine = "paused (not probed)";
@@ -283,12 +295,7 @@ export function computerTools(kit: ToolKit) {
         return recordResult(
           callId,
           { tool: "sandbox", action: "status", verdict, ...s },
-          text(
-            [
-              `machine: ${machineLine}; shell: ${shellLine}${pressureLine}${resourcesLine}${verdictLine}`,
-              ...recoveryLines,
-            ].join("\n"),
-          ),
+          text([`machine: ${machineLine}; shell: ${shellLine}${loadLine}${verdictLine}`, ...recoveryLines].join("\n")),
         );
       } catch (e) {
         if (e instanceof NeedsApproval) return blockOnApproval(callId, e, params.purpose, { tool: "sandbox" });
@@ -364,7 +371,7 @@ export function computerTools(kit: ToolKit) {
       "poll: new output and running/exited state (pass the last cursor as since_cursor; ~64KB per read). send_input: write to stdin. stop: terminate it. list: your jobs. " +
       "watch: wake this conversation as a new turn on new output (optionally only lines matching `pattern`) and once on exit, to keep the user posted on long work; pass since_cursor and `instructions` for your future self. unwatch: disarm by monitor_id. " +
       `Jobs stop after a hard TTL (default ${bgTtlMin} min, max ${bgTtlMaxMin}); anything that finishes within ${execCeilingSec}s should just use execute. ` +
-      `The job has the same environment as foreground execute ($AGENT_API_URL, $AGENT_API_TOKEN, $AGENT_CREDENTIAL_TOKEN). ${capabilityExpiry} It cannot deliver files; attach them from a live turn.\n` +
+      `The job has the same environment as foreground execute ($AGENT_API_URL, $AGENT_API_TOKEN, $AGENT_CREDENTIAL_TOKEN). ${capabilityExpiry} Connected-app (Composio) calls stop working when the launching turn ends, so keep them in foreground execute. It cannot deliver files; attach them from a live turn.\n` +
       "INTERACTIVE LOGINS (`gh auth login` etc., anything printing a URL/code then waiting) must run with background:true: relay the URL/code to the user, then watch or poll until exit; answer prompts with send_input; never run one in the foreground or stop it mid-flight. Read and follow the `interactive-login` skill first.",
     parameters: Type.Object({
       action: Type.Union([
@@ -521,10 +528,13 @@ export function computerTools(kit: ToolKit) {
           case "unwatch": {
             try {
               const r = await tc.backgroundUnwatch(params.monitor_id!);
+              const refusal = r.notYours
+                ? `[not your watch: ${r.monitorId}; someone else in this conversation armed it]`
+                : `[no such watch: ${r.monitorId}]`;
               return recordResult(
                 callId,
                 { tool: "background", action: params.action, ...r },
-                text(r.removed ? `unwatched ${r.monitorId}` : `[no such watch: ${r.monitorId}]`),
+                text(r.removed ? `unwatched ${r.monitorId}` : refusal),
                 !r.removed,
               );
             } catch (e) {
@@ -563,7 +573,7 @@ export function computerTools(kit: ToolKit) {
                       ? jobs
                           .map(
                             (j) =>
-                              `${j.processId}  ${j.registryStatus === "reaped" ? "stopped (ttl)" : fmtStatus(j.status)}  ${new Date(j.startedAt).toISOString()}  ${j.purpose ?? j.command}${j.purpose ? `\n  ${j.command}` : ""}`,
+                              `${j.processId}  ${j.registryStatus === "reaped" ? "stopped (ttl)" : j.registryStatus}  ${new Date(j.startedAt).toISOString()}  ${j.purpose ?? j.command}${j.purpose ? `\n  ${j.command}` : ""}`,
                           )
                           .join("\n")
                       : "(no background jobs)",
@@ -596,9 +606,9 @@ export function computerTools(kit: ToolKit) {
 const operationFields: Record<string, Record<string, string[]>> = {
   sandbox: {
     status: ["sandbox_id"],
-    restart: ["sandbox_id"],
+    restart: ["sandbox_id", "memory_gib"],
     list: [],
-    create: ["backend", "name"],
+    create: ["backend", "name", "memory_gib"],
     set_default: ["sandbox_id"],
     retire: ["sandbox_id"],
   },
@@ -626,6 +636,7 @@ export function validateSandboxTool(
       const action = isObj(params) ? String(params.action) : "";
       const operations = operationFields[tool.name];
       const fields = operations && Object.hasOwn(operations, action) ? operations[action] : undefined;
+      const allowed = fields ? new Set(["action", "purpose", ...fields]) : undefined;
       let required: string[];
       if (tool.name === "execute") required = ["command", "purpose"];
       else if (tool.name === "sandbox") {
@@ -643,13 +654,24 @@ export function validateSandboxTool(
           params[key] === undefined ||
           (typeof params[key] === "string" && key !== "data" && !params[key].trim()),
       );
-      if (
-        !Check(schema, params) ||
-        missing ||
-        (operations &&
-          (!fields || Object.keys(params).some((key) => !["action", "purpose", ...fields].includes(key)))) ||
-        (tool.name === "sandbox" && params.sandbox_id === null && action !== "set_default")
-      ) {
+      const keys = isObj(params) ? Object.keys(params) : [];
+      const unknown = keys.filter((key) => !Object.hasOwn(properties, key));
+      const unused = allowed ? keys.filter((key) => Object.hasOwn(properties, key) && !allowed.has(key)) : [];
+      const nullSandbox =
+        tool.name === "sandbox" && isObj(params) && params.sandbox_id === null && action !== "set_default";
+      const named = (list: string[]) => list.map((key) => `\`${key}\``).join(", ");
+      const problem = (() => {
+        if (operations && !fields)
+          return `unknown action \`${action}\` (use one of ${Object.keys(operations).join(", ")})`;
+        if (missing) return `requires \`${missing}\``;
+        if (unknown.length) return `${tool.name} has no ${named(unknown)} field`;
+        if (unused.length) return `${action} doesn't take ${named(unused)}; omit them and retry`;
+        if (nullSandbox)
+          return "`sandbox_id: null` only clears the default with set_default; omit it or pass a sandbox ID";
+        if (!Check(schema, params)) return "a field has the wrong type or value; check the tool schema";
+        return undefined;
+      })();
+      if (problem) {
         await recordCall(callId, {
           tool: tool.name,
           ...(isObj(params) ? { purpose: params.purpose, action: params.action } : {}),
@@ -657,9 +679,7 @@ export function validateSandboxTool(
         return recordResult(
           callId,
           { tool: tool.name, invalid: true },
-          text(
-            `[error] invalid ${tool.name} arguments: ${missing ? `requires \`${missing}\`` : "use only the advertised fields and types for this operation"}.`,
-          ),
+          text(`[error] invalid ${tool.name} arguments: ${problem}.`),
           true,
         );
       }

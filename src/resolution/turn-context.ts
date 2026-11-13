@@ -21,14 +21,18 @@ import { type Resolution, type ScopeId, type Principal } from "../types.ts";
 import { carriedFileHandles, sharingSourcesForTurn } from "./sharing-access.ts";
 
 import type { CurrentScopeMembers } from "./scope-membership.ts";
+import type { Tenant } from "../tenants/context.ts";
 
 type ContextInput = Omit<Parameters<typeof sharingSourcesForTurn>[0], "posture"> & {
+  tenant: Tenant;
   resolution: Resolution;
+  audienceScopeId?: ScopeId;
   external?: boolean;
   audience: Principal[];
   acl: Pick<AclStore, "sharedOfKindForAudience">;
   memoryPolicy: MemoryPolicy;
   useMemory: boolean;
+  notebookOnly?: boolean;
   memory: MemoryService;
   files: FileArtifactStore;
   skills?: SkillStore;
@@ -52,11 +56,15 @@ export async function resolveTurnContext(input: ContextInput) {
   ];
   const memoryAccess =
     (useMemory && memoryPolicy.capture !== "off") || read.length
-      ? { ...(useMemory && memoryPolicy.capture !== "off" ? { write: memoryScopeId } : {}), read }
+      ? {
+          ...(useMemory && memoryPolicy.capture !== "off" ? { write: memoryScopeId } : {}),
+          read,
+          ...(input.notebookOnly ? { notebookOnly: true as const } : {}),
+        }
       : undefined;
   const recordRead = (scope: ScopeId, resource: string) => {
     if (!sharingSources.includes(scope)) return;
-    input.auditLog?.record({
+    input.auditLog?.record(input.tenant, {
       at: Date.now(),
       principalId: input.actor.id,
       action: "sharing.cross_context_read",
@@ -71,11 +79,16 @@ export async function resolveTurnContext(input: ContextInput) {
     nativeScopes: baseRecallScopes,
     audience: input.audience,
     open: resolution.sharingPosture === "open",
+    ...(input.notebookOnly ? { notebookOnly: true } : {}),
     config: input.config,
     isCurrentSharedScopeMember: input.isCurrentSharedScopeMember,
     currentScopeMembers: input.currentScopeMembers,
   };
   const memory = disclosedMemory(input.memory, disclosure);
+  const reader = {
+    actorId: input.actor.id,
+    ...(input.audienceScopeId ? { audienceScopeId: input.audienceScopeId } : {}),
+  };
   const handles = [...resolution.grantedHandles, ...(await carriedFileHandles(sharingSources, input.files))];
   const memoryLabels = await memoryRecallLabels(read, input.directory, input.projects);
   return {
@@ -101,8 +114,10 @@ export async function resolveTurnContext(input: ContextInput) {
     },
     recallMemory: (
       query: string,
-      disclosedFacts?: ReadonlyMap<ScopeId, readonly MemoryFact[]>,
+      disclosedFacts?: Promise<ReadonlyMap<ScopeId, readonly MemoryFact[]>>,
       report?: MemoryRecallContext["report"],
+      text?: string,
+      sessionId?: string,
     ) =>
       tracePhase(
         "turn.memory_recall",
@@ -112,10 +127,12 @@ export async function resolveTurnContext(input: ContextInput) {
             read,
             {
               query,
-              actorId: input.actor.id,
+              ...(text ? { input: text } : {}),
+              ...reader,
               maxChars: RECALL_MAX_CHARS,
               ...(disclosedFacts ? { disclosedFacts } : {}),
               ...(report ? { report } : {}),
+              ...(sessionId ? { sessionId } : {}),
             },
             memoryLabels,
           ),
@@ -126,8 +143,13 @@ export async function resolveTurnContext(input: ContextInput) {
       limit = 20,
       scope?: ScopeId,
       report?: MemoryRecallContext["report"],
+      sessionId?: string,
     ): Promise<string[] | null> => {
-      const hits = await searchNotebooks(memory, read, query, limit, scope, input.actor.id, report);
+      const hits = await searchNotebooks(memory, read, query, limit, scope, {
+        ...reader,
+        ...(report ? { report } : {}),
+        ...(sessionId ? { sessionId } : {}),
+      });
       if (hits) for (const source of scope === undefined ? read : [scope]) recordRead(source, "memory");
       return hits;
     },
@@ -155,6 +177,7 @@ export async function resolveTurnContext(input: ContextInput) {
         : (
             await input.acl
               .sharedOfKindForAudience(
+                input.tenant,
                 "skill",
                 input.audience,
                 input.targetScope,

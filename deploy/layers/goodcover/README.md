@@ -117,13 +117,6 @@ or token re-entry. Ops owns the release's immutable image pins and rollout recor
   in `/tmp` after two hours. Goodcover removed that sweep because it could delete the
   credentials of a command still running. A directory left behind by a crash remains
   until that computer is replaced.
-- **Private MCP hosts.** Upstream refuses MCP endpoints that resolve to private
-  network addresses. Goodcover's SigNoz MCP server runs in the cluster at
-  `signoz-mcp.signoz.svc.cluster.local`, so core's `MCP_PRIVATE_HOSTS` lists that
-  host. MCP calls to a listed host skip the address check entirely, so they may
-  reach whatever address the host resolves to. The list holds exact host names,
-  with no wildcards. It lives only in the core ConfigMap, so the
-  admin UI cannot widen it, and OAuth discovery still refuses private addresses.
 
 ## Historical deployed baseline: Claude Code alongside Codex
 
@@ -163,11 +156,11 @@ it when expired or revoked. The entry's ID is safe to keep in ops configuration.
 
 ## Upstream updates and CI
 
-Production runs 0.1.15-gc.1, which adopted Pi while retaining ChatGPT subscription
-access ([UPGRADE-0.1.15.md](UPGRADE-0.1.15.md)). The 0.1.16 source candidate is not
-deployed. Use [its upgrade guide](UPGRADE-0.1.16.md) for its configuration, its
-three-hop database migration and recovery requirements. The version notes below are
-historical.
+Production runs 0.1.16-gc ([UPGRADE-0.1.16.md](UPGRADE-0.1.16.md)); ops holds the exact
+pins. The 0.1.19 source candidate is not deployed, and neither was 0.1.17. Moving production
+to 0.1.19 needs both [UPGRADE-0.1.17.md](UPGRADE-0.1.17.md) (single-service layout, configuration
+changes, the 0.1.16 database step) and [UPGRADE-0.1.19.md](UPGRADE-0.1.19.md). The version notes
+below are historical.
 
 The historical 0.1.13 source merge retained Goodcover's Codex 0.156.1 and Claude Agent SDK
 0.3.280, Plain OAuth and MCP catalog support, model reasoning capabilities,

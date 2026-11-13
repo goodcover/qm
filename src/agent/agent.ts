@@ -4,6 +4,7 @@ import type { ResumableToolCall } from "../core/turn-resume.ts";
 import type { DocumentInput } from "../core/documents.ts";
 import type { RuntimeControl, TurnHandoff } from "./runtime-types.ts";
 import type {
+  ApprovedToolCallSpec,
   AttachmentMeta,
   ClientToolDeclaration,
   ConversationTurn,
@@ -24,6 +25,16 @@ import type { ToolContext } from "../tools/primitives.ts";
 import type { SurfaceToolPrompt } from "../surfaces/registry.ts";
 import type { SecurityScreenVerdict, ToolResultScreen, ToolResultScreenInput } from "../security/security-posture.ts";
 import type { TurnPark } from "../runs/run-store.ts";
+
+export interface ApprovedToolCall extends ApprovedToolCallSpec {
+  callId: string;
+  requestId: string;
+}
+
+export type SteeredApproval =
+  | { kind: "run"; call: ApprovedToolCall; summary: string; approver: string }
+  | { kind: "denied"; summary: string; approver: string }
+  | { kind: "ignored" };
 
 export interface RuntimeChoice {
   modelId: string;
@@ -86,16 +97,17 @@ export interface AgentTurnInput {
   }>;
   documents?: DocumentInput[];
   runtime?: Partial<RuntimeChoice>;
-  runtimePurpose?: import("../resolution/config-store.ts").RuntimePurpose;
+  runtimePurpose?: import("../resolution/config-store.ts").TurnRuntimePurpose;
   runtimeControl?: RuntimeControl;
   runtimeActorId?: string;
   readOnly?: boolean;
+  memoryNotebookOnly?: boolean;
   surfaceTools?: boolean;
   delegateWork?: boolean;
   surfaceName?: string;
   surfacePrompt?: SurfaceToolPrompt;
   clientTools?: readonly ClientToolDeclaration[];
-  pollFire?: boolean;
+  replyOptional?: boolean;
   turnWallClockMs?: number;
   systemPrompt: string;
   history: Item[];
@@ -106,8 +118,11 @@ export interface AgentTurnInput {
   tools: ToolContext;
   mcpTools?: McpToolDescriptor[];
   toolApprovalGate?(tool: string, callKey?: string): boolean;
+  approvalUnavailable?: string;
   emit(item: NewItem): Promise<Item>;
   resumeToolCall?: ResumableToolCall;
+  approvedToolCalls?: ApprovedToolCall[];
+  resolveSteeredApproval?(request: TurnRequest): Promise<SteeredApproval>;
   scopeLabel: ScopeId;
   orgScopeId: ScopeId;
   providerKeys?: ProviderKeys;
@@ -157,13 +172,14 @@ export interface AgentTurnResult {
     purpose?: string;
     approvalKey?: string;
     grantModes?: { session: boolean; always: boolean };
+    call?: ApprovedToolCallSpec;
   }>;
   pausedOnApproval?: boolean;
   modelCalls?: number;
   cacheUsage?: { cacheRead: number; cacheWrite: number; uncachedInput: number };
 }
 
-export interface DetectInput {
+export interface DetectInput extends SessionRoute {
   session: Session;
   message: string;
   recentContext: string;
@@ -206,6 +222,7 @@ export interface ModelUtilities {
   pickAckEmoji?(text: string, candidates: readonly string[]): Promise<string | undefined>;
   generateTitle?(transcript: string): Promise<string | undefined>;
   summarizeApproval?(command: string, reason: string, purpose?: string): Promise<string | undefined>;
+  suggestNextPrompt?(transcript: string): Promise<string | undefined>;
 }
 
 export interface Agent extends ModelUtilities {

@@ -23,7 +23,7 @@ import {
 import { deliveryNote } from "../core/attachments.ts";
 import { goalCancelledNote } from "./goal.ts";
 import { messageRevision, renderMessageRevision } from "../slack/message-revisions.ts";
-import { CONTEXT_SUMMARY_HEADER, INTERRUPTED_TOOL_RESULT, unrecordedToolResult } from "./context-compaction.ts";
+import { contextSummaryHeader, INTERRUPTED_TOOL_RESULT, unrecordedToolResult } from "./context-compaction.ts";
 import { contextSummary } from "../sessions/session-store.ts";
 import { isoFromTs, messageTag } from "../util/message-tag.ts";
 import { isObj } from "../util/objects.ts";
@@ -273,7 +273,7 @@ function recordedWireArguments(argumentsJson: string, call: Item): ToolCall["arg
 }
 
 export function recordedToolArguments(call: Pick<Item, "body">): Record<string, unknown> {
-  const { rerun, result: _r, ...recorded } = visibleBody(call);
+  const { rerun, result: _r, approvedRequestId: _a, ...recorded } = visibleBody(call);
   const input = (rerun as { input?: unknown } | undefined)?.input;
   if (isObj(input)) return { ...input, retrySafe: true };
   if (typeof recorded.bytes !== "number" || typeof recorded.text === "string") return recorded;
@@ -352,7 +352,7 @@ export function reconstructMessagesFromHistory(
     previous = e;
     const summary = contextSummary(e);
     if (summary) {
-      raw.push(userMsg(`${CONTEXT_SUMMARY_HEADER}\n${summary.text}`, e.createdAt));
+      raw.push(userMsg(`${contextSummaryHeader(summary.throughSeq, e.createdAt)}\n${summary.text}`, e.createdAt));
       continue;
     }
     const step = itemStep(e);
@@ -402,7 +402,9 @@ export function reconstructMessagesFromHistory(
       }
     } else if (isAgentReply(e)) {
       const t = itemText(e);
-      if (t) raw.push(legacyAssistant([{ type: "text", text: t }], e.createdAt));
+      const via = typeof e.body.via === "string" ? e.body.via : undefined;
+      if (t && via) raw.push(userMsg(messageTag({ from: "agent", via }, t), e.createdAt));
+      else if (t) raw.push(legacyAssistant([{ type: "text", text: t }], e.createdAt));
     } else if (e.kind === "AgentMessage" && e.variant === "files_delivered") {
       const t = itemText(e);
       if (t) raw.push(userMsg(deliveryNote(t), e.createdAt));

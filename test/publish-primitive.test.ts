@@ -13,6 +13,8 @@ import { scopeId } from "../src/types.ts";
 import { singleProcessDeps } from "./support/single-process.ts";
 import { testConfigStore, testDeployBackings, testDatabaseUrl } from "./support/test-database.ts";
 import { createPostgresGrantStore } from "../src/acl/postgres-grant-store.ts";
+import { trimTrailingSlashes } from "../src/util/text.ts";
+import { testTenant as tenant } from "./support/test-tenant.ts";
 
 function svc() {
   const deployStore: DeployStore = createDeployStore(testDeployBackings());
@@ -53,7 +55,7 @@ interface CtxOpts {
 
 function fileSandbox(files: Array<{ path: string; data: Uint8Array }>): Sandbox {
   const under = (dir: string) => {
-    const d = (dir ?? "").replace(/^\.?\/+/, "").replace(/\/+$/, "");
+    const d = trimTrailingSlashes((dir ?? "").replace(/^\.?\/+/, ""));
     return files.filter((f) => !d || d === "." || f.path === d || f.path.startsWith(`${d}/`));
   };
   return {
@@ -70,6 +72,7 @@ function ctx(deploy: DeployService, opts: CtxOpts = {}) {
   const files = opts.files ?? [];
   const sandbox = opts.sandbox ?? fileSandbox(files);
   return createToolContext({
+    tenant: tenant,
     sandbox,
     provision: opts.provision ?? (async () => ({}) as SandboxHandle),
     writableScopeId: scopeId("personal", "U1"),
@@ -199,7 +202,10 @@ test("publish by name inherits the current entrypoint when redeploying without o
   assert.equal(second.version, 2);
   assert.equal(d.versions[1]!.entrypoint, "node server.js");
   assert.deepEqual(
-    (await s.deployStore.filesOf(d.id, 2))?.map((f) => ({ path: f.path, data: [...f.data] })),
+    (await s.deployStore.filesOf(d.id, (await s.deployStore.versionOf(d.id, 2))!.commit!)).map((f) => ({
+      path: f.path,
+      data: [...f.data],
+    })),
     [{ path: "server.js", data: [...bytes("v2")] }],
   );
 });
@@ -262,6 +268,7 @@ test("publish: a different scope claiming a taken name is rejected", async () =>
   const s = svc();
   await ctx(s.deploy, { files: appFile() }).publish({ entrypoint: "x", name: "taken" });
   const other = createToolContext({
+    tenant: tenant,
     sandbox: fileSandbox(appFile()),
     provision: async () => ({}) as SandboxHandle,
     writableScopeId: scopeId("personal", "U2"),
@@ -274,6 +281,26 @@ test("publish: a different scope claiming a taken name is rejected", async () =>
     createdBy: "U2",
   });
   await assert.rejects(() => other.publish({ entrypoint: "x", name: "taken" }), /name taken/);
+});
+
+test("publish hands a bot's turn to the deploy service as bot work", async () => {
+  const { deploy, captured } = spyDeploy();
+  const bot = createToolContext({
+    sandbox: fileSandbox(appFile()),
+    provision: async () => ({}) as SandboxHandle,
+    writableScopeId: scopeId("personal", "release-bot"),
+    readOnlyScopeIds: [],
+    commandPolicy: () => ({}) as never,
+    authorizeCommand: () => false,
+    grantedHandles: [],
+    deploy,
+    acl: {} as never,
+    createdBy: "release-bot",
+    botActor: true,
+    tenant,
+  });
+  await bot.publish({ entrypoint: "node server.js", name: "bot-app" });
+  assert.equal(captured()?.botActor, true);
 });
 
 test("publish: renameFrom moves the link but keeps the id (and shares ride the id)", async () => {
@@ -290,7 +317,7 @@ test("publish: renameFrom moves the link but keeps the id (and shares ride the i
   assert.equal((await s.deployStore.getByName("new-name"))!.versions.length, 1, "a pure rename ships no version");
   assert.equal(await s.deployStore.getByName("old-name"), null);
   assert.equal((await s.deployStore.getByName("new-name"))!.id, created.id);
-  assert.equal((await s.acl.grantsFor(scopeId("personal", "U1"), `deployment:${created.id}`)).length, 1);
+  assert.equal((await s.acl.grantsFor(tenant, scopeId("personal", "U1"), `deployment:${created.id}`)).length, 1);
 });
 
 test("publish rejects an entrypoint deploy when no files were collected", async () => {
@@ -338,6 +365,7 @@ test("publish collects the app tree as ONE archive (not file-by-file)", async ()
   } as unknown as Sandbox;
   const { deploy, captured } = spyDeploy();
   const tc = createToolContext({
+    tenant: tenant,
     sandbox,
     provision: async () => ({}) as SandboxHandle,
     writableScopeId: scopeId("personal", "U1"),
@@ -370,6 +398,7 @@ test("publish FAILS LOUDLY on a flaky archive read — it never silently drops f
     },
   } as unknown as Sandbox;
   const tc = createToolContext({
+    tenant: tenant,
     sandbox,
     provision: async () => ({}) as SandboxHandle,
     writableScopeId: scopeId("personal", "U1"),
@@ -397,7 +426,7 @@ test("publish on a sandbox WITHOUT exportFiles (AWS) still collects the tree, an
   const awsLike = (readFor: (p: string) => Uint8Array | null): Sandbox =>
     ({
       listDir: async (_h: SandboxHandle, dir: string) => {
-        const d = (dir ?? "").replace(/^\.?\/+/, "").replace(/\/+$/, "");
+        const d = trimTrailingSlashes((dir ?? "").replace(/^\.?\/+/, ""));
         return files.filter((f) => !d || d === "." || f.path.startsWith(`${d}/`)).map((f) => f.path);
       },
       readFileBytes: async (_h: SandboxHandle, p: string) => readFor(p),
@@ -406,6 +435,7 @@ test("publish on a sandbox WITHOUT exportFiles (AWS) still collects the tree, an
   {
     const { deploy, captured } = spyDeploy();
     const tc = createToolContext({
+      tenant: tenant,
       sandbox: awsLike((p) => files.find((f) => f.path === p)?.data ?? null),
       provision: async () => ({}) as SandboxHandle,
       writableScopeId: scopeId("personal", "U1"),
@@ -428,6 +458,7 @@ test("publish on a sandbox WITHOUT exportFiles (AWS) still collects the tree, an
   {
     const s = svc();
     const tc = createToolContext({
+      tenant: tenant,
       sandbox: awsLike((p) => (p === "app/ok.txt" ? null : (files.find((f) => f.path === p)?.data ?? null))),
       provision: async () => ({}) as SandboxHandle,
       writableScopeId: scopeId("personal", "U1"),
@@ -518,6 +549,7 @@ test("publish never copies resident credentials into the deployment", async () =
   } as unknown as DeployService;
 
   const tc = createToolContext({
+    tenant: tenant,
     sandbox,
     provision: async () => ({}) as SandboxHandle,
     writableScopeId: scopeId("personal", "U1"),
@@ -592,6 +624,7 @@ test("publish always splits: bakes NO resident creds and injects no acting-as en
   const config = testConfigStore("default-org");
   const { deploy, captured } = spyDeploy();
   const tc = createToolContext({
+    tenant: tenant,
     sandbox: exportSandbox(RESIDENT_HOME),
     provision: async () => ({}) as SandboxHandle,
     writableScopeId: scopeId("personal", "U1"),

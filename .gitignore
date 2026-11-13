@@ -14,6 +14,7 @@ plugins/web-ui/public/*.local.json
 .claude/settings.local.json
 .gstack/
 .ci-instance/
+.twin-instance/
 test/live-slack/out/
 .generated/
 __pycache__/
@@ -22,3 +23,26 @@ __pycache__/
 docs/master.html
 
 .context/
+
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.svg
+*.ico
+*.icns
+*.bmp
+*.avif
+*.heic
+*.tif
+*.tiff
+!desktop/assets/becalmed-off-halfway-rock.webp
+!desktop/assets/qm.icns
+!desktop/assets/qm.png
+!docs/images/qm-logo.png
+!docs/images/slack-app-config-token-setup.gif
+!ios/QM/Resources/Assets.xcassets/AppIcon.appiconset/AppIcon.png
+!plugins/web-ui/public/brand-mark.svg
+!plugins/web-ui/src/assets/brand-mark.svg
+!test/live-slack/fixtures/taylor-selfie.png

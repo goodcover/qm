@@ -1,4 +1,5 @@
 import "./support/auto-fake-sprites.ts";
+import { testTenant } from "./support/test-tenant.ts";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { AddressInfo } from "node:net";
@@ -59,12 +60,11 @@ import {
   modelSupported,
   modelSupportsFastMode,
   fastModeModelIds,
-  defaultWebuiModelIds,
+  modelOfferedInWebui,
 } from "../src/model/pi-models.ts";
 import { setCustomProviders } from "../src/model/custom-providers.ts";
 import { selectableModelCatalog } from "../src/model/model-catalog.ts";
 import { resolveIndividualAuthRouting } from "../src/core/individual-auth-routing.ts";
-import { validateWebTurnModelOptions } from "../src/api/runtime-config.ts";
 
 const createModelOverlayStore: typeof createStore = (backing, write) =>
   createStore(backing, write, async () => ({ fingerprint: "fixture", probe: async () => {} }));
@@ -134,8 +134,7 @@ test("store reload and independent readers observe edits and soft deletion witho
   const inFlight = getRequiredModel(MODEL_ID);
   assert.equal(contextTokenBudgetForModel(MODEL_ID), 150_000);
   assert.deepEqual(inFlight.cost, spec.cost);
-  assert.ok(defaultWebuiModelIds().includes(MODEL_ID));
-  assert.equal(validateWebTurnModelOptions({ model: MODEL_ID }, null), null);
+  assert.ok(modelOfferedInWebui(MODEL_ID));
   assert.equal(modelSupported(MODEL_ID), true);
   assert.equal(resolveModel(`codex/${MODEL_ID}`), undefined);
   await writer.upsert(
@@ -299,7 +298,7 @@ test("live admin lifecycle is authorized, audited, immediately selectable and re
       });
       assert.equal(recoveredTurn.status, "queued", JSON.stringify(recoveredTurn));
     }
-    const events = await built.auditLog.events();
+    const events = await built.auditLog.events(testTenant);
     assert.equal(events.filter((e) => e.action === "model-registry.update").length, 2);
     assert.equal(events.filter((e) => e.action === "model-registry.delete").length, 1);
   } finally {
@@ -309,6 +308,7 @@ test("live admin lifecycle is authorized, audited, immediately selectable and re
 
 import { createServer } from "node:http";
 import { oneShot, createAgent } from "../src/agent/agent-run.ts";
+import { createModelRoutes } from "../src/model/model-route.ts";
 import { setProviderBaseUrls } from "../src/model/provider-endpoints.ts";
 import { calculateCost } from "@earendil-works/pi-ai";
 
@@ -360,7 +360,7 @@ test("Pi serves an overlay via the inherited provider endpoint and metadata driv
     assert.equal(received?.model, MODEL_ID);
     assert.equal(received?.max_tokens, 10_000);
     assert.equal(authorized, true);
-    const agent = createAgent({ apiKey: "local-test-key", captureRequests: false });
+    const agent = createAgent({ routes: createModelRoutes({ apiKey: "local-test-key" }), captureRequests: false });
     const turn = {
       session: { id: "overlay-runtime" } as import("../src/agent/agent.ts").AgentTurnInput["session"],
       input: "Hello",
@@ -513,4 +513,18 @@ test("runtime normalization preserves native capabilities and reflects overlay c
   });
   assert.equal(native.fastMode, true);
   assert.equal(native.effortLevel, "max");
+});
+
+test("OpenRouter catalogs keep every tool model past the first thousand, with long names", async () => {
+  const data = Array.from({ length: 1_001 }, (_, i) => ({
+    id: `catalog-vendor/model-${i}`,
+    name: `Model ${i} ${"x".repeat(250)}`,
+    supported_parameters: ["tools"],
+    context_length: 128_000,
+    top_provider: { max_completion_tokens: 8_192 },
+    pricing: { prompt: "0.000001", completion: "0.000002" },
+    architecture: { input_modalities: ["text"] },
+  }));
+  const catalog = await selectableModelCatalog(async () => Response.json({ data }));
+  assert.ok(catalog.some((m) => m.id === "catalog-vendor/model-1000"));
 });

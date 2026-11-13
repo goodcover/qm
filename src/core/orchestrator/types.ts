@@ -1,3 +1,4 @@
+import type { PersonaService } from "../../personas/persona-service.ts";
 import type { AdmittedWork } from "../../util/admitted-work.ts";
 import type { TraceCarrier } from "../../../plugins/chassis/src/error-reporting.ts";
 import type { GoalCreateInput } from "../../agent/goal.ts";
@@ -18,6 +19,7 @@ import type {
 import type { SurfaceContextQuery, SurfaceContextResult } from "../../reach/reach.ts";
 import type { TurnOrigin } from "../turn-origin.ts";
 import type { IdentityService } from "../../identity/identity-service.ts";
+import type { UserStore } from "../../identity/user-store.ts";
 import type { ResolutionService } from "../../resolution/resolution-service.ts";
 import type { ModelAccount, OrgBranding, ScopedConfigStore } from "../../resolution/config-store.ts";
 import type { UserModelCredentialStore } from "../../model/user-model-credential-store.ts";
@@ -42,7 +44,7 @@ import type { AuditLog } from "../../audit/audit-log.ts";
 import type { SecurityScreener } from "../../security/security-screener.ts";
 import type { BudgetTracker } from "../../ratelimit/budget.ts";
 import type { ControlService } from "../../api/control-service.ts";
-import type { Agent } from "../../agent/agent.ts";
+import type { Agent, RuntimeChoice, SessionRoute } from "../../agent/agent.ts";
 import type { AdminService } from "../../admin/admin-service.ts";
 import type { ErrorLog } from "../../admin/error-log.ts";
 import type { RunSignalStore } from "../../runs/run-signal-store.ts";
@@ -54,6 +56,7 @@ import type { McpToolService } from "../../mcp/mcp-tool-service.ts";
 import type { MemoryStrategy } from "../../memory/strategy.ts";
 import type { MemoryPolicy } from "../../memory/policy.ts";
 import type { DurableMap } from "../../persistence/durable-map.ts";
+import type { PromptSnapshot } from "./prompt-snapshot.ts";
 import type { BlobTransferStore } from "../../persistence/blob-transfer.ts";
 import type { SkillStore } from "../../skills/skill-store.ts";
 import type { OAuthClientResolver } from "../../connectors/oauth.ts";
@@ -67,6 +70,7 @@ import type { SwarmService, SwarmTurn } from "../../swarms/swarm-service.ts";
 import type { ChannelPolicyStore } from "../../surface-cache/channel-policy-store.ts";
 import type { SurfaceCache } from "../../surface-cache/types.ts";
 import type { SurfaceRegistry } from "../../surfaces/registry.ts";
+import type { Tenant } from "../../tenants/context.ts";
 
 export interface OrchestratorInput extends Omit<
   TurnRequest,
@@ -103,32 +107,33 @@ export interface OrchestratorDeps {
   swarms?: SwarmService;
   refreshModels?: () => Promise<void>;
   identity: IdentityService;
+  users: Pick<UserStore, "record" | "markApps">;
   resolution: ResolutionService;
-  config?: ScopedConfigStore;
-  defaultTurnWallClockMs?: number;
+  config: ScopedConfigStore;
+  defaultTurnWallClockMs: number;
   userModelCredentials?: UserModelCredentialStore;
   brandingDefault?: OrgBranding;
   surfaces: SurfaceRegistry;
-  resolveBaseModelId?: () => string | undefined;
+  resolveSessionRuntime?: (route: SessionRoute) => Promise<RuntimeChoice>;
   sessions: SessionStore;
   sessionStateBus?: SessionStateBus;
   sessionSyscalls?: SessionSyscallsFactory;
   files: FileArtifactStore;
-  toolOutput?: ToolOutputStore;
+  toolOutput: ToolOutputStore;
   sandbox: Sandbox;
   sandboxResources?: SandboxResources;
   advisoryLock: AdvisoryLock;
   auditLog: AuditLog;
   budget?: BudgetTracker;
   maxContextTokens?: number;
-  execTimeoutMs?: number;
-  execTimeoutCeilingMs?: number;
+  execTimeoutMs: number;
+  execTimeoutCeilingMs: number;
   approvalSummaryTimeoutMs?: number;
   securityScreenTimeoutMs?: number;
   securityScreener?: SecurityScreener;
-  backgroundJobTtlMs?: number;
+  backgroundJobTtlMs: number;
   sandboxCapabilityTtlMs?: number;
-  backgroundJobTtlMaxMs?: number;
+  backgroundJobTtlMaxMs: number;
   agent: Agent;
   signingSecret?: string;
   capabilitySecret?: string;
@@ -149,22 +154,24 @@ export interface OrchestratorDeps {
   skillsReady?: () => Promise<void>;
   approvals: DurableMap<PendingApprovalRecord>;
   approvalGrants: DurableMap<CommandApprovalGrant>;
-  errors?: ErrorLog;
-  signals?: RunSignalStore;
-  turnStream?: TurnStream;
+  promptSnapshots: DurableMap<PromptSnapshot>;
+  errors: ErrorLog;
+  signals: RunSignalStore;
+  turnStream: TurnStream;
   runActivity?: RunActivityStore;
   runs?: RunStore;
   blobTransfer: BlobTransferStore;
   processes?: ProcessRegistry;
   monitors?: MonitorStore;
   crons?: CronStore;
+  notebookOnlyMemory?: (threadRef: string) => Promise<boolean>;
   webhooks?: WebhookStore;
   control?: ControlService;
   runtime?: RuntimeService;
   validateScheduledRuntime?: (
     scope: import("../../types.ts").ScopeId,
     choice: import("../../agent/agent.ts").RuntimeChoice,
-    purpose?: import("../../resolution/config-store.ts").RuntimePurpose,
+    purpose?: import("../../resolution/config-store.ts").TurnRuntimePurpose,
   ) => Promise<string | null>;
   connectorTokens?: ConnectorTokenStore;
   resolveConnectorClient?: OAuthClientResolver;
@@ -173,9 +180,10 @@ export interface OrchestratorDeps {
   credentialUsage?: CredentialUsageSink;
   keychain?: Keychain;
   serviceCreds?: ServiceCredentialStore;
-  deliveries?: DeliveryStore;
-  directory?: DirectoryStore;
+  deliveries: DeliveryStore;
+  directory: DirectoryStore;
   projects?: Pick<ProjectStore, "recognizes" | "name">;
+  personas?: Pick<PersonaService, "forTurn">;
   isCurrentSharedScopeMember?: IsCurrentSharedScopeMember;
   currentScopeMembers?: import("../../resolution/scope-membership.ts").CurrentScopeMembers;
   managedGroups?: Pick<ManagedGroupDirectory, "recognizes" | "members" | "version" | "withVersion" | "slackChannel">;
@@ -198,6 +206,7 @@ export interface SurfaceContextPuller {
 export interface Orchestrator {
   handleTurn(input: OrchestratorInput): Promise<TurnResult>;
   screenSecuritySteer(input: {
+    tenant: Tenant;
     payload: string;
     actor: Principal;
     conversation: Conversation;
@@ -205,4 +214,10 @@ export interface Orchestrator {
     verifiedSwarm?: boolean;
   }): Promise<"allow" | "block" | "unscreened">;
   regenerateTitle(sessionId: string, principalId: string, personal?: boolean): Promise<{ title: string | null } | null>;
+  suggestNextPrompt(sessionId: string, principalId: string): Promise<NextPromptSuggestion | null>;
+}
+
+interface NextPromptSuggestion {
+  enabled: boolean;
+  suggestion: string | null;
 }

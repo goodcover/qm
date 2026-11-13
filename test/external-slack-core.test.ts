@@ -15,6 +15,7 @@ import { selectDefaultSandbox } from "./support/default-sandbox.ts";
 import { createPostgresGrantStore } from "../src/acl/postgres-grant-store.ts";
 import { testDatabaseUrl } from "./support/test-database.ts";
 import { createPostgresRunStore } from "../src/runs/postgres-run-store.ts";
+import { testTenant as tenant } from "./support/test-tenant.ts";
 
 const policy = { companyDomains: ["example.com"], companyTeamIds: ["TCOMPANY"], serviceCredentials: ["safe"] };
 const externalSlackPolicies = { batch: policy };
@@ -59,8 +60,14 @@ test("external Slack strips private and org preloads before the prompt, but keep
   });
   await b.config.setSharingPosture("org:default-org", "open");
   await b.config.setSoul("org:default-org", "ORG_SOUL_SENTINEL");
-  await b.memory.capture("personal:U1", ["PERSONAL_MEMORY_SENTINEL"], Date.now(), "U1");
-  await b.memory.capture("org:default-org", ["ORG_MEMORY_SENTINEL"], Date.now(), "U1");
+  await b.memory.capture("personal:U1", ["PERSONAL_MEMORY_SENTINEL"], Date.now(), {
+    actorId: "U1",
+    context: "conversation",
+  });
+  await b.memory.capture("org:default-org", ["ORG_MEMORY_SENTINEL"], Date.now(), {
+    actorId: "U1",
+    context: "conversation",
+  });
   for (const slug of ["safe", "confidential"]) {
     await b.serviceCreds.setServiceCredential("org:default-org", {
       slug,
@@ -70,7 +77,7 @@ test("external Slack strips private and org preloads before the prompt, but keep
       secret: `SYNTHETIC_${slug}`,
       host: "",
     });
-    await b.acl.grant({
+    await b.acl.grant(tenant, {
       ownerScopeId: "org:default-org",
       ref: encodeRef(serviceCredRef(slug)),
       granteeScopeId: "org:default-org",
@@ -182,18 +189,18 @@ test("external broker requires the current run lease and both external-safe and 
     threadRef: run.sessionId,
     exp: Date.now() + 60_000,
   };
-  assert.equal(await externalSlackCapabilityAllowed(claims, { runs, acl, externalSlackPolicies }), false);
+  assert.equal(await externalSlackCapabilityAllowed(tenant, claims, { runs, acl, externalSlackPolicies }), false);
   for (const slug of ["safe", "confidential"])
-    await acl.grant({
+    await acl.grant(tenant, {
       ownerScopeId: "org:default-org",
       ref: encodeRef(serviceCredRef(slug)),
       granteeScopeId: "org:default-org",
       permission: "read",
       grantedBy: "U1",
     });
-  assert.equal(await externalSlackCapabilityAllowed(claims, { runs, acl, externalSlackPolicies }), true);
+  assert.equal(await externalSlackCapabilityAllowed(tenant, claims, { runs, acl, externalSlackPolicies }), true);
   assert.equal(
-    await externalSlackCapabilityAllowed(claims, {
+    await externalSlackCapabilityAllowed(tenant, claims, {
       runs,
       acl,
       externalSlackPolicies: { batch: { ...policy, serviceCredentials: [] } },
@@ -209,11 +216,11 @@ test("external broker requires the current run lease and both external-safe and 
     { runAttempt: run.attempts + 1 },
   ])
     assert.equal(
-      await externalSlackCapabilityAllowed({ ...claims, ...patch }, { runs, acl, externalSlackPolicies }),
+      await externalSlackCapabilityAllowed(tenant, { ...claims, ...patch }, { runs, acl, externalSlackPolicies }),
       false,
     );
-  await acl.revoke("org:default-org", encodeRef(serviceCredRef("safe")), "org:default-org", "U1");
-  assert.equal(await externalSlackCapabilityAllowed(claims, { runs, acl, externalSlackPolicies }), false);
+  await acl.revoke(tenant, "org:default-org", encodeRef(serviceCredRef("safe")), "org:default-org", "U1");
+  assert.equal(await externalSlackCapabilityAllowed(tenant, claims, { runs, acl, externalSlackPolicies }), false);
 });
 
 test("external policy changes invalidate retained requests while untouched workspaces stay unchanged", async () => {
@@ -282,7 +289,7 @@ test("external sandbox API token cannot reach private APIs, while its safe broke
     delivery: "broker",
     secret: "SYNTHETIC_BROKER_SECRET",
   });
-  await b.acl.grant({
+  await b.acl.grant(tenant, {
     ownerScopeId: "org:default-org",
     ref: encodeRef(serviceCredRef("safe")),
     granteeScopeId: "org:default-org",

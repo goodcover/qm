@@ -1,8 +1,5 @@
 import type { CapabilityClaims } from "../auth/capability-token.ts";
-import { livePersonCapability } from "./artifact-share.ts";
-import { adminRoutes } from "./routes/admin.ts";
-import { unattendedGrantListing } from "./routes/admin/unattended-grants.ts";
-import { UNATTENDED_ADMIN_GRANTS } from "./control-service.ts";
+import { livePersonCapability, personAtKeyboard } from "./artifact-share.ts";
 
 interface AgentApiRoute {
   method: string;
@@ -14,6 +11,7 @@ interface AgentApiView {
   claims: CapabilityClaims;
   isAdmin: boolean;
   swarmsEnabled: boolean;
+  personasEnabled: boolean;
 }
 
 interface AgentApiFamily {
@@ -23,7 +21,7 @@ interface AgentApiFamily {
 }
 
 const CONVERSATION_UPDATE =
-  "update one of the asking person's conversations — body {archived?, pinned?, title?, color?}; archive/unarchive, pin/unpin, rename (null title clears), or set the sidebar color (#rrggbb; null clears). These are per-person.";
+  "update one of the asking person's conversations — body {archived?, pinned?, title?, color?, unread?}; archive/unarchive, pin/unpin, rename (null title clears), set the sidebar color (#rrggbb; null clears), or mark read/unread. These are per-person.";
 
 const FAMILIES: AgentApiFamily[] = [
   {
@@ -49,6 +47,12 @@ const FAMILIES: AgentApiFamily[] = [
       },
       {
         method: "POST",
+        path: "/v1/composio/proxy",
+        summary:
+          "{url,method?,query?,headers?,body?|bodyBase64?,accountId?} sends one raw request to a connected app's own API (Google, Dropbox, Linear, Zoom) through your own connection; replies with the provider's status and body. Used by native app skills when no direct token is present",
+      },
+      {
+        method: "POST",
         path: "/v1/composio/disconnect",
         summary:
           "{accountId} permanently removes one of your own connections on a human-started turn; use when asked to remove or reset one, or to retire the old account after a reconnect",
@@ -68,9 +72,68 @@ const FAMILIES: AgentApiFamily[] = [
     ],
   },
   {
+    when: (view) => view.personasEnabled,
+    guidance:
+      "Personas are reusable agents (instructions, skills, notes, credentials) living in a persona:<id> scope; people hold owner, write or read on them through people (personal:), teams (team:), the org (org:) or Slack channels (channel:, read only, usable only in that channel). Writers edit instructions with PATCH and add a skill by creating it with scopeId persona:<id> on POST /v1/skills or moving one in with the skills tool; only owners share, attach credentials or delete. Use the persona-fork skill to copy one.",
+    routes: [
+      { method: "GET", path: "/v1/personas", summary: "personas you hold a role on, with your role" },
+      {
+        method: "GET",
+        path: "/v1/personas/:id",
+        summary: "one persona: instructions, access list, attached credential names (never secrets), skills",
+      },
+      {
+        method: "POST",
+        path: "/v1/personas",
+        summary: "{name,description?,instructions?,icon?} creates one you own",
+      },
+      {
+        method: "PATCH",
+        path: "/v1/personas/:id",
+        summary:
+          "{name?,description?,instructions?,icon?} edits it (write or owner); each change that alters a field records a new version",
+      },
+      {
+        method: "GET",
+        path: "/v1/personas/:id/versions",
+        summary:
+          "?before=&limit=&full=1 its versions newest first, 20 a page by default: number, who and when, plus name, description, instructions and icon with full=1; {versions, more}",
+      },
+      {
+        method: "POST",
+        path: "/v1/personas/:id/versions/:version/restore",
+        summary:
+          "rolls name, description, instructions and icon back to that version as a new version (write or owner)",
+      },
+      {
+        method: "PUT",
+        path: "/v1/personas/:id/access",
+        summary:
+          "{access:[{scopeId,role:'owner'|'write'|'read',pinned?}]} replaces who holds which role (owner; at least one owner stays). pinned:true on a channel: entry pins the persona there, so every conversation in that channel wears it and posts under its name and icon; a channel pins one persona at most",
+      },
+      {
+        method: "POST",
+        path: "/v1/personas/:id/credentials",
+        summary: "{credentialId} attaches one of your own keychain credentials (owner, on a turn you sent)",
+      },
+      {
+        method: "DELETE",
+        path: "/v1/personas/:id/credentials/:grantId",
+        summary: "detaches an attached credential (owner, on a turn you sent)",
+      },
+      { method: "DELETE", path: "/v1/personas/:id", summary: "deletes it and detaches its credentials (owner)" },
+      {
+        method: "PUT",
+        path: "/v1/sessions/:id/persona",
+        summary:
+          "{personaId|null} switches this conversation (your own session id) to a persona you can use here, from the next turn",
+      },
+    ],
+  },
+  {
     when: (view) => view.swarmsEnabled,
     guidance:
-      "Swarm workers are ordinary sessions with private blank computers. Inspect peers and their context, then send to chosen IDs or all; shared history is visible to every member. Notifications queue unattended turns. Each swarm gets one shared board computer (inspect returns board.sandboxId) that the root and every worker reach with execute's sandbox_id; pass forumSandboxId at creation to use an existing shared computer instead. Spawn accepts model, effort and fastMode to choose the runtime for the workers it creates; children inherit it unless they choose again. POST action control with memberId and state active, paused or stopped pauses delivery to, resumes, or stops a descendant worker. To keep a worker going instead of stopping after one reply, give it a goal on spawn or send ({objective, floor?, token_cap?}): its turn then runs like a goal turn, past the swarm turn deadline, until the goal is complete, paused or out of tokens. Any member can send any worker, itself included, a goal (not the root session); send a goal again to replace a running, paused or finished one.",
+      "Start a swarm only when the person explicitly asks for a swarm; a large or parallelizable task is not a request for one, so do that work yourself or with subagents. Swarm workers are ordinary sessions with private blank computers. Inspect peers and their context, then send to chosen IDs or all; shared history is visible to every member. Notifications queue unattended turns. Each swarm gets one shared board computer (inspect returns board.sandboxId) that the root and every worker reach with execute's sandbox_id; pass forumSandboxId at creation to use an existing shared computer instead (only in a swarm a person starts; a swarm a Slack bot starts never takes one, from the bot or from a person spawning into it, and always uses its own board). Spawn accepts model, effort and fastMode to choose the runtime for the workers it creates; children inherit it unless they choose again. POST action control with memberId and state active, paused or stopped pauses delivery to, resumes, or stops a descendant worker. To keep a worker going instead of stopping after one reply, give it a goal on spawn or send ({objective, floor?, token_cap?}): its turn then runs like a goal turn, past the swarm turn deadline, until the goal is complete, paused or out of tokens. Any member can send any worker, itself included, a goal (not the root session); send a goal again to replace a running, paused or finished one.",
     routes: [
       {
         method: "GET",
@@ -82,7 +145,7 @@ const FAMILIES: AgentApiFamily[] = [
         method: "POST",
         path: "/v1/swarm",
         summary:
-          "{action:'spawn',requestId,text,count?,context?,contexts?,forumSandboxId?,settings?,backend?,goal?} spawns one or an initial pool; {action:'context',context} updates own JSON; {action:'send',requestId,text,audience,replyTo?,wake?,goal?} sends to explicit peer ids or all and wakes each recipient (wake:false leaves it in their mailboxes for their next turn); {action:'control',memberId,state:'active'|'paused'|'stopped'} controls a descendant worker. Retry the same requestId and payload for idempotency.",
+          "{action:'spawn',requestId,text,count?,context?,contexts?,forumSandboxId?,settings?,backend?,goal?} spawns one or an initial pool (a new swarm only on an explicit request for a swarm); {action:'context',context} updates own JSON; {action:'send',requestId,text,audience,replyTo?,wake?,goal?} sends to explicit peer ids or all and wakes each recipient (wake:false leaves it in their mailboxes for their next turn); {action:'control',memberId,state:'active'|'paused'|'stopped'} controls a descendant worker. Retry the same requestId and payload for idempotency.",
       },
     ],
   },
@@ -229,12 +292,6 @@ const FAMILIES: AgentApiFamily[] = [
         path: "/v1/loops/:id/items/:itemId/followup",
         summary:
           "chat about one held item — body {message}; the reply lands on the item's thread and may revise its proposal",
-      },
-      {
-        method: "POST",
-        path: "/v1/loops/:id/events",
-        summary:
-          'report new messages in conversations already on the ledger — body {events:[{sourceKey, author:"owner"|"other", at, text?, from?}]}; each event is judged by the loop\'s work stage, which may close or redraft the item',
       },
     ],
   },
@@ -453,6 +510,17 @@ const FAMILIES: AgentApiFamily[] = [
     ],
   },
   {
+    when: (v) => personAtKeyboard(v.claims),
+    routes: [
+      {
+        method: "GET|PUT|DELETE",
+        path: "/v1/memory/brain",
+        summary:
+          "the speaker's own memory brain, a gbrain they run: read it (with the principal id their gbrain must link), connect or change it ({url, clientId, label?}, never the client secret), or disconnect it; see the memory skill",
+      },
+    ],
+  },
+  {
     when: (v) => !!v.claims.memory?.orgWrite,
     routes: [
       {
@@ -490,7 +558,7 @@ const FAMILIES: AgentApiFamily[] = [
         method: "POST",
         path: "/v1/keychain/drops",
         summary:
-          "mint a single-use, expiring link for someone to enter a new credential into their keychain — follow the `secret-drop` skill",
+          "mint a single-use, expiring link for someone to enter a new credential into their keychain, or (body {memoryBrain, purpose}, for an org admin or the brain's own member) a memory brain's client secret, which QM's core keeps and never puts in a keychain — follow the `secret-drop` skill",
       },
     ],
   },
@@ -611,7 +679,7 @@ const FAMILIES: AgentApiFamily[] = [
   {
     when: (v) => v.isAdmin && livePersonCapability(v.claims),
     guidance:
-      "Admin plane: you act AS this org admin — live-authorized per call, audited under their name; confirm before any mutation (bodies/params in the admin skill). Enforced limits: content reads require a DM or effective Open sharing for the live admin (organization, personal, and conversation restrictions all apply); configuration mutations work anywhere; admin grant changes, impersonation, and identity links are portal-only. Open admin reads can expose private data to the conversation; retrieve and report only what the request needs.",
+      "Admin plane: you act AS this org admin — authorized per call under their own standing (a cron, webhook or loop fire carries its owner's authority just as a typed turn does), audited under their name; confirm before any mutation (bodies/params in the admin skill). Enforced limits: content reads require a DM or effective Open sharing for the admin (organization, personal, and conversation restrictions all apply); configuration mutations work anywhere; admin grant changes, impersonation, and identity links are portal-only. Open admin reads can expose private data to the conversation; retrieve and report only what the request needs.",
     routes: [
       { method: "GET", path: "/v1/admin/whoami", summary: "this user's admin status" },
       {
@@ -630,6 +698,11 @@ const FAMILIES: AgentApiFamily[] = [
         path: "/v1/admin/scopes/:scopeId/:resource",
         summary:
           "govern a scope: soul | security-posture | command-policy | egress | connectors | service-credentials | runtime ({ modelId })",
+      },
+      {
+        method: "PUT",
+        path: "/v1/admin/memory-registry/member-brains",
+        summary: "turn members' own memory brains on or off for the whole org ({enabled}); off stops every one at once",
       },
       {
         method: "GET|POST|PATCH|DELETE",
@@ -693,16 +766,6 @@ const FAMILIES: AgentApiFamily[] = [
   },
 ];
 
-const unattendedFamilies = (): AgentApiFamily[] =>
-  UNATTENDED_ADMIN_GRANTS.map((grant) => ({
-    when: (v) => !livePersonCapability(v.claims) && v.claims.grants?.includes(grant) === true,
-    guidance:
-      "This cron has a specific read-only admin grant. Use only these listed routes; flag any other admin action to a human.",
-    routes: unattendedGrantListing(adminRoutes).flatMap((entry) =>
-      entry.grant === grant ? [{ method: entry.method, path: entry.path, summary: entry.summary }] : [],
-    ),
-  }));
-
 const WHOAMI_FOR_ALL: AgentApiFamily = {
   when: (v) => !(v.isAdmin && livePersonCapability(v.claims)),
   routes: [
@@ -721,14 +784,15 @@ export interface AgentApiListing {
 export function renderAgentApis(
   claims: CapabilityClaims,
   admin: { isAdmin: boolean; role?: string },
-  features: { swarmsEnabled: boolean },
+  features: { swarmsEnabled: boolean; personasEnabled: boolean },
 ): AgentApiListing {
   const view: AgentApiView = {
     claims,
     isAdmin: admin.isAdmin,
     swarmsEnabled: features.swarmsEnabled,
+    personasEnabled: features.personasEnabled,
   };
-  const visible = [...FAMILIES, ...unattendedFamilies(), WHOAMI_FOR_ALL].filter((f) => f.when?.(view) ?? true);
+  const visible = [...FAMILIES, WHOAMI_FOR_ALL].filter((f) => f.when?.(view) ?? true);
   return {
     actorId: claims.actorId,
     scopeId: claims.scopeId,

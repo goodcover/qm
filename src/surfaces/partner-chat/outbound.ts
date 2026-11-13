@@ -1,5 +1,6 @@
 import type { App } from "../../api/app-types.ts";
 import { refusedStatus, type Send } from "../../delivery/relay.ts";
+import type { Tenant } from "../../tenants/context.ts";
 import type { Delivery } from "../../types.ts";
 import {
   partnerChatMessageId,
@@ -11,6 +12,7 @@ import {
   SIGNATURE_HEADER,
   TIMESTAMP_HEADER,
 } from "./protocol.ts";
+import { trimTrailingSlashes } from "../../util/text.ts";
 
 const REQUEST_TIMEOUT_MS = 15_000;
 export const PARTNER_CHAT_CLAIM_MS = 4 * REQUEST_TIMEOUT_MS;
@@ -39,18 +41,20 @@ function parseJson(text: string): Record<string, unknown> {
 export function partnerChatSender(deps: {
   url: string;
   secret: string;
-  app: Pick<App, "ingestSurfaceEvents">;
+  app: Pick<App, "ingestSurfaceEvents" | "tenantFor">;
   fetch?: typeof fetch;
   now?: () => number;
 }): Send {
-  const endpoint = `${deps.url.replace(/\/+$/, "")}/agent_app/messages`;
+  const endpoint = `${trimTrailingSlashes(deps.url)}/agent_app/messages`;
   const send = deps.fetch ?? fetch;
   const now = deps.now ?? Date.now;
 
-  async function deliver(d: Delivery): Promise<void> {
+  async function deliver(d: Delivery, tenant: Tenant): Promise<void> {
     const ref = parsePartnerChatRef(d.destination.target);
     const body = d.text.trim();
     if (!ref) throw new UnsupportedDelivery(`partner-chat: unroutable target ${d.destination.target}`);
+    if ((await deps.app.tenantFor("partner_chat", ref.account)) !== tenant.id)
+      throw new UnsupportedDelivery(`partner-chat: account ${ref.account} is not bound to this workspace`);
     const { react, delete: del, pin, edit, editRef } = d.destination;
     if (react || del || pin || edit || editRef || !body)
       throw new UnsupportedDelivery("partner-chat: only non-empty text posts are supported");
@@ -109,9 +113,9 @@ export function partnerChatSender(deps: {
     );
   }
 
-  return async (d) => {
+  return async (d, tenant) => {
     try {
-      await deliver(d);
+      await deliver(d, tenant);
     } catch (e) {
       if (e instanceof UnsupportedDelivery) return { refused: e.message };
       if (e instanceof PartnerChatHttpError && refusedStatus(e.status)) return { refused: e.message };

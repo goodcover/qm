@@ -1,6 +1,6 @@
 import type { AdvisoryLock } from "../persistence/advisory-lock.ts";
 import type { CredentialFile, Keychain, KeychainCredentialMeta, MaterializedCred } from "../credentials/keychain.ts";
-import { swallow } from "../util/errors.ts";
+import { parseSecretJson, swallow } from "../util/errors.ts";
 import {
   accessExpiresAt,
   asObject,
@@ -99,12 +99,16 @@ function authFromFiles(files: CredentialFile[]): { path: string; auth: JsonObjec
   for (const file of files) {
     const normalized = file.path.replace(/^\.\//, "");
     if (!AUTH_FILE_PATHS.includes(normalized) && !normalized.endsWith("/auth.json")) continue;
+    let value: unknown;
     try {
-      const auth = chatgptAuthFromValue(JSON.parse(Buffer.from(file.contentBase64, "base64").toString("utf8")));
-      if (auth) return { path: file.path, auth };
-    } catch {
+      value = parseSecretJson(Buffer.from(file.contentBase64, "base64").toString("utf8"), "the file");
+    } catch (error) {
+      swallow(`chatgpt: unusable auth file ${file.path}`, error);
       continue;
     }
+    const auth = chatgptAuthFromValue(value);
+    if (auth) return { path: file.path, auth };
+    swallow(`chatgpt: unusable auth file ${file.path}`, new Error("not a ChatGPT login with tokens and an account id"));
   }
   return null;
 }
@@ -144,7 +148,7 @@ export function keychainCompanyChatGPTAuth(
       return {
         auth: found.auth,
         async write(next) {
-          await deps.keychain.updateFiles(
+          const overruled = await deps.keychain.updateFiles(
             bundle,
             bundle.files.map((file) =>
               file.path === found.path
@@ -153,6 +157,8 @@ export function keychainCompanyChatGPTAuth(
             ),
           );
           cached = undefined;
+          if (overruled.includes(found.path))
+            throw new Error(`the saved login changed during the refresh, so the refreshed ${found.path} was not saved`);
         },
       };
     },

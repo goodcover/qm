@@ -1,20 +1,39 @@
 import { orgId as configOrgId, orgScope as configOrgScope } from "../../config.ts";
-import type { Principal } from "../../types.ts";
+import { scopeId, type Principal } from "../../types.ts";
+import type { CapabilityClaims } from "../../auth/capability-token.ts";
 import type { AuditEvent } from "../../audit/audit-log.ts";
 import { adminStatusFromGrants } from "../../admin/admin-service.ts";
 import { canonicalPerson, samePerson } from "../../directory/person.ts";
 import { isTerminal, type Run } from "../../runs/run-store.ts";
 import type { ServerDeps } from "../deps.ts";
-import type { ApiCtx } from "./route.ts";
+import { tenantOf, type ApiCtx, type BaseCtx } from "./route.ts";
+import type { Tenant } from "../../tenants/context.ts";
 import { headerValue, sendJson } from "../http.ts";
 import { currentModelRequestContext } from "../../model/request-context.ts";
+import { constantTimeEqual } from "../../util/crypto.ts";
 
 export const orgScope = (_deps?: unknown): string => configOrgScope();
 
+export function exportTokenAccepted(ctx: Pick<BaseCtx, "req" | "res">, token: string | undefined): boolean {
+  if (!token) {
+    sendJson(ctx.res, 404, { error: "not_found" });
+    return false;
+  }
+  const authorization = ctx.req.headers.authorization;
+  if (typeof authorization === "string" && constantTimeEqual(authorization, `Bearer ${token}`)) return true;
+  sendJson(ctx.res, 401, { error: "unauthorized" });
+  return false;
+}
+
 export { isObj } from "../../util/objects.ts";
 
-export function audit(deps: ServerDeps, e: Omit<AuditEvent, "at">): void {
-  deps.auditLog?.record({ at: Date.now(), ...e });
+export function personalCapability(ctx: Pick<ApiCtx, "capability" | "actor">): CapabilityClaims | null {
+  if (ctx.capability) return ctx.capability;
+  return ctx.actor ? { actorId: ctx.actor.p, scopeId: scopeId("personal", ctx.actor.p), exp: ctx.actor.exp } : null;
+}
+
+export function audit(ctx: Pick<ApiCtx, "deps" | "tenant">, e: Omit<AuditEvent, "at">): void {
+  ctx.deps.auditLog?.record(tenantOf(ctx), { at: Date.now(), ...e });
 }
 
 function rawAdminActor(ctx: Pick<ApiCtx, "req" | "deps" | "capability" | "actor">): Principal | null {
@@ -29,8 +48,18 @@ export function adminActorFrom(ctx: Pick<ApiCtx, "req" | "deps" | "capability" |
   return actor ? { ...actor, id: canonicalPerson(actor.id) } : null;
 }
 
+export async function adminStanding(
+  deps: ServerDeps,
+  tenant: Tenant,
+  principalId: string,
+): Promise<"inactive" | "admin" | "member"> {
+  const id = canonicalPerson(principalId);
+  if (!(await activePrincipal(deps, id))) return "inactive";
+  return adminStatusFromGrants((await deps.admin?.listGrants(tenant)) ?? [], id).isAdmin ? "admin" : "member";
+}
+
 export async function authorizeAdmin(
-  ctx: Pick<ApiCtx, "req" | "res" | "deps" | "capability" | "actor">,
+  ctx: Pick<ApiCtx, "req" | "res" | "deps" | "capability" | "actor" | "tenant">,
   scope: string,
 ): Promise<Principal | null> {
   const { res, deps } = ctx;
@@ -38,13 +67,13 @@ export async function authorizeAdmin(
     sendJson(res, 404, { error: "not_found" });
     return null;
   }
-  const grants = await deps.admin.listGrants();
   const actor = adminActorFrom(ctx);
-  if (actor && !(await activePrincipal(deps, actor.id))) {
+  const standing = actor ? await adminStanding(deps, tenantOf(ctx), actor.id) : "member";
+  if (standing === "inactive") {
     sendJson(res, 403, { error: "forbidden", message: "this principal is no longer active" });
     return null;
   }
-  if (actor && adminStatusFromGrants(grants, actor.id).isAdmin) {
+  if (actor && standing === "admin") {
     Object.assign(currentModelRequestContext(), { actorId: actor.id, scopeId: scope });
     return actor;
   }

@@ -3,7 +3,7 @@ import { basename } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { AttachmentMeta, IncomingAttachment, OutgoingAttachment, ScopeId } from "../types.ts";
 import { isUserItem, type Item } from "../sessions/items.ts";
-import { hasParentPathSegment, type Sandbox, type SandboxHandle } from "../sandbox/sandbox.ts";
+import { hasParentPathSegment, removeDirAndList, type Sandbox, type SandboxHandle } from "../sandbox/sandbox.ts";
 import {
   MAX_BLOB_BYTES,
   BlobTooLargeError,
@@ -17,12 +17,36 @@ import { hashId } from "../util/crypto.ts";
 import type { SecurityScreenVerdict } from "../security/security-posture.ts";
 import { downscaleVisionImage } from "./image-downscale.ts";
 import { NoDefaultSandboxError } from "../sandbox/sandbox-routing.ts";
+import { BotComputerRefusedError } from "../sandbox/sandbox-resources.ts";
 
 export const INBOX_DIR = "inbox";
 export const TURN_FILES_DIR = ".agent-turn";
+const TURN_FILES_MAX_AGE_MS = 24 * 60 * 60_000;
 
 export function turnFileId(runId?: string, attempt = 1, now = Date.now()): string {
   return `${now.toString(36)}-${hashId([runId ?? randomUUID(), String(attempt)], 24)}`;
+}
+
+export async function clearStaleTurnFiles(
+  sandbox: Sandbox,
+  handle: SandboxHandle,
+  turnSessionDir: string,
+): Promise<void> {
+  const cutoff = Date.now() - TURN_FILES_MAX_AGE_MS;
+  const paths = await removeDirAndList(sandbox, handle, turnSessionDir, TURN_FILES_DIR);
+  const stale = new Set<string>();
+  for (const path of paths) {
+    const parts = path.split("/");
+    const startedAt = Number.parseInt(parts[2]?.split("-")[0] ?? "", 36);
+    if (parts[0] === TURN_FILES_DIR && parts[1] && parts[2] && Number.isFinite(startedAt) && startedAt < cutoff) {
+      stale.add(`${TURN_FILES_DIR}/${parts[1]}/${parts[2]}`);
+    }
+  }
+  await Promise.all(
+    [...stale].map((dir) =>
+      sandbox.removeDir(handle, dir).catch(swallowAs("orchestrator: stale turn file cleanup", undefined)),
+    ),
+  );
 }
 
 export const MAX_ATTACHMENT_BYTES = MAX_BLOB_BYTES;
@@ -44,7 +68,7 @@ function baseMime(m: string): string {
   return (m.split(";")[0] ?? "").trim().toLowerCase();
 }
 
-function isTextMime(mimetype: string): boolean {
+export function isTextMime(mimetype: string): boolean {
   return (
     mimetype.startsWith("text/") ||
     mimetype === "application/json" ||
@@ -228,7 +252,7 @@ export async function materializeInbound(
   let target: Promise<SandboxHandle | null> | undefined;
   const computer = () =>
     (target ??= (typeof handle === "function" ? handle() : Promise.resolve(handle)).catch((e: unknown) => {
-      if (e instanceof NoDefaultSandboxError) return null;
+      if (e instanceof NoDefaultSandboxError || e instanceof BotComputerRefusedError) return null;
       throw e;
     }));
   const unstaged = new Set<string>();

@@ -60,6 +60,29 @@ test("botIdentityArgs/slackReplyArgs stay a no-op without an env override", () =
   });
 });
 
+test("a post from a persona turn goes out under the persona's name and icon", () => {
+  const ada = { id: "p1", name: "Ada" };
+  assert.deepEqual(botIdentityArgs({ ...ada, icon: { kind: "emoji", value: "🎨" } }), {
+    username: "Ada",
+    icon_emoji: ":art:",
+  });
+  assert.deepEqual(botIdentityArgs({ ...ada, icon: { kind: "emoji", value: "❤️" } }), {
+    username: "Ada",
+    icon_emoji: ":heart:",
+  });
+  assert.deepEqual(botIdentityArgs({ ...ada, icon: { kind: "custom", name: "ada-face" } }), {
+    username: "Ada",
+    icon_emoji: ":ada-face:",
+  });
+  assert.deepEqual(botIdentityArgs(ada), { username: "Ada" }, "no icon keeps the app's own");
+  assert.deepEqual(slackReplyArgs("C1", "hi", "1.2", { persona: ada }), {
+    channel: "C1",
+    text: "hi",
+    thread_ts: "1.2",
+    username: "Ada",
+  });
+});
+
 test("slackReplyArgs can suppress Slack link and media unfurls per message", () => {
   assert.deepEqual(slackReplyArgs("C1", "see https://x.com/a/status/1", undefined, { unfurlLinks: false }), {
     channel: "C1",
@@ -189,6 +212,34 @@ test("deliverWithRetry: transient post failures recover before the cap", async (
   assert.equal(h.posts.length, 1);
   assert.equal(h.acks.length, 1);
   assert.ok(!h.tracker.givenUp("d1"));
+});
+
+test("deliverWithRetry: an ack that gives up is retried as an ack after the bench, never re-posted", async () => {
+  const tracker = createDeliveryTracker({ maxAttempts: 2, giveUpRetryMs: 20 });
+  let posts = 0;
+  let ackFails = 2;
+  const acks: unknown[] = [];
+  const cycle = () =>
+    deliverWithRetry({
+      tracker,
+      id: "d1",
+      post: async () => {
+        posts++;
+        return "body";
+      },
+      ack: async (body) => {
+        if (ackFails-- > 0) throw new Error("core 503");
+        acks.push(body);
+      },
+      onError: () => {},
+    });
+  await cycle();
+  await cycle();
+  assert.ok(tracker.givenUp("d1"));
+  await new Promise((r) => setTimeout(r, 30));
+  await cycle();
+  assert.equal(posts, 1);
+  assert.deepEqual(acks, ["body"]);
 });
 
 test("createDeliveryTracker: a posted-but-unacked entry evicted by the cap is given up on, never re-posted", () => {

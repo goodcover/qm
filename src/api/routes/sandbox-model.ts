@@ -1,12 +1,11 @@
-import { Readable } from "node:stream";
-import type { ReadableStream as WebReadableStream } from "node:stream/web";
 import { SANDBOX_MODEL_AUD } from "../../auth/capability-token.ts";
 import { gatewayActorId, gatewayKey, gatewayRoot, modelGatewayHeaders } from "../../model/provider-endpoints.ts";
 import { createExactSecretValueMasker } from "../../security/secret-masking.ts";
 import { reportFailure } from "../../util/errors.ts";
 import { SANDBOX_MODEL_PREFIX } from "../contract.ts";
-import { pipeToResponse, sendJson } from "../http.ts";
-import type { ApiCtx, Route } from "./route.ts";
+import { sendJson } from "../http.ts";
+import { relayStream } from "../../../plugins/chassis/src/http.ts";
+import { tenantOf, type ApiCtx, type Route } from "./route.ts";
 
 const FORWARDED_HEADERS = ["accept", "content-type", "anthropic-version", "anthropic-beta"];
 const UPSTREAM_REQUEST_LIMIT_BYTES = 32 * 1024 * 1024;
@@ -35,7 +34,7 @@ async function denied(ctx: ApiCtx): Promise<boolean> {
   }
   const [posture, budget] = await Promise.all([
     deps.config?.getSecurityPostureDurable(capability.scopeId),
-    deps.budget?.check(capability.actorId),
+    deps.budget?.check(tenantOf(ctx), capability.actorId),
   ]);
   if (posture === "strict") {
     sendJson(res, 403, { error: { message: "model requests are disabled in strict posture" } });
@@ -110,11 +109,11 @@ async function proxy(ctx: ApiCtx): Promise<void> {
       return void res.end(text);
     }
     res.writeHead(response.status, { "content-type": contentType, "cache-control": "no-store" });
-    const upstream = Readable.fromWeb(response.body as WebReadableStream);
-    upstream.on("error", (error) => {
-      if (!controller.signal.aborted) reportFailure("sandbox model: gateway stream", error, path);
+    relayStream(response.body, res, {
+      onError: (error) => {
+        if (!controller.signal.aborted) reportFailure("sandbox model: gateway stream", error, path);
+      },
     });
-    pipeToResponse(res, upstream, "model stream failed");
   } catch (error) {
     if (!controller.signal.aborted) reportFailure("sandbox model: gateway request", error, path);
     if (!res.headersSent)

@@ -1,4 +1,4 @@
-import { ACCOUNT_ID, activeRun, composioUserIds, credential, ownedAccount, request } from "./composio.ts";
+import { ACCOUNT_ID, activeRun, composioUserIds, credential, activeOwnedAccount, request } from "./composio.ts";
 import { sendJson } from "../http.ts";
 import { sniffImageDimensions } from "../../core/image-downscale.ts";
 import { redactSecrets } from "../../../plugins/chassis/src/redact-secrets.ts";
@@ -79,18 +79,12 @@ async function uploadMedia(ctx: ApiCtx): Promise<void> {
   const resource = `${accountId}/media`;
   const mask = createExactSecretValueMasker([access.key]);
   try {
-    const owned = await ownedAccount(ctx, access, accountId);
-    if (
-      !owned ||
-      owned.toolkit !== "twitter" ||
-      owned.account.status !== "ACTIVE" ||
-      owned.account.is_disabled === true
-    )
-      return sendJson(ctx.res, 403, { error: "connection_not_authorized" });
+    const owned = await activeOwnedAccount(ctx, access, accountId);
+    if (!owned || owned.toolkit !== "twitter") return sendJson(ctx.res, 403, { error: "connection_not_authorized" });
     if (!(await activeRun(ctx))) return;
     if (!composioUserIds(access.principal).includes(String(owned.account.user_id)))
       return sendJson(ctx.res, 403, { error: "connection_not_authorized" });
-    audit(ctx.deps, {
+    audit(ctx, {
       principalId: access.principal,
       action: "composio.twitter_media.started",
       resource,
@@ -113,7 +107,7 @@ async function uploadMedia(ctx: ApiCtx): Promise<void> {
     if (!(await activeRun(ctx))) return;
     const finished = await xMedia(ctx, access.key, accountId, `${X_MEDIA_UPLOAD}/${mediaId}/finalize`);
     if (finished.id !== mediaId) throw new Error("Media id changed during upload");
-    audit(ctx.deps, {
+    audit(ctx, {
       principalId: access.principal,
       action: "composio.twitter_media.completed",
       resource: `${resource}/${mediaId}`,
@@ -126,7 +120,7 @@ async function uploadMedia(ctx: ApiCtx): Promise<void> {
       expiresAfterSecs: typeof finished.expires_after_secs === "number" ? finished.expires_after_secs : null,
     });
   } catch (error) {
-    audit(ctx.deps, {
+    audit(ctx, {
       principalId: access.principal,
       action: "composio.twitter_media.failed",
       resource,
