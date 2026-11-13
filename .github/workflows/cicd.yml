@@ -371,6 +371,7 @@ jobs:
           CREATE EXTENSION vector;
           GRANT USAGE, CREATE ON SCHEMA public TO schema_admin;
           SQL
+          git fetch --quiet --depth 1 https://github.com/yc-software/qm.git 'refs/tags/v*:refs/tags/v*'
           scripts/check-published-upgrade.sh
 
   web-ui-plugin:
