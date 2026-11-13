@@ -20,7 +20,6 @@ import type { ScopeId } from "../types.ts";
 const REFRESH_INTERVAL_MS = 5 * 60_000;
 const CATALOG_TTL_MS = 60_000;
 const CATALOG_CACHE_MAX = 1_000;
-const CATALOG_MAX_TOOLS = 5_000;
 const CATALOG_SEARCH_LIMIT = 50;
 const CATALOG_OPERATIONS = ["search", "describe", "invoke"];
 const DROPPED_OPTIONAL_PARAMS = ["intent", "locale"];
@@ -296,13 +295,8 @@ export function createMcpToolService(opts: {
     const key = `${server.id}\0${server.updatedAt}\0${perPerson ? (principalId ?? "") : ""}`;
     const cached = catalogs.get(key);
     if (cached) return cached;
-    const listing = client
-      .listTools({ headers: headersFor(server, principalId), maxTools: CATALOG_MAX_TOOLS })
-      .then((listed) => listed.tools);
+    const listing = client.listTools({ headers: headersFor(server, principalId) }).then((listed) => listed.tools);
     catalogs.set(key, listing);
-    listing.catch(() => {
-      if (catalogs.peek(key) === listing) catalogs.delete(key);
-    });
     return listing;
   }
 
@@ -504,7 +498,7 @@ export function createMcpToolService(opts: {
           if (current) await opts.servers.put({ ...current, tools, about: about ?? current.about });
           await refresh();
           record("call", `${def.serverId}/sign_in`, `ok tools=${tools.length}`, principalId);
-          return `Signed in to ${server.name}. Tools now available on server "${server.id}": ${tools.map((t) => t.name).join(", ")}`;
+          return `Signed in to ${server.name}. Available tools on server "${server.id}": ${tools.length}. Use tool_search to find them.`;
         }
         const result = await client.callTool(def.remoteName, args, headersFor(server, principalId, approval));
         record("call", `${def.serverId}/${def.remoteName}`, approval ? "ok approved" : "ok", principalId);
@@ -526,7 +520,6 @@ export function createMcpToolService(opts: {
           : createMcpClient({ url: server.url, auth: authOf(server), fetch: opts.fetch });
       return client.listTools({
         headers: headersFor(server, principalId),
-        ...(server.catalog ? { maxTools: CATALOG_MAX_TOOLS } : {}),
       });
     },
     close() {

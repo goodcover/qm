@@ -9,7 +9,7 @@ import { swallowAs } from "../util/errors.ts";
 import { publicFetch, type AddressFetch } from "../util/network.ts";
 import { trimTrailingSlashes } from "../util/text.ts";
 
-const MAX_TOOLS = 128;
+const MAX_DISCOVERY_TOOLS = 5_000;
 const CALL_TIMEOUT_MS = 300_000;
 const OAUTH_DENIALS: ReadonlySet<string> = new Set([
   "invalid_client",
@@ -94,7 +94,7 @@ export type McpAuth =
   | { mode: "client-credentials"; clientId: string; clientSecret: string };
 
 export interface McpClient {
-  listTools(opts?: { headers?: Record<string, string>; maxTools?: number }): Promise<McpListing>;
+  listTools(opts?: { headers?: Record<string, string> }): Promise<McpListing>;
   callTool(
     name: string,
     args: Record<string, unknown>,
@@ -185,10 +185,14 @@ export function createMcpClient(opts: {
         "tools/list",
         async (client) => {
           const tools: McpRemoteTool[] = [];
-          const maxTools = opts?.maxTools ?? MAX_TOOLS;
+          const cursors = new Set<string>();
           let cursor: string | undefined;
           do {
             const page = await client.listTools(cursor === undefined ? undefined : { cursor });
+            if (tools.length + page.tools.length > MAX_DISCOVERY_TOOLS || cursors.size >= MAX_DISCOVERY_TOOLS)
+              throw new Error(
+                `MCP tool discovery exceeds ${MAX_DISCOVERY_TOOLS} tools or pages; inventory was not loaded`,
+              );
             for (const t of page.tools)
               tools.push({
                 name: t.name,
@@ -197,18 +201,17 @@ export function createMcpClient(opts: {
                 ...(t.annotations ? { annotations: t.annotations } : {}),
               });
             cursor = page.nextCursor;
-          } while (cursor && tools.length < maxTools);
-          if (cursor || tools.length > maxTools)
-            console.error(
-              `[mcp] ${endpoint.host} lists more than ${maxTools} tools; only the first ${maxTools} are available`,
-            );
+            if (cursor && cursors.has(cursor)) throw new Error("MCP tools/list returned a repeated cursor");
+            if (cursor) cursors.add(cursor);
+          } while (cursor);
           const about = (client.getServerVersion()?.description || client.getInstructions() || "").trim();
           return {
-            tools: tools.slice(0, maxTools),
+            tools,
             ...(about ? { about } : {}),
           };
         },
         opts?.headers,
+        AbortSignal.timeout(CALL_TIMEOUT_MS),
       ),
     async callTool(name, args, headers, signal) {
       const result = (await session(
