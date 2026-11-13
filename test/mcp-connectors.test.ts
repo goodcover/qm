@@ -29,23 +29,19 @@ function server(partial?: Partial<McpServer>): McpServer {
   };
 }
 
-test("mcp client lists every page of tools and calls one over JSON and SSE responses", async (t) => {
-  const tools = ["a", "b", "c"].map((name) => ({
+test("mcp client keeps an oversized page and calls its last tool over JSON and SSE responses", async (t) => {
+  const tools = Array.from({ length: 129 }, (_, i) => `t${i}`).map((name) => ({
     name,
     description: `tool ${name}`,
     inputSchema: { type: "object" as const },
   }));
   for (const json of [true, false]) {
-    const mcp = await startMcpTestServer(t, { tools, pageSize: 1, json });
+    const mcp = await startMcpTestServer(t, { tools, pageSize: json ? 129 : 40, json });
     const client = createMcpClient({ fetch: loopbackFetch, url: `${mcp.url}/mcp`, auth: { mode: "none" } });
     assert.deepEqual(await client.listTools(), {
-      tools: [
-        { name: "a", description: "tool a", inputSchema: { type: "object" } },
-        { name: "b", description: "tool b", inputSchema: { type: "object" } },
-        { name: "c", description: "tool c", inputSchema: { type: "object" } },
-      ],
+      tools,
     });
-    assert.equal(mcpResultText(await client.callTool("b", {})), "ran b");
+    assert.equal(mcpResultText(await client.callTool("t128", {})), "ran t128");
     assert.equal(mcp.openSessions(), 0, "each operation ends its session");
   }
 });
@@ -58,19 +54,6 @@ test("mcp client keeps the server's own description, else its instructions", asy
   const about = (await createMcpClient({ fetch: loopbackFetch, url: told.url, auth: { mode: "none" } }).listTools())
     .about;
   assert.equal(about, "Call search first.\nThen update.");
-});
-
-test("mcp client caps a server's tool list and says what it cut", async (t) => {
-  const tools = Array.from({ length: 200 }, (_, i) => ({ name: `t${i}`, inputSchema: { type: "object" as const } }));
-  const mcp = await startMcpTestServer(t, { tools, pageSize: 40 });
-  const logged = t.mock.method(console, "error", () => {});
-  const listed = (await createMcpClient({ fetch: loopbackFetch, url: mcp.url, auth: { mode: "none" } }).listTools())
-    .tools;
-  assert.equal(listed.length, 128);
-  assert.equal(listed.at(-1)?.name, "t127");
-  assert.equal(mcp.requests.filter((r) => r.rpc === "tools/list").length, 4);
-  assert.equal(logged.mock.callCount(), 1);
-  assert.match(String(logged.mock.calls[0]!.arguments[0]), /more than 128 tools; only the first 128 are available/);
 });
 
 test("draft-7 definitions in an MCP tool schema reach the model intact and validate arguments", async (t) => {
@@ -106,6 +89,30 @@ test("draft-7 definitions in an MCP tool schema reach the model intact and valid
       arguments: { customerId: "c1", filters: { status: "NOPE" } },
     }),
   );
+});
+
+test("mcp client fails explicitly rather than returning a truncated oversized inventory", async (t) => {
+  const tools = Array.from({ length: 5001 }, (_, i) => ({ name: `t${i}`, inputSchema: { type: "object" as const } }));
+  const mcp = await startMcpTestServer(t, { tools, pageSize: 2500 });
+  const client = createMcpClient({ fetch: loopbackFetch, url: mcp.url, auth: { mode: "none" } });
+  await assert.rejects(client.listTools(), (e: Error) => String(e.cause).includes("inventory was not loaded"));
+  assert.equal(mcp.requests.filter((r) => r.rpc === "tools/list").length, 3);
+  const store = createMcpServerStore(testMap<McpServer>());
+  await store.put(server({ url: mcp.url, catalog: true }));
+  const service = createMcpToolService({ fetch: loopbackFetch, servers: store });
+  t.after(() => service.close());
+  for (const operation of ["search", "describe"])
+    await assert.rejects(service.call("crm", { operation, tool: "t0" }), (e: Error) =>
+      String(e.cause).includes("inventory was not loaded"),
+    );
+  assert.equal(mcp.requests.filter((r) => r.rpc === "tools/list").length, 6);
+});
+
+test("mcp client rejects pagination cycles instead of returning a partial list", async (t) => {
+  const mcp = await startMcpTestServer(t, { pageSize: 0 });
+  const client = createMcpClient({ fetch: loopbackFetch, url: mcp.url, auth: { mode: "none" } });
+  await assert.rejects(client.listTools(), (e: Error) => String(e.cause).includes("repeated cursor"));
+  assert.equal(mcp.requests.filter((r) => r.rpc === "tools/list").length, 2);
 });
 
 test("mcp client surfaces tool errors and protocol errors", async (t) => {
