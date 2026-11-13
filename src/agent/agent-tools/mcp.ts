@@ -52,8 +52,7 @@ export function mcpTools(kit: ToolKit, nativeNames: Set<string>) {
   const toolSearch = defineTool({
     name: "tool_search",
     label: "tool_search",
-    description:
-      "Find connector tools by keyword. Returns each match's name, description and input schema.",
+    description: "Find connector tools by keyword. Returns each match's name, description and input schema.",
     parameters: Type.Object({
       query: Type.String({ description: "Words to match against tool names and descriptions." }),
     }),
