@@ -117,11 +117,6 @@ or token re-entry. Ops owns the release's immutable image pins and rollout recor
   in `/tmp` after two hours. Goodcover removed that sweep because it could delete the
   credentials of a command still running. A directory left behind by a crash remains
   until that computer is replaced.
-- **No Fast mode for GPT-6.2 Sol and Astra.** Upstream registers both with Fast mode.
-  On the company ChatGPT login, priority requests for them were accepted, but the
-  backend reported the `auto` and `default` tiers rather than `priority`, so Fast is
-  not exposed for these two models until a served priority tier is confirmed. When
-  syncing upstream, keep `fastMode: false` on both entries until then.
 
 ## Historical deployed baseline: Claude Code alongside Codex
 
