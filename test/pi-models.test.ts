@@ -154,6 +154,7 @@ test("the curated catalog contains only current model families", () => {
     tiers: [{ inputTokensAbove: 272_000, input: 16, output: 60, cacheRead: 0.8, cacheWrite: 20 }],
   });
   assert.equal(astra62.thinkingLevelMap?.off, null);
+  assert.deepEqual(["gpt-6.2-sol", "gpt-6.2-astra"].map(modelSupportsFastMode), [false, false]);
   assert.deepEqual(getRequiredModel("gpt-6-sol").cost, {
     input: 2,
     output: 10,

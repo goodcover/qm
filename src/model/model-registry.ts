@@ -180,7 +180,7 @@ export const MODEL_REGISTRY: readonly ModelEntry[] = [
     id: "gpt-6.2-sol",
     buttonLabel: "6.2 Sol",
     name: "GPT-6.2 Sol",
-    fastMode: true,
+    fastMode: false,
     base: true,
     clone: {
       ...GPT_56_CLONE,
@@ -196,7 +196,7 @@ export const MODEL_REGISTRY: readonly ModelEntry[] = [
     id: "gpt-6.2-astra",
     buttonLabel: "6.2 Astra",
     name: "GPT-6.2 Astra",
-    fastMode: true,
+    fastMode: false,
     base: true,
     clone: {
       ...GPT_56_CLONE,
