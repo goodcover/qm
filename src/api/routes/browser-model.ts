@@ -56,14 +56,11 @@ async function browserModel(ctx: ApiCtx): Promise<void> {
       runtime: { modelId: capability.browserModel },
       ...(personal ? { providerKeys: personal.keys } : {}),
     });
-    if (
-      personal
-        ? personal.subscription === "anthropic"
-        : deps.companySubscriptionAuth === "anthropic" && route.model.provider === "anthropic"
-    )
+    const companyClaudeCode = deps.companySubscriptionAuth === "anthropic" && route.model.provider === "anthropic";
+    const cliHarness = personal ? personal.subscription : companyClaudeCode && "anthropic";
+    if (cliHarness === "anthropic" || cliHarness === "antigravity")
       return sendJson(res, 422, {
-        error:
-          "Claude subscription access does not support the browser agent. Choose company access, ChatGPT, or a Claude API key in Settings.",
+        error: `${cliHarness === "anthropic" ? "Claude subscription" : "Antigravity"} access does not support the browser agent. Choose company access, ChatGPT, or a Claude API key in Settings.`,
       });
     if (!deps.modelRoutes.servable(route))
       return sendJson(res, 503, { error: `${routeLabel(route)} has no credential` });

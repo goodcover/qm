@@ -4,6 +4,7 @@ import { mock, test } from "node:test";
 import * as agentRun from "../src/agent/agent-run.ts";
 import * as mockAgent from "./support/mock-agent.ts";
 import type { AgentTurnInput } from "../src/agent/agent.ts";
+import { antigravityProfile } from "../src/model/antigravity-boundary.ts";
 import { resolveModel } from "../src/model/pi-models.ts";
 import { testConfig } from "./support/test-config.ts";
 import { COMPANY_CHATGPT_CREDENTIAL, saveCompanyChatGPTLogin } from "./support/company-chatgpt-login.ts";
@@ -251,6 +252,37 @@ test("a company ChatGPT login feeds pi's subscription provider while personal Ch
     assert.equal(finished.status, "done", JSON.stringify(finished.result));
     assert.deepEqual(turns[0]!.providerKeys, { "openai-codex": "personal-oauth" });
     assert.equal(turns[0]!.runtime!.modelId, "codex/gpt-6.1-sol");
+  } finally {
+    await built.runtime.stop();
+  }
+});
+
+test("an Antigravity login reaches only its owner's personal turns, as the default when it is their only login", async () => {
+  turns.length = 0;
+  const built = buildApp(testConfig({ antigravityOwner: "U1" }));
+  for (const user of ["U1", "U2"]) await built.config.setPersonalModelAuth(user, true);
+  const submit = (user: string, surface: "web" | "slack") =>
+    built.app.turn({
+      surface,
+      actor: { externalId: user },
+      conversation: { kind: "dm", threadRef: `${surface}:${user}:antigravity` },
+      text: "hello",
+      origin: { kind: "human" },
+      async: true,
+      ...(surface === "web" ? { model: "antigravity/gemini-4-neon" } : {}),
+    });
+  const owner = [await submit("U1", "web"), await submit("U1", "slack")];
+  assert.deepEqual(await submit("U2", "web"), {
+    status: "refused",
+    reason: "Your connected AI account cannot serve this model.",
+  });
+  built.runtime.start();
+  try {
+    for (const run of owner) assert.equal((await built.runs.waitFor(run.runId!, 5_000)).status, "done");
+    assert.deepEqual(
+      turns.map((turn) => [turn.runtime?.modelId, turn.providerKeys]),
+      owner.map(() => ["antigravity/gemini-4-neon", { antigravity: antigravityProfile() }]),
+    );
   } finally {
     await built.runtime.stop();
   }

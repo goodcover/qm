@@ -76,6 +76,7 @@ export interface Config extends SandboxSettings, DeploySettings {
   modelId?: string;
   codexAuthCredential?: string;
   claudeAuthCredential?: string;
+  antigravityOwner?: string;
   titleModelId?: string;
   judgeModelId?: string;
   anthropicApiKey?: string;
@@ -527,6 +528,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ...(env.PI_MODEL ? { modelId: env.PI_MODEL } : {}),
     ...(codexAuthCredential ? { codexAuthCredential } : {}),
     ...(claudeAuthCredential ? { claudeAuthCredential } : {}),
+    ...(env.ANTIGRAVITY_OWNER?.trim() ? { antigravityOwner: env.ANTIGRAVITY_OWNER.trim() } : {}),
     ...(env.PI_TITLE_MODEL ? { titleModelId: env.PI_TITLE_MODEL } : {}),
     ...(env.PI_JUDGE_MODEL ? { judgeModelId: env.PI_JUDGE_MODEL } : {}),
     ...(env.ANTHROPIC_API_KEY ? { anthropicApiKey: env.ANTHROPIC_API_KEY } : {}),

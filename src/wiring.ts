@@ -1328,7 +1328,10 @@ export function buildApp(
     ...(fresh.accountId ? { accountId: fresh.accountId } : {}),
     ...(fresh.expiresAt !== undefined ? { expiresAt: fresh.expiresAt } : {}),
   });
-  const userModelCredentials = createUserModelCredentialStore({ keychain: credentialStore });
+  const userModelCredentials = createUserModelCredentialStore({
+    keychain: credentialStore,
+    ...(config.antigravityOwner ? { antigravityOwner: config.antigravityOwner } : {}),
+  });
   const keychain: Keychain | undefined = keychainKeyMaterial ? credentialStore : undefined;
   const serviceCreds = withDeploymentCredentials(
     credentialStore,

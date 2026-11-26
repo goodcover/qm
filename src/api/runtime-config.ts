@@ -7,9 +7,11 @@ import { resolveRuntimeChoice } from "../agent/runtime-choice.ts";
 import { resolveIndividualAuthRouting } from "../core/individual-auth-routing.ts";
 import { gatewayModelCatalog } from "../model/gateway-models.ts";
 import type { AppDeps } from "./app-types.ts";
-import type { ScopeId, TurnRequest } from "../types.ts";
+import { parseScopeId, type ScopeId, type TurnRequest } from "../types.ts";
 import { orgScope } from "../config.ts";
+import { ANTIGRAVITY_PROVIDER } from "../model/provider-endpoints.ts";
 import {
+  ANTIGRAVITY_MODEL_IDS,
   defaultModel,
   modelSupported,
   serviceableModelIds,
@@ -74,15 +76,16 @@ export async function userRuntimeConfigBody(ctx: { deps: RuntimeDeps }, scope: S
   const account = await ctx.deps.config?.getModelAccountDurable(actorId);
   const store = ctx.deps.userModelCredentials;
   if (!store || !account || account === "company") return runtimeConfigBody(ctx, scope);
-  const [anthropic, openai] = await Promise.all([
+  const [anthropic, openai, antigravity] = await Promise.all([
     account === "openai" ? null : store.get(actorId, "anthropic"),
     account === "anthropic" ? null : store.get(actorId, "openai"),
+    account === "personal" ? store.get(actorId, ANTIGRAVITY_PROVIDER) : null,
   ]);
   const snapshot = await runtimeConfigBody(ctx, scope, async (choice) => {
-    const route = resolveIndividualAuthRouting(anthropic, openai, choice.modelId);
+    const route = resolveIndividualAuthRouting(anthropic, openai, choice.modelId, antigravity);
     return route?.model === choice.modelId ? null : "account_runtime_unavailable";
   });
-  const route = resolveIndividualAuthRouting(anthropic, openai, snapshot.effective.modelId);
+  const route = resolveIndividualAuthRouting(anthropic, openai, snapshot.effective.modelId, antigravity);
   if (!route?.model || !snapshot.models.includes(route.model)) return snapshot;
   const { unavailableReason: _, ...available } = snapshot;
   return {
@@ -164,6 +167,7 @@ export async function runtimeConfigBody(
       const subscriptionId = codexSubscriptionModelId(id);
       if (modelSupported(subscriptionId) && !models.includes(subscriptionId)) models.push(subscriptionId);
     }
+    if (allowlist == null && parseScopeId(scope).kind === "personal") models.push(...ANTIGRAVITY_MODEL_IDS);
     const allowed = await Promise.all(
       models.map((modelId) => authorizeChoice({ modelId, effortLevel: "auto", fastMode: false })),
     );
