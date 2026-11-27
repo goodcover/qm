@@ -312,7 +312,11 @@ import {
 } from "./model/model-credential-store.ts";
 import { refreshChatGPTTokens, refreshClaudeTokens } from "./model/subscription-oauth.ts";
 import { createUserModelCredentialStore, type UserModelCredentialStore } from "./model/user-model-credential-store.ts";
-import { type ModelGatewayTransportConfig, setProviderBaseUrls } from "./model/provider-endpoints.ts";
+import {
+  ANTIGRAVITY_PROVIDER,
+  type ModelGatewayTransportConfig,
+  setProviderBaseUrls,
+} from "./model/provider-endpoints.ts";
 import { setCustomProviders } from "./model/custom-providers.ts";
 import { createPostgresSessionStore } from "./sessions/postgres-session-store.ts";
 import { bootTenant, inBootTenant, tenancyBooted } from "./tenants/boot.ts";
@@ -669,6 +673,7 @@ export function buildApp(
       return {
         ...direct,
         ...(directProviderAvailability.codexOAuth ? { codexOAuth: true } : {}),
+        ...(directProviderAvailability.antigravity ? { antigravity: true } : {}),
         ...(config.claudeAuthCredential ? { anthropic: true } : {}),
         modelIds: new Set(Object.keys(gatewayTransport?.models ?? {})),
       };
@@ -1328,10 +1333,7 @@ export function buildApp(
     ...(fresh.accountId ? { accountId: fresh.accountId } : {}),
     ...(fresh.expiresAt !== undefined ? { expiresAt: fresh.expiresAt } : {}),
   });
-  const userModelCredentials = createUserModelCredentialStore({
-    keychain: credentialStore,
-    ...(config.antigravityOwner ? { antigravityOwner: config.antigravityOwner } : {}),
-  });
+  const userModelCredentials = createUserModelCredentialStore({ keychain: credentialStore });
   const keychain: Keychain | undefined = keychainKeyMaterial ? credentialStore : undefined;
   const serviceCreds = withDeploymentCredentials(
     credentialStore,
@@ -1494,7 +1496,12 @@ export function buildApp(
       resolveModelProviderKeys(),
       resolveCompanySubscriptionKeys(),
     ]);
-    const keys = { ...metered, ...claude, ...chatgpt };
+    const keys = {
+      ...metered,
+      ...claude,
+      ...chatgpt,
+      ...(config.antigravityProfile ? { [ANTIGRAVITY_PROVIDER]: config.antigravityProfile } : {}),
+    };
     return companyClaudeAuthEnv && !claude.anthropic ? { ...keys, anthropic: undefined } : keys;
   };
   const runtimeOrgScope = scopeId("org", config.orgId);

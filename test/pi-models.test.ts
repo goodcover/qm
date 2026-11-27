@@ -22,7 +22,7 @@ test("every selectable base model resolves against the pi-ai registry", () => {
     const model = getRequiredModel(m.id);
     assert.equal(model.id, m.id);
     assert.ok(
-      ["anthropic", "openai", "openrouter"].includes(String(model.provider)),
+      ["anthropic", "openai", "openrouter", "antigravity"].includes(String(model.provider)),
       `${m.id} has unexpected provider ${model.provider}`,
     );
   }
@@ -116,6 +116,7 @@ test("the curated catalog contains only current model families", () => {
       "gpt-6-sol",
       "gpt-6-luna",
       "openrouter/auto",
+      "antigravity/gemini-4-neon",
     ],
   );
   assert.equal(getRequiredModel("gpt-5.6-sol").contextWindow, 1_050_000);

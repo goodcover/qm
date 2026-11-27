@@ -10,7 +10,6 @@ import {
   calculateCost,
   createAssistantMessageEventStream,
   type Api,
-  type AssistantMessage,
   type AssistantMessageEventStream,
   type Context,
   type ImageContent,
@@ -19,6 +18,7 @@ import {
   type SimpleStreamOptions,
   type TextContent,
   type ToolCall,
+  type Usage,
 } from "@earendil-works/pi-ai";
 import { constantTimeEqual } from "../util/crypto.ts";
 import { asError, errMessage, swallow } from "../util/errors.ts";
@@ -30,13 +30,15 @@ import {
 } from "./antigravity-boundary.ts";
 import {
   answersToolCalls,
+  closeOnce,
   failStep,
   finishStep,
   HarnessFailure,
   harnessOutput,
+  harnessSlot,
   mcpResult,
-  onAbort,
   qmToolServer,
+  refuseUnsent,
   RESUMED_AT_TOOL_RESULTS,
   startStep,
   type HarnessStep,
@@ -47,14 +49,14 @@ import { zeroUsage } from "./model-runtime.ts";
 
 const AGY_TOOL_PREFIX = `mcp_${ANTIGRAVITY_MCP_SERVER}_`;
 const ALWAYS_LOAD = "antigravity/alwaysLoad";
-const SENT_FIELDS = new Set(["model", "thought_level", "system", "prompt", "tools"]);
+const SENT_FIELDS = new Set(["model", "thought_level", "system", "messages", "tools"]);
 const AUTH_REQUIRED = acp.RequestError.authRequired().code;
 
 interface AntigravityRequest {
   model: string;
   thought_level?: string;
   system: string;
-  prompt: acp.ContentBlock[];
+  messages: [{ role: "user"; content: acp.ContentBlock[] }];
   tools: ServedTool[];
 }
 
@@ -78,7 +80,9 @@ interface Live {
   connection?: acp.ClientConnection;
   sessionId?: string;
   prompts: number;
-  spent: acp.PromptResponse[];
+  prompting?: Promise<void>;
+  unbilled: Usage;
+  dropped?: unknown;
   step?: Step;
   backlog: Array<{ kind: "text" | "thinking"; text: string }>;
   queued: Call[];
@@ -180,8 +184,7 @@ async function teardown(live: Live, reason: string): Promise<void> {
 }
 
 function closeLive(live: Live, reason: string): Promise<void> {
-  live.closing ??= teardown(live, reason);
-  return live.closing;
+  return closeOnce(live, reason, teardown);
 }
 
 function fail(live: Live, error: Error): void {
@@ -305,19 +308,20 @@ function promptBlocks(messages: readonly Message[]): acp.ContentBlock[] {
 
 function sendable(value: unknown): AntigravityRequest {
   const request = value as Partial<AntigravityRequest> | null;
+  const message = Array.isArray(request?.messages) && request.messages.length === 1 ? request.messages[0] : undefined;
   if (
     !request ||
     typeof request.model !== "string" ||
     typeof request.system !== "string" ||
-    !Array.isArray(request.prompt) ||
+    message?.role !== "user" ||
+    !Array.isArray(message.content) ||
     !Array.isArray(request.tools)
   )
     throw new Error("QM's request hook returned a payload the Antigravity route cannot send");
-  const unsent = Object.keys(request).filter((key) => !SENT_FIELDS.has(key));
-  if (unsent.length)
-    throw new HarnessFailure(`Antigravity cannot send request fields QM's request hook set: ${unsent.join(", ")}`, {
-      type: "invalid_request_error",
-    });
+  refuseUnsent(
+    "Antigravity",
+    Object.keys(request).filter((key) => !SENT_FIELDS.has(key)),
+  );
   return request as AntigravityRequest;
 }
 
@@ -329,7 +333,7 @@ function continues(live: Live | undefined, messages: readonly Message[]): live i
 function lost(live: Live, error: unknown): void {
   if (live.closed) return swallow("antigravity: error after the turn closed", error);
   if (!live.connection?.signal.aborted) return fail(live, acpFailure(error));
-  swallow("antigravity: the ACP connection closed", error);
+  live.dropped = error;
   live.proc.child.kill("SIGKILL");
 }
 
@@ -340,26 +344,25 @@ async function prompt(live: Live, blocks: acp.ContentBlock[]): Promise<void> {
       sessionId: live.sessionId!,
       prompt: blocks,
     });
-    live.spent.push(response);
-    if (index === live.prompts) finish(live, response);
+    credit(live, response);
+    if (index === live.prompts) return finish(live, response);
+    if (response.stopReason !== "end_turn")
+      console.error(`[antigravity] prompt ${index} ended (${response.stopReason}) after a steer superseded it`);
   } catch (error) {
     lost(live, error);
   }
 }
 
-function usageOf(model: Model<Api>, responses: readonly acp.PromptResponse[]): AssistantMessage["usage"] {
-  const out = zeroUsage();
-  for (const response of responses) {
-    const usage = (response as { usage?: PromptUsage | null }).usage;
-    if (!usage) continue;
-    out.input += usage.inputTokens;
-    out.output += usage.outputTokens;
-    out.cacheRead += usage.cachedReadTokens ?? 0;
-    out.cacheWrite += usage.cachedWriteTokens ?? 0;
-    out.totalTokens += usage.totalTokens;
-  }
-  out.cost = calculateCost(model, out);
-  return out;
+function credit(live: Live, response: acp.PromptResponse): void {
+  const usage = (response as { usage?: PromptUsage | null }).usage;
+  if (!usage) return;
+  const into = live.step?.output.usage ?? live.unbilled;
+  into.input += usage.inputTokens;
+  into.output += usage.outputTokens;
+  into.cacheRead += usage.cachedReadTokens ?? 0;
+  into.cacheWrite += usage.cachedWriteTokens ?? 0;
+  into.totalTokens += usage.totalTokens;
+  into.cost = calculateCost(live.model, into);
 }
 
 function finish(live: Live, response: acp.PromptResponse): void {
@@ -373,7 +376,6 @@ function finish(live: Live, response: acp.PromptResponse): void {
     void closeLive(live, "Antigravity ended the prompt before QM answered its tool calls");
     return;
   }
-  step.output.usage = usageOf(live.model, live.spent);
   if (response.stopReason === "end_turn") endStep(live, "stop");
   else if (response.stopReason === "max_tokens") endStep(live, "length");
   else {
@@ -398,20 +400,18 @@ function clientApp(target: () => Live) {
     .onRequest("session/request_permission", ({ params }) => {
       const live = target();
       const allow = params.options.find((option) => option.kind === "allow_once");
-      if (startsServedTool(live, params.toolCall) && allow)
-        return { outcome: { outcome: "selected", optionId: allow.optionId } };
-      fail(live, foreignTool(params.toolCall));
-      return { outcome: { outcome: "cancelled" } };
-    })
-    .onRequest("*", ({ method }) => {
+      const served = startsServedTool(live, params.toolCall);
+      if (served && allow) return { outcome: { outcome: "selected", optionId: allow.optionId } };
       fail(
-        target(),
-        new HarnessFailure(`Antigravity asked QM for ${method}, which QM does not offer; QM stopped the turn`, {
-          type: "permission_error",
-          code: "unsupported_request",
-        }),
+        live,
+        !served
+          ? foreignTool(params.toolCall)
+          : new HarnessFailure(
+              `Antigravity asked to run ${String((params.toolCall as { name?: unknown }).name)} without a one-time approval option (offered: ${params.options.map((option) => option.kind).join(", ")}); QM stopped the turn`,
+              { type: "permission_error", code: "no_allow_once" },
+            ),
       );
-      throw acp.RequestError.methodNotFound(method);
+      return { outcome: { outcome: "cancelled" } };
     });
 }
 
@@ -421,27 +421,32 @@ interface AntigravityConnection {
 }
 
 export function createAntigravityConnection(launch = launchAntigravity): AntigravityConnection {
-  let live: Live | undefined;
-  let connectionClosed = false;
-
-  const bindAbort = (target: Live, signal: AbortSignal | undefined) =>
-    onAbort(signal, () => void closeLive(target, "The run was aborted"));
+  const slot = harnessSlot<Live>("antigravity", closeLive, fail);
 
   const attach = (target: Live, step: Step, messages: readonly Message[], signal: AbortSignal | undefined) => {
     target.handedOut = [];
     if (target.failure) return abandon(step, target.failure, false);
     target.step = step;
-    bindAbort(target, signal);
+    step.output.usage = target.unbilled;
+    target.unbilled = zeroUsage();
+    slot.bindAbort(target, signal);
     for (const { kind, text } of target.backlog.splice(0)) append(step, kind, text);
     const tail = messages.slice(messages.findLastIndex((message) => message.role === "assistant") + 1);
-    for (const message of tail) {
-      if (message.role !== "toolResult") continue;
-      const call = target.awaiting.get(message.toolCallId);
-      target.awaiting.delete(message.toolCallId);
-      call?.settle(mcpResult(message));
-    }
     const steer = tail.flatMap((message) => (message.role === "user" ? userBlocks(message.content) : []));
-    if (steer.length) void prompt(target, steer);
+    const settle = () => {
+      for (const message of tail) {
+        if (message.role !== "toolResult") continue;
+        const call = target.awaiting.get(message.toolCallId);
+        target.awaiting.delete(message.toolCallId);
+        call?.settle(mcpResult(message));
+      }
+    };
+    if (!steer.length) settle();
+    else {
+      const superseded = target.prompting;
+      target.prompting = prompt(target, steer);
+      void superseded?.then(settle);
+    }
     handOut(target);
   };
 
@@ -452,10 +457,8 @@ export function createAntigravityConnection(launch = launchAntigravity): Antigra
     step: Step,
     signal: AbortSignal | undefined,
   ): Promise<void> => {
-    const previous = live;
-    live = undefined;
-    if (previous) await closeLive(previous, "Superseded by a new request");
-    if (connectionClosed) return abandon(step, new Error("QM ended the turn"), true);
+    await slot.supersede();
+    if (slot.closed) return abandon(step, new Error("QM ended the turn"), true);
     const proc = launch(profile);
     const secret = randomBytes(32).toString("base64url");
     const target: Live = {
@@ -470,17 +473,18 @@ export function createAntigravityConnection(launch = launchAntigravity): Antigra
       awaiting: new Map(),
       handedOut: [],
       prompts: 0,
-      spent: [],
+      unbilled: zeroUsage(),
       done: false,
       closed: false,
     };
-    live = target;
+    slot.adopt(target);
     target.http.on("request", toolServer(target, request.tools, secret));
     void proc.exited.then((how) => {
-      if (!target.closed && !target.done)
-        fail(target, new HarnessFailure(`Antigravity ${how} before the turn finished`, { type: "api_error" }));
+      if (target.closed || target.done) return;
+      const reason = target.dropped === undefined ? "" : ` (${errMessage(target.dropped)})`;
+      fail(target, new HarnessFailure(`Antigravity ${how} before the turn finished${reason}`, { type: "api_error" }));
     });
-    bindAbort(target, signal);
+    slot.bindAbort(target, signal);
     await new Promise<void>((resolve) => target.http.listen(0, "127.0.0.1", resolve));
     if (target.closed) return;
     const { port } = target.http.address() as AddressInfo;
@@ -491,7 +495,6 @@ export function createAntigravityConnection(launch = launchAntigravity): Antigra
       ),
     );
     const agent = target.connection.agent;
-    let sessionId: string;
     try {
       await agent.request("initialize", {
         protocolVersion: acp.PROTOCOL_VERSION,
@@ -509,7 +512,7 @@ export function createAntigravityConnection(launch = launchAntigravity): Antigra
         ],
         _meta: { antigravity: { systemPrompt: { append: request.system } } },
       });
-      sessionId = session.sessionId;
+      const sessionId = session.sessionId;
       await agent.request("session/set_config_option", { sessionId, configId: "model", value: request.model });
       if (request.thought_level)
         await agent.request("session/set_config_option", {
@@ -517,11 +520,11 @@ export function createAntigravityConnection(launch = launchAntigravity): Antigra
           configId: "thought_level",
           value: request.thought_level,
         });
+      target.sessionId = sessionId;
     } catch (error) {
       return lost(target, error);
     }
-    target.sessionId = sessionId;
-    if (!target.closed) await prompt(target, request.prompt);
+    if (!target.closed) await (target.prompting = prompt(target, request.messages[0].content));
   };
 
   return {
@@ -529,47 +532,38 @@ export function createAntigravityConnection(launch = launchAntigravity): Antigra
       const stream = createAssistantMessageEventStream();
       const step: Step = { stream, output: harnessOutput(model), started: false };
       const profile = options?.apiKey;
-      if (connectionClosed || !profile) {
-        const refusal = connectionClosed
-          ? new HarnessFailure("This model runtime has been closed", { type: "invalid_request_error" })
-          : new HarnessFailure("Antigravity serves only its owner's personal turns", {
-              type: "authentication_error",
-            });
-        queueMicrotask(() => abandon(step, refusal, false));
-        return stream;
-      }
-      const messages = context.messages;
-      const thought = options?.reasoning ? model.thinkingLevelMap?.[options.reasoning] : undefined;
-      const request: AntigravityRequest = {
-        model: antigravityServedModelId(model.id),
-        ...(thought ? { thought_level: thought } : {}),
-        system: context.systemPrompt ?? "",
-        prompt: promptBlocks(messages),
-        tools: (context.tools ?? []).map((tool) => ({
-          name: tool.name,
-          description: tool.description,
-          input_schema: tool.parameters,
-        })),
-      };
-      const continuing = continues(live, messages) ? live : undefined;
-      void (async () => {
-        const shaped = await options?.onPayload?.(request, model);
-        const sent = sendable(shaped === undefined ? request : shaped);
-        if (continuing) attach(continuing, step, messages, options?.signal);
-        else await start(model, sent, profile, step, options?.signal);
-      })().catch((error) => {
-        const failure = acpFailure(error);
-        if (live?.step === step) fail(live, failure);
-        else if (!step.output.errorMessage) abandon(step, failure, false);
-        else swallow("antigravity: failure after the step ended", failure);
-      });
+      const refusal = profile
+        ? undefined
+        : new HarnessFailure("The Antigravity route needs this instance's Antigravity login", {
+            type: "authentication_error",
+          });
+      slot.run(
+        step,
+        refusal,
+        async () => {
+          const messages = context.messages;
+          const thought = options?.reasoning ? model.thinkingLevelMap?.[options.reasoning] : undefined;
+          const request: AntigravityRequest = {
+            model: antigravityServedModelId(model.id),
+            ...(thought ? { thought_level: thought } : {}),
+            system: context.systemPrompt ?? "",
+            messages: [{ role: "user", content: promptBlocks(messages) }],
+            tools: (context.tools ?? []).map((tool) => ({
+              name: tool.name,
+              description: tool.description,
+              input_schema: tool.parameters,
+            })),
+          };
+          const continuing = continues(slot.current, messages) ? slot.current : undefined;
+          const shaped = await options?.onPayload?.(request, model);
+          const sent = sendable(shaped === undefined ? request : shaped);
+          if (continuing) attach(continuing, step, messages, options?.signal);
+          else await start(model, sent, profile!, step, options?.signal);
+        },
+        acpFailure,
+      );
       return stream;
     },
-    async close() {
-      connectionClosed = true;
-      const current = live;
-      live = undefined;
-      if (current) await closeLive(current, "QM ended the turn");
-    },
+    close: () => slot.close(),
   };
 }

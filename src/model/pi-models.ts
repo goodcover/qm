@@ -223,19 +223,17 @@ export function modelRequestOverrides(id: string): ModelEntry["request"] {
 }
 
 const ANTIGRAVITY_PREFIX = `${ANTIGRAVITY_PROVIDER}/`;
-const ANTIGRAVITY_MODELS = new Map([["gemini-4-neon", "Gemini 4 Neon (Antigravity)"]]);
-export const ANTIGRAVITY_MODEL_IDS = [...ANTIGRAVITY_MODELS.keys()].map((id) => ANTIGRAVITY_PREFIX + id);
 
 export function antigravityServedModelId(id: string): string {
   return id.slice(ANTIGRAVITY_PREFIX.length);
 }
 
 function antigravityModel(id: string): PiModel | undefined {
-  const name = id.startsWith(ANTIGRAVITY_PREFIX) ? ANTIGRAVITY_MODELS.get(antigravityServedModelId(id)) : undefined;
-  return name
+  const entry = id.startsWith(ANTIGRAVITY_PREFIX) ? REGISTRY_BY_ID.get(id) : undefined;
+  return entry
     ? {
         id,
-        name,
+        name: entry.name,
         api: ANTIGRAVITY_PROVIDER,
         provider: ANTIGRAVITY_PROVIDER,
         baseUrl: "",

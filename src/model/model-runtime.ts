@@ -140,8 +140,9 @@ export async function buildModelRuntime(
   const modelsPath = customModelsPath();
   const runtime = await ModelRuntime.create({ credentials, modelsPath });
   const claudeCode = createClaudeCodeConnection();
-  const antigravity = createAntigravityConnection();
-  runtime.registerProvider(ANTIGRAVITY_PROVIDER, { api: ANTIGRAVITY_PROVIDER, streamSimple: antigravity.streamSimple });
+  const antigravity = apiKeys[ANTIGRAVITY_PROVIDER] ? createAntigravityConnection() : undefined;
+  if (antigravity)
+    runtime.registerProvider(ANTIGRAVITY_PROVIDER, { api: ANTIGRAVITY_PROVIDER, streamSimple: antigravity.streamSimple });
   for (const [provider, apiKey] of Object.entries(apiKeys)) {
     if (apiKey) await runtime.setRuntimeApiKey(provider, apiKey, { allowNetwork: false });
   }
@@ -266,7 +267,6 @@ export async function buildModelRuntime(
   }) as typeof runtime.stream;
   const streamSimple = runtime.streamSimple.bind(runtime);
   runtime.streamSimple = ((model: Model<Api>, context: Context, options?: ModelsSimpleStreamOptions) => {
-    if (model.provider === ANTIGRAVITY_PROVIDER) return streamSimple(model, context, options);
     if (claudeCodeLogin && model.provider === "anthropic" && !modelGatewayRequest(modelGateway, model, purpose))
       return claudeCode.streamSimple(model, context, { ...retained(options), apiKey: claudeCodeLogin });
     const routed = route(model, options);
@@ -274,7 +274,7 @@ export async function buildModelRuntime(
   }) as typeof runtime.streamSimple;
   return Object.assign(runtime, {
     close: async () => {
-      await Promise.all([claudeCode.close(), antigravity.close()]);
+      await Promise.all([claudeCode.close(), antigravity?.close()]);
     },
   });
 }

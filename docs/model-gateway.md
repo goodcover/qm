@@ -24,8 +24,8 @@ The browse skill follows the user's saved AI access and default model. Company
 access uses the configured model gateway, or the deployment's default provider
 credentials when no gateway is configured; ChatGPT access uses the user's connected
 OpenAI account, including refreshed subscription access; Claude access supports
-API keys. Claude subscription and Antigravity access are unavailable for the inner
-browser agent and return an actionable error. No account silently falls back to another.
+API keys. Claude subscription access and models served through Antigravity are
+unavailable for the inner browser agent and return an actionable error. No account silently falls back to another.
 Kernel, Anchor, Browserbase and Browser Use still use their own credentials for browser sessions.
 
 Core gives internal, non-strict turns a one-hour capability bound to the account,

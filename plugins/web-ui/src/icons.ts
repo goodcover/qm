@@ -10,6 +10,7 @@ const OPENAI_MARK =
 
 const MARK_KEYS: Record<string, "claude" | "gemini" | "openai"> = {
   anthropic: "claude",
+  antigravity: "gemini",
   google: "gemini",
   gemini: "gemini",
   claude: "claude",

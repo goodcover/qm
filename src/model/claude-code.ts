@@ -43,7 +43,7 @@ import { adjustMaxTokensForThinking, clampMaxTokensToContext } from "@earendil-w
 import { transformMessages } from "@earendil-works/pi-ai/api/transform-messages";
 import { MAX_TOOL_RESULT_CHARS } from "../agent/agent-tools/record.ts";
 import { hashId } from "../util/crypto.ts";
-import { asError, errMessage, swallow } from "../util/errors.ts";
+import { errMessage, swallow } from "../util/errors.ts";
 import { isClaudeSubscriptionToken } from "./claude-subscription.ts";
 import {
   answersToolCalls,
@@ -51,9 +51,11 @@ import {
   finishStep,
   HarnessFailure,
   harnessOutput,
+  closeOnce,
+  harnessSlot,
   mcpResult,
-  onAbort,
   qmToolServer,
+  refuseUnsent,
   RESUMED_AT_TOOL_RESULTS,
   startStep,
   type ServedTool,
@@ -297,10 +299,7 @@ function sendable(value: unknown): ClaudeCodeRequest {
       .filter((key) => key !== "effort")
       .map((key) => `output_config.${key}`),
   ];
-  if (unsent.length)
-    throw new HarnessFailure(`Claude Code cannot send request fields QM's request hook set: ${unsent.join(", ")}`, {
-      type: "invalid_request_error",
-    });
+  refuseUnsent("Claude Code", unsent);
   return servedToolChoice(request as ClaudeCodeRequest);
 }
 
@@ -772,12 +771,10 @@ async function teardown(live: Live, reason: string): Promise<void> {
 }
 
 function closeLive(live: Live, reason: string): Promise<void> {
-  live.closing ??= teardown(live, reason);
-  return live.closing;
+  return closeOnce(live, reason, teardown);
 }
 
-function refusalFor(closed: boolean, token: string | undefined): HarnessFailure | undefined {
-  if (closed) return new HarnessFailure("This model runtime has been closed", { type: "invalid_request_error" });
+function refusalFor(token: string | undefined): HarnessFailure | undefined {
   if (!isClaudeSubscriptionToken(token))
     return new HarnessFailure(
       "Claude Code serves only a Claude subscription OAuth token; this route never uses a metered API key",
@@ -792,11 +789,7 @@ function continues(live: Live | undefined, messages: readonly Message[]): live i
 }
 
 export function createClaudeCodeConnection(): ClaudeCodeConnection {
-  let live: Live | undefined;
-  let connectionClosed = false;
-
-  const bindAbort = (target: Live, signal: AbortSignal | undefined) =>
-    onAbort(signal, () => void closeLive(target, "The run was aborted"));
+  const slot = harnessSlot<Live>("claude-code", closeLive, fail);
 
   const attach = (
     target: Live,
@@ -812,7 +805,7 @@ export function createClaudeCodeConnection(): ClaudeCodeConnection {
     }
     const tail = messages.slice(messages.findLastIndex((message) => message.role === "assistant") + 1);
     target.step = step;
-    bindAbort(target, signal);
+    slot.bindAbort(target, signal);
     const steer = lastUserBlocks(request.messages).filter((block) => block.type !== "tool_result");
     if (steer.length) target.input.push(userMessage(steer));
     for (const message of tail)
@@ -826,9 +819,7 @@ export function createClaudeCodeConnection(): ClaudeCodeConnection {
     step: Step,
     streamOptions: SimpleStreamOptions | undefined,
   ): Promise<void> => {
-    const previous = live;
-    live = undefined;
-    if (previous) await closeLive(previous, "Superseded by a new request");
+    await slot.supersede();
     const lost = unservable(request.tools);
     if (lost.length)
       throw new HarnessFailure(`Claude Code cannot receive these QM tools: ${lost.join("; ")}`, {
@@ -860,8 +851,8 @@ export function createClaudeCodeConnection(): ClaudeCodeConnection {
       closed: false,
       finished: false,
     };
-    live = target;
-    bindAbort(target, streamOptions?.signal);
+    slot.adopt(target);
+    slot.bindAbort(target, streamOptions?.signal);
     if (target.closed) return;
     const { history, prompt } = splitPrompt(request.messages);
     const sessionId = target.session;
@@ -898,7 +889,7 @@ export function createClaudeCodeConnection(): ClaudeCodeConnection {
       ...wire.options,
       spawnClaudeCodeProcess: spawnTracked(target),
     };
-    if (target.closed || connectionClosed) return closeLive(target, "QM ended the turn");
+    if (target.closed || slot.closed) return closeLive(target, "QM ended the turn");
     target.query = sdk.query({ prompt: target.input, options });
     try {
       if (await appliesUnconfiguredSettings(target.query))
@@ -925,25 +916,20 @@ export function createClaudeCodeConnection(): ClaudeCodeConnection {
       const stream = createAssistantMessageEventStream();
       const step = newStep(stream, model);
       const token = options?.apiKey;
-      const refusal = refusalFor(connectionClosed, token);
-      if (refusal) {
-        queueMicrotask(() => failStep(step, refusal, false));
-        return stream;
-      }
-      const messages = transformMessages(context.messages, model, toolCallId);
-      const request: ClaudeCodeRequest = {
-        model: model.id,
-        system: (context.systemPrompt ?? "").toWellFormed(),
-        messages: claudeCodeTranscript(messages),
-        tools: (context.tools ?? []).map((tool) => ({
-          name: TOOL_PREFIX + tool.name,
-          description: tool.description,
-          input_schema: tool.parameters,
-        })),
-        ...thinkingFor(model, context, options),
-      };
-      const continuing = continues(live, messages) ? live : undefined;
-      void (async () => {
+      slot.run(step, refusalFor(token), async () => {
+        const messages = transformMessages(context.messages, model, toolCallId);
+        const request: ClaudeCodeRequest = {
+          model: model.id,
+          system: (context.systemPrompt ?? "").toWellFormed(),
+          messages: claudeCodeTranscript(messages),
+          tools: (context.tools ?? []).map((tool) => ({
+            name: TOOL_PREFIX + tool.name,
+            description: tool.description,
+            input_schema: tool.parameters,
+          })),
+          ...thinkingFor(model, context, options),
+        };
+        const continuing = continues(slot.current, messages) ? slot.current : undefined;
         const shaped = await options?.onPayload?.(request, model);
         const sent = sendable(shaped === undefined ? request : shaped);
         if (sent.speed === "fast")
@@ -954,19 +940,9 @@ export function createClaudeCodeConnection(): ClaudeCodeConnection {
         if (continuing && JSON.stringify(continuing.toolChoice) === JSON.stringify(sent.tool_choice))
           attach(continuing, step, sent, messages, options?.signal);
         else await start(model, sent, token!, step, options);
-      })().catch((error) => {
-        const failure = asError(error);
-        if (live?.step === step) fail(live, failure);
-        else if (!step.output.errorMessage) failStep(step, failure, false);
-        else swallow("claude-code: failure after the step ended", failure);
       });
       return stream;
     },
-    async close() {
-      connectionClosed = true;
-      const current = live;
-      live = undefined;
-      if (current) await closeLive(current, "QM ended the turn");
-    },
+    close: () => slot.close(),
   };
 }

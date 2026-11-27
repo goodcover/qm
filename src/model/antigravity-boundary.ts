@@ -7,17 +7,9 @@ import { errMessage, swallow } from "../util/errors.ts";
 export const ANTIGRAVITY_MCP_SERVER = "qm";
 export const ANTIGRAVITY_WORKSPACE = "/work";
 const AGENT = "qm";
-const BWRAP = "/usr/bin/bwrap";
 const SANDBOX_HOME = "/home/agy";
-const GLIBC = [
-  "ld-linux-x86-64.so.2",
-  "libc.so.6",
-  "libdl.so.2",
-  "libm.so.6",
-  "libpthread.so.0",
-  "libresolv.so.2",
-  "librt.so.1",
-];
+const HOST_LIBRARIES = ["/lib", "/lib64", "/usr/lib", "/usr/lib64"];
+const HOST_FILES = ["/etc/resolv.conf", "/etc/hosts", "/etc/ssl", "/etc/pki", "/etc/ca-certificates"];
 
 const AGENT_DEFINITION = `---
 name: ${AGENT}
@@ -39,23 +31,15 @@ export interface AntigravityProcess {
   exited: Promise<string>;
 }
 
-function antigravityCli(): string {
-  return join(homedir(), ".local", "bin", "agy");
-}
-
-export function antigravityProfile(): string {
-  return join(homedir(), ".local", "share", "qm-antigravity", "profile");
-}
-
 function assertOwnerOnlyProfile(profile: string): void {
   const stat = lstatSync(profile);
   if (!stat.isDirectory() || stat.uid !== process.getuid?.() || (stat.mode & 0o777) !== 0o700)
     throw new Error(
-      `The Antigravity profile ${profile} must be a directory, not a symbolic link, owned by this user with mode 700`,
+      "ANTIGRAVITY_PROFILE must be a directory, not a symbolic link, owned by the user running core with mode 700",
     );
 }
 
-function boundaryArgs(profile: string, workspace: string): string[] {
+function boundaryArgs(cli: string, profile: string, workspace: string): string[] {
   return [
     "--unshare-user",
     "--unshare-pid",
@@ -71,38 +55,24 @@ function boundaryArgs(profile: string, workspace: string): string[] {
     "HOME",
     SANDBOX_HOME,
     "--setenv",
-    "XDG_CONFIG_HOME",
-    `${SANDBOX_HOME}/.config`,
-    "--setenv",
     "PATH",
     "/bin",
     "--setenv",
     "LANG",
     "C.UTF-8",
     "--ro-bind",
-    antigravityCli(),
+    cli,
     "/bin/agy",
-    "--symlink",
-    "usr/lib64",
-    "/lib64",
-    ...GLIBC.flatMap((lib) => ["--ro-bind", `/usr/lib64/${lib}`, `/usr/lib64/${lib}`]),
-    "--ro-bind-try",
-    "/etc/resolv.conf",
-    "/etc/resolv.conf",
-    "--ro-bind-try",
-    "/etc/hosts",
-    "/etc/hosts",
-    "--ro-bind",
-    "/etc/ssl/certs/ca-bundle.crt",
-    "/etc/ssl/certs/ca-bundle.crt",
+    ...[...HOST_LIBRARIES, ...HOST_FILES].flatMap((path) => ["--ro-bind-try", path, path]),
     "--dev",
     "/dev",
     "--tmpfs",
     "/tmp",
     "--proc",
     "/proc",
-    "--bind",
+    "--overlay-src",
     profile,
+    "--tmp-overlay",
     SANDBOX_HOME,
     "--ro-bind",
     workspace,
@@ -112,28 +82,32 @@ function boundaryArgs(profile: string, workspace: string): string[] {
   ];
 }
 
+export function processExit(child: ChildProcessWithoutNullStreams, cleanup: () => void): Promise<string> {
+  return new Promise<string>((resolve) => {
+    const done = (how: string) => {
+      cleanup();
+      resolve(how);
+    };
+    child.once("exit", (code, signal) => done(signal ? `was killed by ${signal}` : `exited with code ${code}`));
+    child.once("error", (error) => {
+      if (child.pid === undefined) done(`could not start: ${errMessage(error)}`);
+      else swallow("antigravity: the boundary process reported an error", error);
+    });
+  });
+}
+
 export function launchAntigravity(profile: string): AntigravityProcess {
   assertOwnerOnlyProfile(profile);
+  const cli = join(homedir(), ".local", "bin", "agy");
   const workspace = mkdtempSync(join(tmpdir(), "qm-antigravity-"));
   const agents = join(workspace, ".agents", "agents");
   mkdirSync(agents, { recursive: true });
   writeFileSync(join(agents, `${AGENT}.md`), AGENT_DEFINITION);
   const child = spawn(
-    BWRAP,
-    [...boundaryArgs(profile, workspace), "--", "/bin/agy", "acp", "--disable-telemetry", "--agent", AGENT],
-    { stdio: ["pipe", "pipe", "pipe"], env: {} },
+    "bwrap",
+    [...boundaryArgs(cli, profile, workspace), "--", "/bin/agy", "acp", "--disable-telemetry", "--agent", AGENT],
+    { stdio: ["pipe", "pipe", "pipe"] },
   );
   child.stderr.on("data", (data: Buffer) => console.error(`[antigravity] ${data.toString().trimEnd()}`));
-  const exited = new Promise<string>((resolve) => {
-    const done = (how: string) => {
-      rmSync(workspace, { recursive: true, force: true });
-      resolve(how);
-    };
-    child.once("exit", (code, signal) => done(signal ? `was killed by ${signal}` : `exited with code ${code}`));
-    child.once("error", (error) => {
-      if (child.pid === undefined) done(`could not start ${BWRAP}: ${errMessage(error)}`);
-      else swallow("antigravity: the boundary process reported an error", error);
-    });
-  });
-  return { child, exited };
+  return { child, exited: processExit(child, () => rmSync(workspace, { recursive: true, force: true })) };
 }

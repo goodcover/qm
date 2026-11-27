@@ -1,28 +1,30 @@
-# Antigravity personal route
+# Antigravity model login
 
-A QM core running on its owner's own Linux workstation can serve that person's turns through Google's Antigravity CLI (`agy`), using the Antigravity login already on the machine. It is a personal route only: no teammate, organization default, fallback, browser agent or automated turn reaches it.
+A QM instance can serve Gemini through Google's Antigravity CLI (`agy`), the way it serves Claude through a company Claude subscription. One Google login, signed in once on the core host, serves every authorized company-model user who selects Gemini 4 Neon. Only the model login is shared. Each turn keeps its own QM identity, scope, credentials, approvals and tools.
 
 ## Setup
 
-1. Install `agy` at `~/.local/bin/agy` for the user that runs core, and install bubblewrap at `/usr/bin/bwrap`. The boundary binds the glibc libraries from `/usr/lib64` and the CA bundle at `/etc/ssl/certs/ca-bundle.crt`, the Fedora layout.
-2. Sign in once with `agy acp --disable-telemetry --login`, run inside a bubblewrap boundary whose `HOME` is `~/.local/share/qm-antigravity/profile`. That directory must be owned by the same user, with mode `700`, and must not be a symbolic link.
-3. Start core with `ANTIGRAVITY_OWNER` set to the owner's QM principal id.
-4. The owner sets their AI access to a personal account (`POST /v1/user-model-auth/account` with `{"account":"personal"}`). In their personal scope, the runtime listing then offers `antigravity/gemini-4-neon`. When the Antigravity login is the owner's only personal login, it also serves their turns that name no model.
+1. Make sure your Google plan allows this login to serve more than one person. That is a rollout prerequisite, not something QM checks.
+2. On the core host, install `agy` at `~/.local/bin/agy` (the installer's default) for the user that runs core, and install bubblewrap (`bwrap`) on `PATH`.
+3. Sign in once into a dedicated profile directory, for example by running `agy acp --disable-telemetry --login` inside bubblewrap with `HOME` set to that directory. Don't use the profile interactively; its own history is visible to agy, though not to the model. It must be owned by the core user, mode `700`, and not a symbolic link.
+4. Start core with `ANTIGRAVITY_PROFILE` set to that directory's absolute path.
 
-QM never reads, copies or stores the Antigravity login. It only mounts the profile as the CLI's home inside the boundary.
+Gemini 4 Neon (`antigravity/gemini-4-neon`) then appears wherever company models do. The organization's model allowlist and defaults apply as for any other company model, and the default model does not change. People on a personal AI account do not get it. The inner browser agent refuses it, as it refuses Claude subscription access.
+
+QM never reads, copies or stores the login. It mounts the profile read-only.
 
 ## What a turn does
 
-Each turn starts `agy acp` inside bubblewrap. The CLI sees only its own binary, a few glibc libraries, DNS and CA files, a private `/tmp`, the profile as `HOME` and a read-only `/work`. There is no shell and no view of the host's home directory. `/work` holds one fixed custom agent definition. It drops Antigravity's default prompt and its file, command, web and subagent tools, and allows only QM's MCP server. Antigravity still adds its inert `list_resources`, `read_resource` and `manage_task` tools. The network namespace is shared with the host, because the CLI reaches Google directly.
+Each turn starts its own `agy acp` inside bubblewrap. The CLI sees its binary, the host's libraries, DNS and CA files, a private `/tmp`, a read-only `/work`, and the profile as `HOME`. The profile is the lower layer of an overlay whose writes go to a tmpfs that disappears with the turn. Concurrent turns and later turns never see each other's Antigravity conversations, artifacts or refreshed tokens, and the profile itself is never written. There is no shell and no view of the host's home directory.
 
-QM's system prompt goes to the session through the Antigravity system prompt extension in `session/new`. QM's transcript goes in the first prompt. QM serves the turn's tools from a loopback MCP server. Each turn's server has a random port and bearer secret, and both die with the turn. When Antigravity calls a tool, QM hands the call to its own agent loop, so the usual approvals and policies apply. QM then returns the result to Antigravity's waiting MCP request.
+`/work` holds one fixed custom agent definition. It drops Antigravity's default prompt and its file, command, web and subagent tools, and allows only QM's MCP server. Antigravity still adds its inert `list_resources`, `read_resource` and `manage_task` tools. The network namespace is shared with the host, because the CLI reaches Google directly.
 
-QM approves Antigravity's permission prompts only for the tools it serves. Any other tool start, permission prompt or client request ends the turn and kills the process, and so does an aborted run. If the process dies, the turn reports its exit code or signal. Usage is reported at the end of each prompt and priced at zero, since the owner's Antigravity plan pays for it.
+QM's system prompt goes to the session through the Antigravity system prompt extension in `session/new`. QM's transcript goes in the first prompt, together with any documents, as text. QM serves the turn's tools from a loopback MCP server with a random port and bearer secret, and both die with the turn. When Antigravity calls a tool, QM hands the call to its own agent loop for the person whose turn it is, so that person's approvals, credentials and policies apply. QM then returns the result to Antigravity's waiting MCP request. A message that steers a running turn goes into the live session.
+
+QM approves Antigravity's permission prompts only for the tools it serves. Any other tool start or permission prompt ends the turn and kills the process, and so does an aborted run. If the process dies, the turn reports its exit status. Usage is reported per prompt and priced at zero, since the Google plan pays for it.
 
 ## Limits
 
-- Each turn starts a new Antigravity session. Earlier turns arrive as text in the first prompt, so they are not read from Antigravity's prompt cache.
-- A message that steers a running turn restarts the session from QM's transcript.
-- Each turn leaves an Antigravity conversation in the owner's profile.
+- Each turn starts a new Antigravity session, so earlier turns are not read from Antigravity's prompt cache.
 - A QM tool that runs longer than Antigravity's MCP request timeout makes Antigravity give up on the call. QM then restarts the turn from its own transcript.
-- Images in earlier turns are shown as `[image]`. Document inputs are refused.
+- Images in earlier turns are shown as `[image]`.

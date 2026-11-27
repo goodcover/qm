@@ -2,6 +2,8 @@ import { loadPersonalModelAuth } from "../../core/individual-auth-routing.ts";
 import { BrowserCompletionError, completeBrowserRequest } from "../../model/browser-completion.ts";
 import { BROWSER_MODEL_AUD } from "../../auth/capability-token.ts";
 import { routeLabel } from "../../model/model-route.ts";
+import { modelDisplayName } from "../../model/pi-models.ts";
+import { ANTIGRAVITY_PROVIDER } from "../../model/provider-endpoints.ts";
 import { errMessage, reportFailure } from "../../util/errors.ts";
 import { sendJson } from "../http.ts";
 import type { ApiCtx, Route } from "./route.ts";
@@ -56,11 +58,14 @@ async function browserModel(ctx: ApiCtx): Promise<void> {
       runtime: { modelId: capability.browserModel },
       ...(personal ? { providerKeys: personal.keys } : {}),
     });
-    const companyClaudeCode = deps.companySubscriptionAuth === "anthropic" && route.model.provider === "anthropic";
-    const cliHarness = personal ? personal.subscription : companyClaudeCode && "anthropic";
-    if (cliHarness === "anthropic" || cliHarness === "antigravity")
+    const claudeSubscription = personal
+      ? personal.subscription === "anthropic"
+      : deps.companySubscriptionAuth === "anthropic" && route.model.provider === "anthropic";
+    if (claudeSubscription || route.model.provider === ANTIGRAVITY_PROVIDER)
       return sendJson(res, 422, {
-        error: `${cliHarness === "anthropic" ? "Claude subscription" : "Antigravity"} access does not support the browser agent. Choose company access, ChatGPT, or a Claude API key in Settings.`,
+        error: claudeSubscription
+          ? "Claude subscription access does not support the browser agent. Choose company access, ChatGPT, or a Claude API key in Settings."
+          : `${modelDisplayName(route.modelId)} does not support the browser agent. Choose another model for this conversation.`,
       });
     if (!deps.modelRoutes.servable(route))
       return sendJson(res, 503, { error: `${routeLabel(route)} has no credential` });

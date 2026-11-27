@@ -4,6 +4,7 @@ import { test } from "node:test";
 import { Type } from "typebox";
 import type { AssistantMessage, Message, ToolCall } from "@earendil-works/pi-ai";
 import { createAntigravityConnection } from "../src/model/antigravity.ts";
+import { processExit } from "../src/model/antigravity-boundary.ts";
 import { resolveModel } from "../src/model/pi-models.ts";
 
 const model = resolveModel("antigravity/gemini-4-neon")!;
@@ -13,10 +14,7 @@ function fakeAntigravity(script: string, pids: number[] = []) {
   return () => {
     const child = spawn(process.execPath, ["test/support/fake-antigravity.ts", script]);
     pids.push(child.pid!);
-    const exited = new Promise<string>((resolve) =>
-      child.once("exit", (code, signal) => resolve(signal ? `was killed by ${signal}` : `exited with code ${code}`)),
-    );
-    return { child, exited };
+    return { child, exited: processExit(child, () => undefined) };
   };
 }
 
@@ -56,7 +54,7 @@ test("an Antigravity tool call is handed to QM and QM's result reaches Antigravi
   await connection.close();
 });
 
-test("Antigravity fails closed on a tool QM does not serve and on a turn without the owner's login", async () => {
+test("Antigravity fails closed on a tool QM does not serve, reports its exit, and refuses a turn without the instance login", async () => {
   const pids: number[] = [];
   const connection = createAntigravityConnection(fakeAntigravity("foreign", pids));
   const failed = await ask(connection, [user]).result();
@@ -71,7 +69,7 @@ test("Antigravity fails closed on a tool QM does not serve and on a turn without
   const refused = await createAntigravityConnection(fakeAntigravity("tool"))
     .streamSimple(model, { messages: [user] })
     .result();
-  assert.match(refused.errorMessage!, /only its owner's personal turns/);
+  assert.match(refused.errorMessage!, /needs this instance's Antigravity login/);
 });
 
 test("aborting the run kills Antigravity", async () => {

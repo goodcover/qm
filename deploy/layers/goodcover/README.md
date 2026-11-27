@@ -113,10 +113,10 @@ or token re-entry. Ops owns the release's immutable image pins and rollout recor
   a sandbox CSP, and can make authenticated same-origin requests as the viewer.
   Upstream's documentation of sandboxed proxied HTML, including `docs/porter.md`,
   does not apply to this fork.
-- **Personal Antigravity route.** A core running on its owner's workstation can serve
-  that person's turns through the Antigravity CLI inside bubblewrap; see
-  [`docs/antigravity.md`](../../../docs/antigravity.md). The route is off unless
-  `ANTIGRAVITY_OWNER` is set.
+- **Antigravity model login.** One opt-in Google login served through the Antigravity CLI
+  inside bubblewrap gives company-model users Gemini 4 Neon; see
+  [`docs/antigravity.md`](../../../docs/antigravity.md). It is off unless
+  `ANTIGRAVITY_PROFILE` is set.
 - **No age-based credential sweep.** Upstream deletes command credential directories
   in `/tmp` after two hours. Goodcover removed that sweep because it could delete the
   credentials of a command still running. A directory left behind by a crash remains

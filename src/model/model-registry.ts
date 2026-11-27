@@ -318,6 +318,7 @@ export const MODEL_REGISTRY: readonly ModelEntry[] = [
     },
   },
   { id: "openrouter/auto", name: "OpenRouter Auto", fastMode: false, base: true },
+  { id: "antigravity/gemini-4-neon", name: "Gemini 4 Neon", fastMode: false, base: true },
   { id: "claude-opus-4-7", name: "Claude Opus 4.7", fastMode: false, base: false },
   { id: "claude-opus-4-6", name: "Claude Opus 4.6", fastMode: false, base: false },
 ];

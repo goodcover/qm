@@ -4,7 +4,6 @@ import { mock, test } from "node:test";
 import * as agentRun from "../src/agent/agent-run.ts";
 import * as mockAgent from "./support/mock-agent.ts";
 import type { AgentTurnInput } from "../src/agent/agent.ts";
-import { antigravityProfile } from "../src/model/antigravity-boundary.ts";
 import { resolveModel } from "../src/model/pi-models.ts";
 import { testConfig } from "./support/test-config.ts";
 import { COMPANY_CHATGPT_CREDENTIAL, saveCompanyChatGPTLogin } from "./support/company-chatgpt-login.ts";
@@ -257,32 +256,43 @@ test("a company ChatGPT login feeds pi's subscription provider while personal Ch
   }
 });
 
-test("an Antigravity login reaches only its owner's personal turns, as the default when it is their only login", async () => {
+test("the instance's Antigravity login serves company users who select Neon, never a personal account or an unconfigured instance", async (t) => {
   turns.length = 0;
-  const built = buildApp(testConfig({ antigravityOwner: "U1" }));
-  for (const user of ["U1", "U2"]) await built.config.setPersonalModelAuth(user, true);
-  const submit = (user: string, surface: "web" | "slack") =>
+  const neon = "antigravity/gemini-4-neon";
+  const submit = (built: ReturnType<typeof buildApp>, user: string) =>
     built.app.turn({
-      surface,
+      surface: "web",
       actor: { externalId: user },
-      conversation: { kind: "dm", threadRef: `${surface}:${user}:antigravity` },
+      conversation: { kind: "dm", threadRef: `web:${user}:neon` },
       text: "hello",
       origin: { kind: "human" },
       async: true,
-      ...(surface === "web" ? { model: "antigravity/gemini-4-neon" } : {}),
+      model: neon,
     });
-  const owner = [await submit("U1", "web"), await submit("U1", "slack")];
-  assert.deepEqual(await submit("U2", "web"), {
+  const unconfigured = buildApp(testConfig({ anthropicApiKey: "company-anthropic" }));
+  t.after(() => unconfigured.runtime.stop());
+  assert.deepEqual(await submit(unconfigured, "U1"), {
     status: "refused",
-    reason: "Your connected AI account cannot serve this model.",
+    reason: "that model isn't available on this deployment (its provider isn't configured)",
   });
+  const built = buildApp(testConfig({ anthropicApiKey: "company-anthropic", antigravityProfile: "/srv/agy-profile" }));
+  await built.userModelCredentials.setApiKey("U3", "anthropic", "personal-anthropic");
+  await built.config.setPersonalModelAuth("U3", true);
+  const company = [await submit(built, "U1"), await submit(built, "U2")];
+  assert.equal((await submit(built, "U3")).status, "refused");
   built.runtime.start();
   try {
-    for (const run of owner) assert.equal((await built.runs.waitFor(run.runId!, 5_000)).status, "done");
+    for (const run of company) assert.equal((await built.runs.waitFor(run.runId!, 5_000)).status, "done");
     assert.deepEqual(
       turns.map((turn) => [turn.runtime?.modelId, turn.providerKeys]),
-      owner.map(() => ["antigravity/gemini-4-neon", { antigravity: antigravityProfile() }]),
+      [
+        [neon, undefined],
+        [neon, undefined],
+      ],
     );
+    const route = await piOptions!.routes!.route(neon);
+    assert.equal(route.keys.antigravity, "/srv/agy-profile");
+    assert.equal(route.billing, "org_subscription");
   } finally {
     await built.runtime.stop();
   }

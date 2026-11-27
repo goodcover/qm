@@ -197,3 +197,16 @@ test("a company ChatGPT subscription serves company browsing without an API-key 
   assert.equal(calls[0]?.host, "chatgpt.com");
   assert.equal(calls[0]?.headers.get("authorization"), `Bearer ${chatgptToken}`);
 });
+
+test("the browser agent refuses Gemini 4 Neon instead of sending it to Antigravity", async (t) => {
+  const { calls, post } = await browserEndpoint(t, () => anthropicToolResult({ done: true }), {
+    antigravityProfile: "/srv/agy-profile",
+  });
+  const refused = await post(
+    { browserAccount: "company", browserModel: "antigravity/gemini-4-neon" },
+    { ...structuredRequest, model: "antigravity/gemini-4-neon" },
+  );
+  assert.equal(refused.status, 422);
+  assert.match(await refused.text(), /Gemini 4 Neon does not support the browser agent/);
+  assert.equal(calls.length, 0);
+});

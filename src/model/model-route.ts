@@ -1,5 +1,10 @@
 import type { Api, Model } from "@earendil-works/pi-ai";
-import { modelGatewayRequest, providerBaseUrl, type ModelGatewayTransportConfig } from "./provider-endpoints.ts";
+import {
+  ANTIGRAVITY_PROVIDER,
+  modelGatewayRequest,
+  providerBaseUrl,
+  type ModelGatewayTransportConfig,
+} from "./provider-endpoints.ts";
 import type { ProviderKeys } from "./model-runtime.ts";
 import {
   auxiliaryModelFor,
@@ -50,6 +55,7 @@ export function companyRouteKeys(keys: ProviderKeys): ProviderKeys {
 function servedBySubscription(model: Model<Api>, keys: ProviderKeys): boolean {
   return (
     model.provider === CODEX_SUBSCRIPTION_PROVIDER ||
+    model.provider === ANTIGRAVITY_PROVIDER ||
     (model.provider === "anthropic" && isClaudeSubscriptionToken(keys.anthropic))
   );
 }

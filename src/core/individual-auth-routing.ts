@@ -1,5 +1,4 @@
 import {
-  ANTIGRAVITY_MODEL_IDS,
   codexSubscriptionModelId,
   CODEX_SUBSCRIPTION_PROVIDER,
   DEFAULT_AGENT_MODEL_ID,
@@ -11,33 +10,22 @@ import {
   modelUnavailableReason,
   modelRequestOverrides,
 } from "../model/pi-models.ts";
-import { ANTIGRAVITY_PROVIDER, type ModelProvider } from "../model/provider-endpoints.ts";
+import type { ModelProvider } from "../model/provider-endpoints.ts";
 import type { UserModelCredential, UserModelCredentialStore } from "../model/user-model-credential-store.ts";
 import type { ProviderKeys } from "../model/model-runtime.ts";
 
 export type IndividualAuthRouting =
   | { kind: "apikey"; provider: ModelProvider; model: string | undefined; apiKey: string }
   | { kind: "oauth"; provider: "anthropic" | "openai"; model: string }
-  | { kind: "local"; provider: typeof ANTIGRAVITY_PROVIDER; model: string; profile: string }
   | null;
 
 export function resolveIndividualAuthRouting(
   anthCred: UserModelCredential | null,
   oaiCred: UserModelCredential | null,
   requestedModel: string | undefined,
-  agyCred: UserModelCredential | null = null,
 ): IndividualAuthRouting {
   if (requestedModel && (modelUnavailableReason(requestedModel) || !resolveModel(requestedModel))) return null;
   const rawProvider = requestedModel ? resolveModel(requestedModel)?.provider : undefined;
-  if (rawProvider === ANTIGRAVITY_PROVIDER || (!anthCred && !oaiCred))
-    return agyCred?.profile
-      ? {
-          kind: "local",
-          provider: ANTIGRAVITY_PROVIDER,
-          model: rawProvider === ANTIGRAVITY_PROVIDER ? requestedModel! : ANTIGRAVITY_MODEL_IDS[0]!,
-          profile: agyCred.profile,
-        }
-      : null;
   const requestedProvider = rawProvider === CODEX_SUBSCRIPTION_PROVIDER ? "openai" : rawProvider;
   const pick = ((): { provider: "anthropic" | "openai"; cred: UserModelCredential } | null => {
     if (requestedProvider === "anthropic" && anthCred) return { provider: "anthropic", cred: anthCred };
@@ -94,17 +82,12 @@ export async function loadPersonalModelAuth(
   actorId: string,
   account: string,
   requestedModel: string | undefined,
-): Promise<
-  { keys: ProviderKeys; modelId: string | undefined; subscription?: "anthropic" | "openai" | "antigravity" } | undefined
-> {
-  const [anthCred, oaiCred, agyCred] = await Promise.all([
+): Promise<{ keys: ProviderKeys; modelId: string | undefined; subscription?: "anthropic" | "openai" } | undefined> {
+  const [anthCred, oaiCred] = await Promise.all([
     account === "openai" ? null : credentials.get(actorId, "anthropic"),
     account === "anthropic" ? null : credentials.get(actorId, "openai"),
-    account === "personal" ? credentials.get(actorId, ANTIGRAVITY_PROVIDER) : null,
   ]);
-  const routing = resolveIndividualAuthRouting(anthCred ?? null, oaiCred ?? null, requestedModel, agyCred ?? null);
-  if (routing?.kind === "local")
-    return { keys: { [ANTIGRAVITY_PROVIDER]: routing.profile }, modelId: routing.model, subscription: "antigravity" };
+  const routing = resolveIndividualAuthRouting(anthCred ?? null, oaiCred ?? null, requestedModel);
   if (routing?.kind === "apikey") return { keys: { [routing.provider]: routing.apiKey }, modelId: routing.model };
   if (routing?.kind !== "oauth") return undefined;
   const derived = await credentials.derivedOAuth(actorId, routing.provider);

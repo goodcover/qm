@@ -1,9 +1,7 @@
 import type { DerivedOAuthAuth, Keychain } from "../credentials/keychain.ts";
-import { antigravityProfile } from "./antigravity-boundary.ts";
-import { ANTIGRAVITY_PROVIDER, MODEL_PROVIDERS, type ModelProvider } from "./provider-endpoints.ts";
+import { MODEL_PROVIDERS, type ModelProvider } from "./provider-endpoints.ts";
 
-type UserCredentialKind = "apikey" | "oauth" | "local";
-type PersonalProvider = ModelProvider | typeof ANTIGRAVITY_PROVIDER;
+type UserCredentialKind = "apikey" | "oauth";
 
 export interface UserOAuthTokens {
   accessToken: string;
@@ -14,21 +12,20 @@ export interface UserOAuthTokens {
 }
 
 export interface UserModelCredential {
-  provider: PersonalProvider;
+  provider: ModelProvider;
   kind: UserCredentialKind;
   apiKey?: string;
-  profile?: string;
   oauth?: { accountId?: string; expiresAt?: number; needsReconnect?: boolean };
   updatedAt: number;
 }
 
 interface UserCredentialConnection {
-  provider: PersonalProvider;
+  provider: ModelProvider;
   kind: UserCredentialKind;
 }
 
 export interface UserModelCredentialStore {
-  get(userId: string, provider: PersonalProvider): Promise<UserModelCredential | null>;
+  get(userId: string, provider: ModelProvider): Promise<UserModelCredential | null>;
   connections(userId: string): Promise<UserCredentialConnection[]>;
   setApiKey(userId: string, provider: ModelProvider, apiKey: string): Promise<void>;
   setOAuth(userId: string, provider: ModelProvider, tokens: UserOAuthTokens): Promise<void>;
@@ -51,17 +48,8 @@ function oauthHostFor(provider: ModelProvider): string | null {
   return provider === "anthropic" || provider === "openai" ? AI_OAUTH_HOSTS[provider] : null;
 }
 
-export function createUserModelCredentialStore(input: {
-  keychain: Keychain;
-  antigravityOwner?: string;
-}): UserModelCredentialStore {
-  const { keychain, antigravityOwner } = input;
-
-  function antigravityLogin(userId: string): UserModelCredential | null {
-    return antigravityOwner === userId
-      ? { provider: ANTIGRAVITY_PROVIDER, kind: "local", profile: antigravityProfile(), updatedAt: 0 }
-      : null;
-  }
+export function createUserModelCredentialStore(input: { keychain: Keychain }): UserModelCredentialStore {
+  const { keychain } = input;
 
   async function findApiKey(userId: string, provider: ModelProvider) {
     const all = await keychain.listByOwner(userId);
@@ -94,7 +82,6 @@ export function createUserModelCredentialStore(input: {
 
   return {
     async get(userId, provider) {
-      if (provider === ANTIGRAVITY_PROVIDER) return antigravityLogin(userId);
       return (await oauthCredential(userId, provider)) ?? (await apiKeyCredential(userId, provider));
     },
 
@@ -104,8 +91,6 @@ export function createUserModelCredentialStore(input: {
         const cred = (await oauthCredential(userId, provider)) ?? (await apiKeyCredential(userId, provider));
         if (cred) found.push({ provider, kind: cred.kind });
       }
-      const local = antigravityLogin(userId);
-      if (local) found.push({ provider: local.provider, kind: local.kind });
       return found;
     },
 
