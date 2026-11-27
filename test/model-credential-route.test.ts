@@ -86,6 +86,7 @@ test("admin model credentials are encrypted, write-only, live, and removable", a
         { id: "gpt-6-sol", name: "GPT-6 Sol", provider: "openai" },
         { id: "gpt-6-luna", name: "GPT-6 Luna", provider: "openai" },
         { id: "openrouter/auto", name: "OpenRouter Auto", provider: "openrouter" },
+        { id: "antigravity/gemini-4-neon", name: "Gemini 4 Neon", provider: "antigravity" },
       ],
     });
     const scopeBefore = await fetch(`${srv.base}/v1/admin/scopes/org%3Adefault-org`, { headers: ADMIN });
@@ -513,6 +514,16 @@ test("surface-config reports company ChatGPT OAuth without making it a Pi API cr
   try {
     const surface = await fetch(`${srv.base}/v1/surface-config`);
     assert.equal(surface.status, 200);
+    assert.equal(((await surface.json()) as { modelProviderConfigured?: boolean }).modelProviderConfigured, true);
+  } finally {
+    await srv.close();
+  }
+});
+
+test("surface-config counts the instance Antigravity login as a configured model provider", async () => {
+  const srv = start({ antigravityProfile: "/srv/agy-profile" });
+  try {
+    const surface = await fetch(`${srv.base}/v1/surface-config`);
     assert.equal(((await surface.json()) as { modelProviderConfigured?: boolean }).modelProviderConfigured, true);
   } finally {
     await srv.close();

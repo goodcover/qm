@@ -18,6 +18,7 @@ import {
 } from "./model-overlay.ts";
 import { MODEL_REGISTRY, type ModelEntry } from "./model-registry.ts";
 import {
+  ANTIGRAVITY_PROVIDER,
   CODEX_SUBSCRIPTION_PROVIDER,
   MODEL_PROVIDERS,
   providerBaseUrl,
@@ -221,7 +222,38 @@ export function modelRequestOverrides(id: string): ModelEntry["request"] {
   return request ? { ...request } : undefined;
 }
 
+const ANTIGRAVITY_PREFIX = `${ANTIGRAVITY_PROVIDER}/`;
+
+function antigravityModel(id: string): PiModel | undefined {
+  const entry = id.startsWith(ANTIGRAVITY_PREFIX) ? REGISTRY_BY_ID.get(id) : undefined;
+  return entry
+    ? {
+        id,
+        name: entry.name,
+        api: ANTIGRAVITY_PROVIDER,
+        provider: ANTIGRAVITY_PROVIDER,
+        baseUrl: "",
+        reasoning: true,
+        thinkingLevelMap: {
+          off: null,
+          minimal: null,
+          low: "low",
+          medium: "medium",
+          high: "high",
+          xhigh: "xhigh",
+          max: null,
+        },
+        input: ["text", "image"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 1_048_576,
+        maxTokens: 65_536,
+      }
+    : undefined;
+}
+
 export function resolveBuiltinModel(id: string): PiModel | undefined {
+  const antigravity = antigravityModel(id);
+  if (antigravity) return antigravity;
   if (id.startsWith(CODEX_SUBSCRIPTION_PREFIX)) {
     const providerId = codexProviderModelId(id);
     if (modelRequestOverrides(providerId)) return undefined;
@@ -368,6 +400,7 @@ export interface ModelProviderAvailability {
   openrouter: boolean;
   modelIds?: ReadonlySet<string>;
   codexOAuth?: boolean;
+  antigravity?: boolean;
 }
 
 export function modelServiceable(id: string, providers: ModelProviderAvailability): boolean {
@@ -383,6 +416,7 @@ export function modelServiceable(id: string, providers: ModelProviderAvailabilit
         resolveModel(codexSubscriptionModelId(id))?.provider === CODEX_SUBSCRIPTION_PROVIDER)
     );
   if (provider === CODEX_SUBSCRIPTION_PROVIDER) return providers.codexOAuth === true;
+  if (provider === ANTIGRAVITY_PROVIDER) return providers.antigravity === true;
   if (provider === "anthropic") return providers.anthropic;
   if (provider === "openrouter") return providers.openrouter;
   return true;
@@ -397,6 +431,7 @@ export const ALL_PROVIDERS_AVAILABLE: ModelProviderAvailability = {
   openai: true,
   openrouter: true,
   codexOAuth: true,
+  antigravity: true,
 };
 
 export function onlyProvider(provider: ModelProvider): ModelProviderAvailability {

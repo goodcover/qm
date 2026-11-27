@@ -255,3 +255,45 @@ test("a company ChatGPT login feeds pi's subscription provider while personal Ch
     await built.runtime.stop();
   }
 });
+
+test("the instance's Antigravity login serves company users who select Neon, never a personal account or an unconfigured instance", async (t) => {
+  turns.length = 0;
+  const neon = "antigravity/gemini-4-neon";
+  const submit = (built: ReturnType<typeof buildApp>, user: string) =>
+    built.app.turn({
+      surface: "web",
+      actor: { externalId: user },
+      conversation: { kind: "dm", threadRef: `web:${user}:neon` },
+      text: "hello",
+      origin: { kind: "human" },
+      async: true,
+      model: neon,
+    });
+  const unconfigured = buildApp(testConfig({ anthropicApiKey: "company-anthropic" }));
+  t.after(() => unconfigured.runtime.stop());
+  assert.deepEqual(await submit(unconfigured, "U1"), {
+    status: "refused",
+    reason: "that model isn't available on this deployment (its provider isn't configured)",
+  });
+  const built = buildApp(testConfig({ anthropicApiKey: "company-anthropic", antigravityProfile: "/srv/agy-profile" }));
+  await built.userModelCredentials.setApiKey("U3", "anthropic", "personal-anthropic");
+  await built.config.setPersonalModelAuth("U3", true);
+  const company = [await submit(built, "U1"), await submit(built, "U2")];
+  assert.equal((await submit(built, "U3")).status, "refused");
+  built.runtime.start();
+  try {
+    for (const run of company) assert.equal((await built.runs.waitFor(run.runId!, 5_000)).status, "done");
+    assert.deepEqual(
+      turns.map((turn) => [turn.runtime?.modelId, turn.providerKeys]),
+      [
+        [neon, undefined],
+        [neon, undefined],
+      ],
+    );
+    const route = await piOptions!.routes!.route(neon);
+    assert.equal(route.keys.antigravity, "/srv/agy-profile");
+    assert.equal(route.billing, "org_subscription");
+  } finally {
+    await built.runtime.stop();
+  }
+});

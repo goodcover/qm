@@ -7,6 +7,7 @@ import {
   overlayModelCatalog,
 } from "./pi-models.ts";
 import { customModelCatalog } from "./custom-providers.ts";
+import { ANTIGRAVITY_PROVIDER } from "./provider-endpoints.ts";
 import { readBoundedText } from "../util/bytes.ts";
 
 export interface ModelCatalogEntry {
@@ -33,7 +34,10 @@ const cache = new WeakMap<typeof fetch, CacheEntry>();
 export function builtInModelCatalog(): ModelCatalogEntry[] {
   const builtIns = selectableBaseModels().flatMap((model) => {
     const provider = resolveModel(model.id)?.provider;
-    return provider === "anthropic" || provider === "openai" || provider === "openrouter"
+    return provider === "anthropic" ||
+      provider === "openai" ||
+      provider === "openrouter" ||
+      provider === ANTIGRAVITY_PROVIDER
       ? [{ ...model, provider: provider as string }]
       : [];
   });

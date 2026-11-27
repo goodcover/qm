@@ -7,6 +7,7 @@ import { trimTrailingSlashes } from "../util/text.ts";
 
 export const MODEL_PROVIDERS = ["anthropic", "openai", "openrouter"] as const;
 export const CODEX_SUBSCRIPTION_PROVIDER = "openai-codex";
+export const ANTIGRAVITY_PROVIDER = "antigravity";
 export type ModelProvider = (typeof MODEL_PROVIDERS)[number];
 
 export function isModelProvider(value: unknown): value is ModelProvider {

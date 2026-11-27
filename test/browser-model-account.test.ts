@@ -197,3 +197,18 @@ test("a company ChatGPT subscription serves company browsing without an API-key 
   assert.equal(calls[0]?.host, "chatgpt.com");
   assert.equal(calls[0]?.headers.get("authorization"), `Bearer ${chatgptToken}`);
 });
+
+test("a browser request on Gemini 4 Neon fails on the forced tool choice before Antigravity starts", async (t) => {
+  const { calls, post } = await browserEndpoint(t, () => anthropicToolResult({ done: true }), {
+    antigravityProfile: "/srv/agy-profile",
+  });
+  const refused = await post(
+    { browserAccount: "company", browserModel: "antigravity/gemini-4-neon" },
+    { ...structuredRequest, model: "antigravity/gemini-4-neon" },
+  );
+  assert.equal(refused.status, 502);
+  assert.ok(
+    (await refused.text()).includes("Antigravity cannot send request fields QM's request hook set: tool_choice"),
+  );
+  assert.equal(calls.length, 0);
+});

@@ -21,7 +21,7 @@ import {
   type ModelProvider,
   type ProviderBaseUrls,
 } from "./model/provider-endpoints.ts";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import {
   parseMemoryCaptureMode,
   parseMemoryRecallMode,
@@ -76,6 +76,7 @@ export interface Config extends SandboxSettings, DeploySettings {
   modelId?: string;
   codexAuthCredential?: string;
   claudeAuthCredential?: string;
+  antigravityProfile?: string;
   titleModelId?: string;
   judgeModelId?: string;
   anthropicApiKey?: string;
@@ -189,6 +190,7 @@ export function providerKeysPresent(config: Config): ModelProviderAvailability {
     openai: Boolean(config.openaiApiKey),
     openrouter: Boolean(config.openrouterApiKey),
     ...(config.codexAuthCredential ? { codexOAuth: true } : {}),
+    ...(config.antigravityProfile ? { antigravity: true } : {}),
   };
 }
 
@@ -402,6 +404,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   );
   const codexAuthCredential = env.CODEX_AUTH_CREDENTIAL?.trim() || undefined;
   const claudeAuthCredential = env.CLAUDE_AUTH_CREDENTIAL?.trim() || undefined;
+  const antigravityProfile = env.ANTIGRAVITY_PROFILE?.trim() || undefined;
+  if (antigravityProfile && !isAbsolute(antigravityProfile))
+    throw new Error("ANTIGRAVITY_PROFILE must be the absolute path of the signed-in Antigravity profile directory");
   const publicApiUrl = env.PUBLIC_API_URL ?? env.AGENT_API_URL;
   const publicUrl = env.PUBLIC_WEB_URL || publicApiUrl;
   const deploy = deploySettings(env, publicUrl);
@@ -527,6 +532,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ...(env.PI_MODEL ? { modelId: env.PI_MODEL } : {}),
     ...(codexAuthCredential ? { codexAuthCredential } : {}),
     ...(claudeAuthCredential ? { claudeAuthCredential } : {}),
+    ...(antigravityProfile ? { antigravityProfile } : {}),
     ...(env.PI_TITLE_MODEL ? { titleModelId: env.PI_TITLE_MODEL } : {}),
     ...(env.PI_JUDGE_MODEL ? { judgeModelId: env.PI_JUDGE_MODEL } : {}),
     ...(env.ANTHROPIC_API_KEY ? { anthropicApiKey: env.ANTHROPIC_API_KEY } : {}),

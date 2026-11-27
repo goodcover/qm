@@ -14,8 +14,7 @@ import type {
   SpawnOptions,
   ThinkingConfig,
 } from "@anthropic-ai/claude-agent-sdk";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { CallToolRequestSchema, ListToolsRequestSchema, type CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import {
   createSession,
   openSession,
@@ -29,26 +28,44 @@ import {
   EventStream,
   parseStreamingJson,
   type Api,
-  type AssistantMessage,
   type AssistantMessageEventStream,
   type CacheRetention,
   type Context,
   type ImageContent,
   type Message,
   type Model,
-  type ProviderErrorInfo,
   type SimpleStreamOptions,
   type TextContent,
-  type ToolCall,
-  type ToolResultMessage,
   type Usage,
 } from "@earendil-works/pi-ai";
 import { adjustMaxTokensForThinking, clampMaxTokensToContext } from "@earendil-works/pi-ai/api/simple-options";
 import { transformMessages } from "@earendil-works/pi-ai/api/transform-messages";
 import { MAX_TOOL_RESULT_CHARS } from "../agent/agent-tools/record.ts";
 import { hashId } from "../util/crypto.ts";
-import { asError, errMessage, swallow } from "../util/errors.ts";
+import { errMessage, swallow } from "../util/errors.ts";
 import { isClaudeSubscriptionToken } from "./claude-subscription.ts";
+import {
+  afterLastAssistant,
+  continues,
+  failStep,
+  finishStep,
+  HarnessFailure,
+  harnessOutput,
+  harnessSlot,
+  holdFailure,
+  refusalFailure,
+  servedTools,
+  type HarnessConnection,
+  type HarnessLive,
+  type HarnessStep,
+  mcpResult,
+  qmToolServer,
+  refuseUnsent,
+  RESUMED_AT_TOOL_RESULTS,
+  startStep,
+  trackProcess,
+  type ServedTool,
+} from "./harness.ts";
 import { applyThinkingBinding, withRequestHeaders, zeroUsage } from "./model-runtime.ts";
 import { modelSupportsAdaptiveThinking } from "./pi-models.ts";
 
@@ -58,7 +75,6 @@ const ANTHROPIC_TOOL_NAME_LIMIT = 64;
 const TOOL_USE_ID = "claudecode/toolUseId";
 const CLIENT_APP = "qm/claude-code-provider";
 const WORK_DIR = join(tmpdir(), "qm-claude-code-cwd");
-const RESUMED_AT_TOOL_RESULTS = "[system] The run resumed after the tool results above. Continue the task.";
 
 const RESULT_SIZE_META = "anthropic/maxResultSizeChars";
 const QM_SETTINGS_SOURCE = "flagSettings";
@@ -116,22 +132,8 @@ function claudeCodeEnv(
   };
 }
 
-class ClaudeCodeFailure extends Error {
-  readonly providerError: ProviderErrorInfo;
-  constructor(message: string, providerError: ProviderErrorInfo) {
-    super(message);
-    this.providerError = providerError;
-  }
-}
-
 interface SettingsReport {
   sources?: Array<{ source?: string; settings?: Record<string, unknown> }>;
-}
-
-interface ServedTool {
-  name: string;
-  description: string;
-  input_schema: unknown;
 }
 
 interface WireThinking {
@@ -170,10 +172,7 @@ const SENT_FIELDS: Record<keyof ClaudeCodeRequest, true> = {
   tool_choice: true,
 };
 
-interface Step {
-  stream: AssistantMessageEventStream;
-  output: AssistantMessage;
-  started: boolean;
+interface Step extends HarnessStep {
   open: Map<number, number>;
   json: Map<number, string>;
   calls: string[];
@@ -181,7 +180,7 @@ interface Step {
   current: Usage;
 }
 
-interface Live {
+interface Live extends HarnessLive<Step> {
   query?: Query;
   abort: AbortController;
   model: Model<Api>;
@@ -189,40 +188,19 @@ interface Live {
   served: Map<string, string>;
   waiting: Map<string, (result: CallToolResult) => void>;
   ready: Map<string, CallToolResult>;
-  step?: Step;
-  awaiting: string[];
-  failure?: Error;
   apiError?: { kind: SDKAssistantMessageError; text: string };
   authError?: string;
   child?: ChildProcess;
-  exited: Promise<void>;
-  markExited: () => void;
+  exited?: Promise<unknown>;
   dir: string;
   session: string;
   toolChoice: WireToolChoice | undefined;
-  closing?: Promise<void>;
-  closed: boolean;
-  finished: boolean;
-}
-
-interface ClaudeCodeConnection {
-  streamSimple(model: Model<Api>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream;
-  close(): Promise<void>;
 }
 
 function newStep(stream: AssistantMessageEventStream, model: Model<Api>): Step {
   return {
     stream,
-    output: {
-      role: "assistant",
-      content: [],
-      api: model.api,
-      provider: model.provider,
-      model: model.id,
-      usage: zeroUsage(),
-      stopReason: "stop",
-      timestamp: Date.now(),
-    },
+    output: harnessOutput(model),
     started: false,
     open: new Map(),
     json: new Map(),
@@ -234,10 +212,6 @@ function newStep(stream: AssistantMessageEventStream, model: Model<Api>): Step {
 
 function toolCallId(id: string): string {
   return `toolu_${hashId([id], 32)}`;
-}
-
-function isToolCall(block: AssistantMessage["content"][number]): block is ToolCall {
-  return block.type === "toolCall";
 }
 
 function imageBlock(image: ImageContent): ContentBlock {
@@ -294,7 +268,7 @@ function servedToolChoice(request: ClaudeCodeRequest): ClaudeCodeRequest {
   if (choice?.type !== "tool") return request;
   const name = TOOL_PREFIX + String(choice.name);
   if (!request.tools.some((tool) => tool.name === name))
-    throw new ClaudeCodeFailure(`QM's request hook forces the tool ${choice.name}, which this request does not serve`, {
+    throw new HarnessFailure(`QM's request hook forces the tool ${choice.name}, which this request does not serve`, {
       type: "invalid_request_error",
     });
   return { ...request, tool_choice: { ...choice, name } };
@@ -316,10 +290,7 @@ function sendable(value: unknown): ClaudeCodeRequest {
       .filter((key) => key !== "effort")
       .map((key) => `output_config.${key}`),
   ];
-  if (unsent.length)
-    throw new ClaudeCodeFailure(`Claude Code cannot send request fields QM's request hook set: ${unsent.join(", ")}`, {
-      type: "invalid_request_error",
-    });
+  refuseUnsent("Claude Code", unsent);
   return servedToolChoice(request as ClaudeCodeRequest);
 }
 
@@ -349,17 +320,6 @@ function userMessage(content: ContentBlock[]): SDKUserMessage {
   };
 }
 
-function mcpResult(result: ToolResultMessage): CallToolResult {
-  return {
-    content: result.content.map((block) =>
-      block.type === "text"
-        ? { type: "text" as const, text: block.text.toWellFormed() }
-        : { type: "image" as const, data: block.data, mimeType: block.mimeType },
-    ),
-    ...(result.isError ? { isError: true } : {}),
-  };
-}
-
 function unservable(tools: readonly ServedTool[]): string[] {
   return tools.flatMap((tool) => {
     const schema = tool.input_schema as Record<string, unknown>;
@@ -372,27 +332,24 @@ function unservable(tools: readonly ServedTool[]): string[] {
 }
 
 function toolServer(tools: readonly ServedTool[], live: Live) {
-  const server = new McpServer({ name: SERVER, version: "1.0.0" }, { capabilities: { tools: {} } });
-  server.server.setRequestHandler(ListToolsRequestSchema, () => ({
-    tools: tools.map((tool) => ({
-      name: tool.name.slice(TOOL_PREFIX.length),
-      description: tool.description,
-      inputSchema: tool.input_schema as { type: "object" },
-      _meta: { [RESULT_SIZE_META]: MAX_TOOL_RESULT_CHARS },
-    })),
-  }));
-  server.server.setRequestHandler(CallToolRequestSchema, (request) => {
-    const id = request.params._meta?.[TOOL_USE_ID];
-    if (!live.served.has(TOOL_PREFIX + request.params.name))
-      throw new Error(`QM does not serve a tool named ${request.params.name}`);
-    if (typeof id !== "string") throw new Error(`${request.params.name}: tools/call is missing its tool_use id`);
-    const ready = live.ready.get(id);
-    if (ready) {
-      live.ready.delete(id);
-      return ready;
-    }
-    return new Promise<CallToolResult>((resolve) => live.waiting.set(id, resolve));
-  });
+  const server = qmToolServer(
+    SERVER,
+    tools,
+    { [RESULT_SIZE_META]: MAX_TOOL_RESULT_CHARS },
+    (request) => {
+      const id = request.params._meta?.[TOOL_USE_ID];
+      if (!live.served.has(TOOL_PREFIX + request.params.name))
+        throw new Error(`QM does not serve a tool named ${request.params.name}`);
+      if (typeof id !== "string") throw new Error(`${request.params.name}: tools/call is missing its tool_use id`);
+      const ready = live.ready.get(id);
+      if (ready) {
+        live.ready.delete(id);
+        return ready;
+      }
+      return new Promise<CallToolResult>((resolve) => live.waiting.set(id, resolve));
+    },
+    TOOL_PREFIX,
+  );
   return { type: "sdk" as const, name: SERVER, instance: server };
 }
 
@@ -474,12 +431,6 @@ function wireOptions(
   };
 }
 
-function started(step: Step): void {
-  if (step.started) return;
-  step.started = true;
-  step.stream.push({ type: "start", partial: step.output });
-}
-
 function settleUsage(step: Step, model: Model<Api>): void {
   const usage = step.output.usage;
   usage.input = step.billed.input + step.current.input;
@@ -495,18 +446,7 @@ function endStep(live: Live, reason: "stop" | "length" | "toolUse"): void {
   const step = live.step;
   if (!step) return;
   live.step = undefined;
-  started(step);
-  step.output.stopReason = reason;
-  step.stream.push({ type: "done", reason, message: step.output });
-  step.stream.end();
-}
-
-function failStep(step: Step, error: Error, aborted: boolean): void {
-  step.output.stopReason = aborted ? "aborted" : "error";
-  step.output.errorMessage = errMessage(error);
-  if (error instanceof ClaudeCodeFailure) step.output.providerError = error.providerError;
-  step.stream.push({ type: "error", reason: aborted ? "aborted" : "error", error: step.output });
-  step.stream.end();
+  finishStep(step, reason);
 }
 
 function onStreamEvent(live: Live, event: Record<string, unknown> & { type: string }): void {
@@ -539,14 +479,14 @@ function onStreamEvent(live: Live, event: Record<string, unknown> & { type: stri
     if (block.type === "tool_use") {
       const name = live.served.get(block.name ?? "");
       if (!name) return;
-      started(step);
+      startStep(step);
       output.content.push({ type: "toolCall", id: block.id!, name, arguments: {} });
       step.json.set(index, "");
       step.open.set(index, output.content.length - 1);
       step.stream.push({ type: "toolcall_start", contentIndex: output.content.length - 1, partial: output });
       return;
     }
-    started(step);
+    startStep(step);
     if (block.type === "text") {
       output.content.push({ type: "text", text: "" });
       step.open.set(index, output.content.length - 1);
@@ -621,46 +561,41 @@ function onStreamEvent(live: Live, event: Record<string, unknown> & { type: stri
     step.current = zeroUsage();
     if (output.rawStopReason === "refusal") {
       live.step = undefined;
-      failStep(step, new ClaudeCodeFailure("The model declined to continue (refusal)", { type: "refusal" }), false);
+      failStep(step, refusalFailure(step), false);
       return;
     }
     if (output.stopReason === "length") {
-      live.finished = true;
+      live.done = true;
       live.input.end();
       live.child?.kill("SIGKILL");
       endStep(live, "length");
       return;
     }
     if (step.calls.length) {
-      live.awaiting = step.calls;
+      live.handedOut = step.calls;
       endStep(live, "toolUse");
     }
   }
 }
 
-function apiFailure(live: Live, text: string, status: number | null | undefined): ClaudeCodeFailure {
+function apiFailure(live: Live, text: string, status: number | null | undefined): HarnessFailure {
   const kind = live.apiError?.kind;
   const evidence = [...new Set([text, live.apiError?.text, live.authError].filter(Boolean))].join(" — ");
-  return new ClaudeCodeFailure(evidence || `Claude Code failed${kind ? ` (${kind})` : ""}`, {
+  return new HarnessFailure(evidence || `Claude Code failed${kind ? ` (${kind})` : ""}`, {
     ...(typeof status === "number" ? { status } : {}),
     ...(kind ? { code: kind, ...(ERROR_TYPES[kind] ? { type: ERROR_TYPES[kind] } : {}) } : {}),
   });
 }
 
 function stop(live: Live): void {
-  if (live.finished) return;
+  if (live.done) return;
   live.abort.abort();
   live.child?.kill("SIGKILL");
 }
 
 function fail(live: Live, error: Error): void {
   stop(live);
-  if (live.failure) swallow("claude-code: later failure", error);
-  else live.failure = error;
-  const step = live.step;
-  live.step = undefined;
-  if (step) failStep(step, live.failure, false);
-  else swallow("claude-code: failure held for the next step", error);
+  holdFailure("claude-code", live, error);
 }
 
 async function appliesUnconfiguredSettings(query: Query): Promise<boolean> {
@@ -671,8 +606,8 @@ async function appliesUnconfiguredSettings(query: Query): Promise<boolean> {
   );
 }
 
-function unconfigured(what: string): ClaudeCodeFailure {
-  return new ClaudeCodeFailure(
+function unconfigured(what: string): HarnessFailure {
+  return new HarnessFailure(
     `Claude Code ${what} that QM did not configure, most likely from the Claude account's managed settings; QM refuses to run Claude Code with them`,
     { type: "permission_error", code: "managed_settings" },
   );
@@ -691,7 +626,7 @@ function onMessage(live: Live, message: SDKMessage): void {
     if (foreign.length || missing.length)
       return fail(
         live,
-        new ClaudeCodeFailure(
+        new HarnessFailure(
           `Claude Code's tools differ from QM's: extra [${foreign.join(", ")}], missing [${missing.join(", ")}], MCP servers [${servers}]`,
           { type: "invalid_request_error" },
         ),
@@ -699,7 +634,7 @@ function onMessage(live: Live, message: SDKMessage): void {
     if (message.apiKeySource !== "none")
       return fail(
         live,
-        new ClaudeCodeFailure(
+        new HarnessFailure(
           `Claude Code reported API key source ${message.apiKeySource}; this route only uses a subscription login`,
           { type: "permission_error" },
         ),
@@ -740,7 +675,7 @@ function onMessage(live: Live, message: SDKMessage): void {
     if (info.isUsingOverage === true || info.overageInUse === true)
       return fail(
         live,
-        new ClaudeCodeFailure(
+        new HarnessFailure(
           "Claude reported that this request is drawing on extra usage (overage); the claude-code route refuses metered usage",
           { type: "invalid_request_error", code: "overage_in_use" },
         ),
@@ -748,7 +683,7 @@ function onMessage(live: Live, message: SDKMessage): void {
     return;
   }
   if (message.type === "result") {
-    live.finished = true;
+    live.done = true;
     live.input.end();
     if (message.subtype === "success" && !message.is_error) {
       endStep(live, "stop");
@@ -763,7 +698,7 @@ function onMessage(live: Live, message: SDKMessage): void {
 }
 
 function rememberAnnouncements(live: Live): void {
-  if (!live.query || !live.finished) return;
+  if (!live.query || !live.done) return;
   try {
     const latest = new Map<string, ImportAttachment["attachment"]>();
     const transcript = openSession({
@@ -788,13 +723,7 @@ function spawnTracked(live: Live) {
       stdio: ["pipe", "pipe", "pipe"],
     });
     live.child = child;
-    child.stderr.on("data", (data: Buffer) => console.error(`[claude-code] ${data.toString().trimEnd()}`));
-    child.once("exit", live.markExited);
-    child.once("error", (error) => {
-      if (error.name === "AbortError") return;
-      swallow("claude-code: the Claude Code process failed", error);
-      if (child.pid === undefined) live.markExited();
-    });
+    live.exited = trackProcess("claude-code", child);
     return child as unknown as SpawnedProcess;
   };
 }
@@ -811,7 +740,6 @@ async function teardown(live: Live, reason: string): Promise<void> {
   } catch (e) {
     swallow("claude-code: closing the query", e);
   }
-  if (!live.child) live.markExited();
   await live.exited;
   rememberAnnouncements(live);
   try {
@@ -826,40 +754,17 @@ function closeLive(live: Live, reason: string): Promise<void> {
   return live.closing;
 }
 
-function refusalFor(closed: boolean, token: string | undefined): ClaudeCodeFailure | undefined {
-  if (closed) return new ClaudeCodeFailure("This model runtime has been closed", { type: "invalid_request_error" });
+function refusalFor(token: string | undefined): HarnessFailure | undefined {
   if (!isClaudeSubscriptionToken(token))
-    return new ClaudeCodeFailure(
+    return new HarnessFailure(
       "Claude Code serves only a Claude subscription OAuth token; this route never uses a metered API key",
       { type: "authentication_error" },
     );
   return undefined;
 }
 
-function continues(live: Live | undefined, messages: readonly Message[]): live is Live {
-  if (!live || live.step || !live.awaiting.length || (!live.failure && (live.closed || live.finished))) return false;
-  const last = messages.findLastIndex((message) => message.role === "assistant");
-  const assistant = messages[last] as AssistantMessage | undefined;
-  const calls = assistant?.content.filter(isToolCall).map((call) => call.id) ?? [];
-  if (calls.length !== live.awaiting.length || calls.some((id, i) => id !== live.awaiting[i])) return false;
-  const answered = new Set(
-    messages.slice(last + 1).flatMap((message) => (message.role === "toolResult" ? [message.toolCallId] : [])),
-  );
-  return calls.every((id) => answered.has(id));
-}
-
-export function createClaudeCodeConnection(): ClaudeCodeConnection {
-  let live: Live | undefined;
-  let connectionClosed = false;
-
-  const bindAbort = (target: Live, signal: AbortSignal | undefined) => {
-    if (!signal) return;
-    if (signal.aborted) {
-      void closeLive(target, "The run was aborted");
-      return;
-    }
-    signal.addEventListener("abort", () => void closeLive(target, "The run was aborted"), { once: true });
-  };
+export function createClaudeCodeConnection(): HarnessConnection {
+  const slot = harnessSlot<Live>("claude-code", closeLive, fail);
 
   const attach = (
     target: Live,
@@ -868,14 +773,14 @@ export function createClaudeCodeConnection(): ClaudeCodeConnection {
     messages: readonly Message[],
     signal: AbortSignal | undefined,
   ) => {
-    target.awaiting = [];
+    target.handedOut = [];
     if (target.failure) {
       failStep(step, target.failure, false);
       return;
     }
-    const tail = messages.slice(messages.findLastIndex((message) => message.role === "assistant") + 1);
+    const tail = afterLastAssistant(messages);
     target.step = step;
-    bindAbort(target, signal);
+    slot.bindAbort(target, signal);
     const steer = lastUserBlocks(request.messages).filter((block) => block.type !== "tool_result");
     if (steer.length) target.input.push(userMessage(steer));
     for (const message of tail)
@@ -889,20 +794,16 @@ export function createClaudeCodeConnection(): ClaudeCodeConnection {
     step: Step,
     streamOptions: SimpleStreamOptions | undefined,
   ): Promise<void> => {
-    const previous = live;
-    live = undefined;
-    if (previous) await closeLive(previous, "Superseded by a new request");
+    await slot.supersede();
     const lost = unservable(request.tools);
     if (lost.length)
-      throw new ClaudeCodeFailure(`Claude Code cannot receive these QM tools: ${lost.join("; ")}`, {
+      throw new HarnessFailure(`Claude Code cannot receive these QM tools: ${lost.join("; ")}`, {
         type: "invalid_request_error",
       });
     mkdirSync(WORK_DIR, { recursive: true });
     const work = realpathSync(WORK_DIR);
     const sdk = await import("@anthropic-ai/claude-agent-sdk");
     const dir = realpathSync(mkdtempSync(join(tmpdir(), "qm-claude-code-")));
-    let markExited!: () => void;
-    const exited = new Promise<void>((resolve) => (markExited = resolve));
     const target: Live = {
       abort: new AbortController(),
       model,
@@ -914,17 +815,15 @@ export function createClaudeCodeConnection(): ClaudeCodeConnection {
       waiting: new Map(),
       ready: new Map(),
       step,
-      awaiting: [],
-      exited,
-      markExited,
+      handedOut: [],
       dir,
       session: randomUUID(),
       toolChoice: request.tool_choice,
       closed: false,
-      finished: false,
+      done: false,
     };
-    live = target;
-    bindAbort(target, streamOptions?.signal);
+    slot.adopt(target);
+    slot.bindAbort(target, streamOptions?.signal);
     if (target.closed) return;
     const { history, prompt } = splitPrompt(request.messages);
     const sessionId = target.session;
@@ -961,7 +860,7 @@ export function createClaudeCodeConnection(): ClaudeCodeConnection {
       ...wire.options,
       spawnClaudeCodeProcess: spawnTracked(target),
     };
-    if (target.closed || connectionClosed) return closeLive(target, "QM ended the turn");
+    if (target.closed || slot.closed) return closeLive(target, "QM ended the turn");
     target.query = sdk.query({ prompt: target.input, options });
     try {
       if (await appliesUnconfiguredSettings(target.query))
@@ -973,13 +872,13 @@ export function createClaudeCodeConnection(): ClaudeCodeConnection {
         onMessage(target, message);
         if (target.failure) break;
       }
-      if (!target.closed && !target.finished && !target.failure)
+      if (!target.closed && !target.done && !target.failure)
         throw apiFailure(target, "Claude Code ended without a result", undefined);
     } catch (error) {
-      if (target.closed || target.finished) swallow("claude-code: error after the query ended", error);
-      else fail(target, error instanceof ClaudeCodeFailure ? error : apiFailure(target, errMessage(error), undefined));
+      if (target.closed || target.done) swallow("claude-code: error after the query ended", error);
+      else fail(target, error instanceof HarnessFailure ? error : apiFailure(target, errMessage(error), undefined));
     } finally {
-      if (target.failure || target.finished) await closeLive(target, "The Claude Code query ended");
+      if (target.failure || target.done) await closeLive(target, "The Claude Code query ended");
     }
   };
 
@@ -988,48 +887,29 @@ export function createClaudeCodeConnection(): ClaudeCodeConnection {
       const stream = createAssistantMessageEventStream();
       const step = newStep(stream, model);
       const token = options?.apiKey;
-      const refusal = refusalFor(connectionClosed, token);
-      if (refusal) {
-        queueMicrotask(() => failStep(step, refusal, false));
-        return stream;
-      }
-      const messages = transformMessages(context.messages, model, toolCallId);
-      const request: ClaudeCodeRequest = {
-        model: model.id,
-        system: (context.systemPrompt ?? "").toWellFormed(),
-        messages: claudeCodeTranscript(messages),
-        tools: (context.tools ?? []).map((tool) => ({
-          name: TOOL_PREFIX + tool.name,
-          description: tool.description,
-          input_schema: tool.parameters,
-        })),
-        ...thinkingFor(model, context, options),
-      };
-      const continuing = continues(live, messages) ? live : undefined;
-      void (async () => {
+      slot.run(step, refusalFor(token), async () => {
+        const messages = transformMessages(context.messages, model, toolCallId);
+        const request: ClaudeCodeRequest = {
+          model: model.id,
+          system: (context.systemPrompt ?? "").toWellFormed(),
+          messages: claudeCodeTranscript(messages),
+          tools: servedTools(context.tools, TOOL_PREFIX),
+          ...thinkingFor(model, context, options),
+        };
+        const continuing = continues(slot.current, messages) ? slot.current : undefined;
         const shaped = await options?.onPayload?.(request, model);
         const sent = sendable(shaped === undefined ? request : shaped);
         if (sent.speed === "fast")
-          throw new ClaudeCodeFailure(
+          throw new HarnessFailure(
             "Fast mode draws on Claude extra usage, which the Claude subscription route refuses; turn fast mode off for this model",
             { type: "invalid_request_error", code: "fast_mode_unavailable" },
           );
         if (continuing && JSON.stringify(continuing.toolChoice) === JSON.stringify(sent.tool_choice))
           attach(continuing, step, sent, messages, options?.signal);
         else await start(model, sent, token!, step, options);
-      })().catch((error) => {
-        const failure = asError(error);
-        if (live?.step === step) fail(live, failure);
-        else if (!step.output.errorMessage) failStep(step, failure, false);
-        else swallow("claude-code: failure after the step ended", failure);
       });
       return stream;
     },
-    async close() {
-      connectionClosed = true;
-      const current = live;
-      live = undefined;
-      if (current) await closeLive(current, "QM ended the turn");
-    },
+    close: () => slot.close(),
   };
 }

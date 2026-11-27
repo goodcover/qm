@@ -1,4 +1,9 @@
-import { CODEX_SUBSCRIPTION_PROVIDER, isModelProvider, parseProviderBaseUrl } from "./provider-endpoints.ts";
+import {
+  ANTIGRAVITY_PROVIDER,
+  CODEX_SUBSCRIPTION_PROVIDER,
+  isModelProvider,
+  parseProviderBaseUrl,
+} from "./provider-endpoints.ts";
 import { CLAUDE_CODE_KEY } from "./claude-subscription.ts";
 import { perTenant } from "../tenants/cache.ts";
 import { boundTenant } from "../tenants/context.ts";
@@ -25,7 +30,7 @@ export interface CustomProviderSpec {
 }
 
 const SLUG_RE = /^[a-z][a-z0-9-]+$/;
-const RESERVED = new Set<string>([CODEX_SUBSCRIPTION_PROVIDER, CLAUDE_CODE_KEY]);
+const RESERVED = new Set<string>([CODEX_SUBSCRIPTION_PROVIDER, CLAUDE_CODE_KEY, ANTIGRAVITY_PROVIDER]);
 
 export function validateCustomProviderSpec(spec: CustomProviderSpec): void {
   if (!SLUG_RE.test(spec.id)) {
