@@ -1265,6 +1265,7 @@ async function getSurfaceConfig(ctx: ApiCtx): Promise<void> {
         providerStatus.anthropic ||
         providerStatus.openai ||
         providerStatus.openrouter ||
+        providerStatus.antigravity ||
         providerStatus.modelIds?.size ||
         deps.companySubscriptionAuth,
       ),

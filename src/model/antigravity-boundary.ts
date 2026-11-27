@@ -2,7 +2,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { lstatSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { errMessage, swallow } from "../util/errors.ts";
+import { trackProcess, type ProcessExit } from "./harness.ts";
 
 export const ANTIGRAVITY_MCP_SERVER = "qm";
 export const ANTIGRAVITY_WORKSPACE = "/work";
@@ -28,7 +28,7 @@ Use only the tools QM serves.
 
 export interface AntigravityProcess {
   child: ChildProcessWithoutNullStreams;
-  exited: Promise<string>;
+  exited: Promise<ProcessExit>;
 }
 
 function assertOwnerOnlyProfile(profile: string): void {
@@ -82,20 +82,6 @@ function boundaryArgs(cli: string, profile: string, workspace: string): string[]
   ];
 }
 
-export function processExit(child: ChildProcessWithoutNullStreams, cleanup: () => void): Promise<string> {
-  return new Promise<string>((resolve) => {
-    const done = (how: string) => {
-      cleanup();
-      resolve(how);
-    };
-    child.once("exit", (code, signal) => done(signal ? `was killed by ${signal}` : `exited with code ${code}`));
-    child.once("error", (error) => {
-      if (child.pid === undefined) done(`could not start: ${errMessage(error)}`);
-      else swallow("antigravity: the boundary process reported an error", error);
-    });
-  });
-}
-
 export function launchAntigravity(profile: string): AntigravityProcess {
   assertOwnerOnlyProfile(profile);
   const cli = join(homedir(), ".local", "bin", "agy");
@@ -108,6 +94,8 @@ export function launchAntigravity(profile: string): AntigravityProcess {
     [...boundaryArgs(cli, profile, workspace), "--", "/bin/agy", "acp", "--disable-telemetry", "--agent", AGENT],
     { stdio: ["pipe", "pipe", "pipe"] },
   );
-  child.stderr.on("data", (data: Buffer) => console.error(`[antigravity] ${data.toString().trimEnd()}`));
-  return { child, exited: processExit(child, () => rmSync(workspace, { recursive: true, force: true })) };
+  return {
+    child,
+    exited: trackProcess("antigravity", child, () => rmSync(workspace, { recursive: true, force: true })),
+  };
 }

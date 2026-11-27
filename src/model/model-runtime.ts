@@ -142,7 +142,10 @@ export async function buildModelRuntime(
   const claudeCode = createClaudeCodeConnection();
   const antigravity = apiKeys[ANTIGRAVITY_PROVIDER] ? createAntigravityConnection() : undefined;
   if (antigravity)
-    runtime.registerProvider(ANTIGRAVITY_PROVIDER, { api: ANTIGRAVITY_PROVIDER, streamSimple: antigravity.streamSimple });
+    runtime.registerProvider(ANTIGRAVITY_PROVIDER, {
+      api: ANTIGRAVITY_PROVIDER,
+      streamSimple: antigravity.streamSimple,
+    });
   for (const [provider, apiKey] of Object.entries(apiKeys)) {
     if (apiKey) await runtime.setRuntimeApiKey(provider, apiKey, { allowNetwork: false });
   }

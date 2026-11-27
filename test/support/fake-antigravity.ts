@@ -22,6 +22,8 @@ acp
     await update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "working" } });
     const name = script === "foreign" ? "read_file" : "mcp_qm_lookup";
     if (script === "hang") return never;
+    if (script === "refusal" || script === "cancelled") return { stopReason: script };
+    if (script === "quota") throw acp.RequestError.internalError({ details: "daily quota reached" });
     if (script === "die") process.exit(7);
     await update({ sessionUpdate: "tool_call", toolCallId: "t1", title: `Run ${name}`, name });
     if (script === "foreign") return never;

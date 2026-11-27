@@ -14,6 +14,7 @@ import type {
   ProviderErrorInfo,
   ToolResultMessage,
 } from "@earendil-works/pi-ai";
+import type { ChildProcess } from "node:child_process";
 import { asError, errMessage, swallow } from "../util/errors.ts";
 import { zeroUsage } from "./model-runtime.ts";
 
@@ -73,19 +74,13 @@ export function failStep(step: HarnessStep, error: Error, aborted: boolean): voi
   step.stream.end();
 }
 
-function onAbort(signal: AbortSignal | undefined, abort: () => void): void {
-  if (!signal) return;
-  if (signal.aborted) abort();
-  else signal.addEventListener("abort", abort, { once: true });
-}
-
-export function closeOnce<L extends { closing?: Promise<void> }>(
-  live: L,
-  reason: string,
-  teardown: (live: L, reason: string) => Promise<void>,
-): Promise<void> {
-  live.closing ??= teardown(live, reason);
-  return live.closing;
+export interface HarnessLive<S extends HarnessStep = HarnessStep> {
+  step?: S;
+  handedOut: string[];
+  failure?: Error;
+  closed: boolean;
+  done: boolean;
+  closing?: Promise<void>;
 }
 
 export function refuseUnsent(label: string, unsent: readonly string[]): void {
@@ -95,7 +90,45 @@ export function refuseUnsent(label: string, unsent: readonly string[]): void {
     });
 }
 
-export function harnessSlot<L extends { step?: HarnessStep }>(
+export function holdFailure<S extends HarnessStep>(
+  label: string,
+  live: HarnessLive<S>,
+  error: Error,
+  end: (step: S, failure: Error) => void = (step, failure) => failStep(step, failure, false),
+): void {
+  if (live.failure) swallow(`${label}: later failure`, error);
+  else live.failure = error;
+  const step = live.step;
+  live.step = undefined;
+  if (step) end(step, live.failure);
+  else swallow(`${label}: failure held for the next step`, error);
+}
+
+export interface ProcessExit {
+  started: boolean;
+  how: string;
+}
+
+export function trackProcess(
+  label: string,
+  child: ChildProcess,
+  cleanup: () => void = () => undefined,
+): Promise<ProcessExit> {
+  child.stderr?.on("data", (data: Buffer) => console.error(`[${label}] ${data.toString().trimEnd()}`));
+  return new Promise<ProcessExit>((resolve) => {
+    const done = (started: boolean, how: string) => {
+      cleanup();
+      resolve({ started, how });
+    };
+    child.once("exit", (code, signal) => done(true, signal ? `was killed by ${signal}` : `exited with code ${code}`));
+    child.once("error", (error) => {
+      if (child.pid === undefined) done(false, `could not start: ${errMessage(error)}`);
+      else if (error.name !== "AbortError") swallow(`${label}: the process reported an error`, error);
+    });
+  });
+}
+
+export function harnessSlot<L extends HarnessLive>(
   label: string,
   closeLive: (live: L, reason: string) => Promise<void>,
   fail: (live: L, error: Error) => void,
@@ -110,7 +143,9 @@ export function harnessSlot<L extends { step?: HarnessStep }>(
       return closed;
     },
     bindAbort(live: L, signal: AbortSignal | undefined): void {
-      onAbort(signal, () => void closeLive(live, "The run was aborted"));
+      const abort = () => void closeLive(live, "The run was aborted");
+      if (signal?.aborted) abort();
+      else signal?.addEventListener("abort", abort, { once: true });
     },
     async supersede(): Promise<void> {
       const previous = current;
@@ -149,13 +184,17 @@ export function harnessSlot<L extends { step?: HarnessStep }>(
   };
 }
 
-export function answersToolCalls(messages: readonly Message[], handedOut: readonly string[]): boolean {
-  const last = messages.findLastIndex((message) => message.role === "assistant");
-  const assistant = messages[last] as AssistantMessage | undefined;
+export function afterLastAssistant(messages: readonly Message[]): readonly Message[] {
+  return messages.slice(messages.findLastIndex((message) => message.role === "assistant") + 1);
+}
+
+export function continues<L extends HarnessLive>(live: L | undefined, messages: readonly Message[]): live is L {
+  if (!live || live.step || !live.handedOut.length || (!live.failure && (live.closed || live.done))) return false;
+  const assistant = messages.findLast((message) => message.role === "assistant");
   const calls = assistant?.content.flatMap((block) => (block.type === "toolCall" ? [block.id] : [])) ?? [];
-  if (calls.length !== handedOut.length || calls.some((id, i) => id !== handedOut[i])) return false;
+  if (calls.length !== live.handedOut.length || calls.some((id, i) => id !== live.handedOut[i])) return false;
   const answered = new Set(
-    messages.slice(last + 1).flatMap((message) => (message.role === "toolResult" ? [message.toolCallId] : [])),
+    afterLastAssistant(messages).flatMap((message) => (message.role === "toolResult" ? [message.toolCallId] : [])),
   );
   return calls.every((id) => answered.has(id));
 }

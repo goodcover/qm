@@ -1,34 +1,27 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { test } from "node:test";
 import { Type } from "typebox";
 import type { AssistantMessage, Message, ToolCall } from "@earendil-works/pi-ai";
 import { createAntigravityConnection } from "../src/model/antigravity.ts";
-import { processExit } from "../src/model/antigravity-boundary.ts";
+import { trackProcess } from "../src/model/harness.ts";
+import { providerTurnError } from "../src/model/provider-error.ts";
+import { processAlive } from "./support/fake-claude-code.ts";
 import { resolveModel } from "../src/model/pi-models.ts";
 
 const model = resolveModel("antigravity/gemini-4-neon")!;
 const tools = [{ name: "lookup", description: "Look up one record.", parameters: Type.Object({ key: Type.String() }) }];
 
-function fakeAntigravity(script: string, pids: number[] = []) {
+function fakeAntigravity(script: string, children: ChildProcess[] = []) {
   return () => {
     const child = spawn(process.execPath, ["test/support/fake-antigravity.ts", script]);
-    pids.push(child.pid!);
-    return { child, exited: processExit(child, () => undefined) };
+    children.push(child);
+    return { child, exited: trackProcess("fake-antigravity", child) };
   };
 }
 
 function ask(connection: ReturnType<typeof createAntigravityConnection>, messages: Message[], signal?: AbortSignal) {
   return connection.streamSimple(model, { systemPrompt: "You are QM.", messages, tools }, { apiKey: "/p", signal });
-}
-
-function gone(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return false;
-  } catch {
-    return true;
-  }
 }
 
 const user: Message = { role: "user", content: "go", timestamp: 0 };
@@ -55,13 +48,13 @@ test("an Antigravity tool call is handed to QM and QM's result reaches Antigravi
 });
 
 test("Antigravity fails closed on a tool QM does not serve, reports its exit, and refuses a turn without the instance login", async () => {
-  const pids: number[] = [];
-  const connection = createAntigravityConnection(fakeAntigravity("foreign", pids));
+  const children: ChildProcess[] = [];
+  const connection = createAntigravityConnection(fakeAntigravity("foreign", children));
   const failed = await ask(connection, [user]).result();
   assert.equal(failed.stopReason, "error");
   assert.match(failed.errorMessage!, /read_file, which is not a tool QM serves/);
   await connection.close();
-  assert.ok(gone(pids[0]!), "QM killed the Antigravity process");
+  assert.ok(!processAlive(children[0]), "QM killed the Antigravity process");
 
   const died = await ask(createAntigravityConnection(fakeAntigravity("die")), [user]).result();
   assert.match(died.errorMessage!, /Antigravity exited with code 7 before the turn finished/);
@@ -72,14 +65,33 @@ test("Antigravity fails closed on a tool QM does not serve, reports its exit, an
   assert.match(refused.errorMessage!, /needs this instance's Antigravity login/);
 });
 
+test("Antigravity's own stops reach QM with their cause and the category QM routes on", async () => {
+  const outcome = async (launch: Parameters<typeof createAntigravityConnection>[0]) => {
+    const failed = await ask(createAntigravityConnection(launch), [user]).result();
+    return { stopReason: failed.stopReason, message: failed.errorMessage, code: providerTurnError(failed).code };
+  };
+  assert.deepEqual(await outcome(fakeAntigravity("refusal")), {
+    stopReason: "error",
+    message: "The model declined to continue (refusal)",
+    code: "refusal",
+  });
+  assert.equal((await outcome(fakeAntigravity("cancelled"))).stopReason, "error");
+  assert.ok((await outcome(fakeAntigravity("quota"))).message?.includes("daily quota reached"));
+  const unlaunchable = await outcome(() => {
+    throw new Error("the profile directory is missing");
+  });
+  assert.equal(unlaunchable.code, "model_unavailable");
+  assert.ok(unlaunchable.message?.includes("the profile directory is missing"));
+});
+
 test("aborting the run kills Antigravity", async () => {
-  const pids: number[] = [];
-  const connection = createAntigravityConnection(fakeAntigravity("hang", pids));
+  const children: ChildProcess[] = [];
+  const connection = createAntigravityConnection(fakeAntigravity("hang", children));
   const controller = new AbortController();
   const stream = ask(connection, [user], controller.signal);
   for await (const event of stream) if (event.type === "text_delta") controller.abort();
   const aborted: AssistantMessage = await stream.result();
   assert.equal(aborted.stopReason, "aborted");
   await connection.close();
-  assert.ok(gone(pids[0]!), "no Antigravity process outlives the aborted run");
+  assert.ok(!processAlive(children[0]), "no Antigravity process outlives the aborted run");
 });

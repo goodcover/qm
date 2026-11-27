@@ -46,18 +46,20 @@ import { hashId } from "../util/crypto.ts";
 import { errMessage, swallow } from "../util/errors.ts";
 import { isClaudeSubscriptionToken } from "./claude-subscription.ts";
 import {
-  answersToolCalls,
+  afterLastAssistant,
+  continues,
   failStep,
   finishStep,
   HarnessFailure,
   harnessOutput,
-  closeOnce,
   harnessSlot,
+  holdFailure,
   mcpResult,
   qmToolServer,
   refuseUnsent,
   RESUMED_AT_TOOL_RESULTS,
   startStep,
+  trackProcess,
   type ServedTool,
 } from "./harness.ts";
 import { applyThinkingBinding, withRequestHeaders, zeroUsage } from "./model-runtime.ts";
@@ -186,19 +188,18 @@ interface Live {
   waiting: Map<string, (result: CallToolResult) => void>;
   ready: Map<string, CallToolResult>;
   step?: Step;
-  awaiting: string[];
+  handedOut: string[];
   failure?: Error;
   apiError?: { kind: SDKAssistantMessageError; text: string };
   authError?: string;
   child?: ChildProcess;
-  exited: Promise<void>;
-  markExited: () => void;
+  exited?: Promise<unknown>;
   dir: string;
   session: string;
   toolChoice: WireToolChoice | undefined;
   closing?: Promise<void>;
   closed: boolean;
-  finished: boolean;
+  done: boolean;
 }
 
 interface ClaudeCodeConnection {
@@ -574,14 +575,14 @@ function onStreamEvent(live: Live, event: Record<string, unknown> & { type: stri
       return;
     }
     if (output.stopReason === "length") {
-      live.finished = true;
+      live.done = true;
       live.input.end();
       live.child?.kill("SIGKILL");
       endStep(live, "length");
       return;
     }
     if (step.calls.length) {
-      live.awaiting = step.calls;
+      live.handedOut = step.calls;
       endStep(live, "toolUse");
     }
   }
@@ -597,19 +598,14 @@ function apiFailure(live: Live, text: string, status: number | null | undefined)
 }
 
 function stop(live: Live): void {
-  if (live.finished) return;
+  if (live.done) return;
   live.abort.abort();
   live.child?.kill("SIGKILL");
 }
 
 function fail(live: Live, error: Error): void {
   stop(live);
-  if (live.failure) swallow("claude-code: later failure", error);
-  else live.failure = error;
-  const step = live.step;
-  live.step = undefined;
-  if (step) failStep(step, live.failure, false);
-  else swallow("claude-code: failure held for the next step", error);
+  holdFailure("claude-code", live, error);
 }
 
 async function appliesUnconfiguredSettings(query: Query): Promise<boolean> {
@@ -697,7 +693,7 @@ function onMessage(live: Live, message: SDKMessage): void {
     return;
   }
   if (message.type === "result") {
-    live.finished = true;
+    live.done = true;
     live.input.end();
     if (message.subtype === "success" && !message.is_error) {
       endStep(live, "stop");
@@ -712,7 +708,7 @@ function onMessage(live: Live, message: SDKMessage): void {
 }
 
 function rememberAnnouncements(live: Live): void {
-  if (!live.query || !live.finished) return;
+  if (!live.query || !live.done) return;
   try {
     const latest = new Map<string, ImportAttachment["attachment"]>();
     const transcript = openSession({
@@ -737,13 +733,7 @@ function spawnTracked(live: Live) {
       stdio: ["pipe", "pipe", "pipe"],
     });
     live.child = child;
-    child.stderr.on("data", (data: Buffer) => console.error(`[claude-code] ${data.toString().trimEnd()}`));
-    child.once("exit", live.markExited);
-    child.once("error", (error) => {
-      if (error.name === "AbortError") return;
-      swallow("claude-code: the Claude Code process failed", error);
-      if (child.pid === undefined) live.markExited();
-    });
+    live.exited = trackProcess("claude-code", child);
     return child as unknown as SpawnedProcess;
   };
 }
@@ -760,7 +750,6 @@ async function teardown(live: Live, reason: string): Promise<void> {
   } catch (e) {
     swallow("claude-code: closing the query", e);
   }
-  if (!live.child) live.markExited();
   await live.exited;
   rememberAnnouncements(live);
   try {
@@ -771,7 +760,8 @@ async function teardown(live: Live, reason: string): Promise<void> {
 }
 
 function closeLive(live: Live, reason: string): Promise<void> {
-  return closeOnce(live, reason, teardown);
+  live.closing ??= teardown(live, reason);
+  return live.closing;
 }
 
 function refusalFor(token: string | undefined): HarnessFailure | undefined {
@@ -781,11 +771,6 @@ function refusalFor(token: string | undefined): HarnessFailure | undefined {
       { type: "authentication_error" },
     );
   return undefined;
-}
-
-function continues(live: Live | undefined, messages: readonly Message[]): live is Live {
-  if (!live || live.step || !live.awaiting.length || (!live.failure && (live.closed || live.finished))) return false;
-  return answersToolCalls(messages, live.awaiting);
 }
 
 export function createClaudeCodeConnection(): ClaudeCodeConnection {
@@ -798,12 +783,12 @@ export function createClaudeCodeConnection(): ClaudeCodeConnection {
     messages: readonly Message[],
     signal: AbortSignal | undefined,
   ) => {
-    target.awaiting = [];
+    target.handedOut = [];
     if (target.failure) {
       failStep(step, target.failure, false);
       return;
     }
-    const tail = messages.slice(messages.findLastIndex((message) => message.role === "assistant") + 1);
+    const tail = afterLastAssistant(messages);
     target.step = step;
     slot.bindAbort(target, signal);
     const steer = lastUserBlocks(request.messages).filter((block) => block.type !== "tool_result");
@@ -829,8 +814,6 @@ export function createClaudeCodeConnection(): ClaudeCodeConnection {
     const work = realpathSync(WORK_DIR);
     const sdk = await import("@anthropic-ai/claude-agent-sdk");
     const dir = realpathSync(mkdtempSync(join(tmpdir(), "qm-claude-code-")));
-    let markExited!: () => void;
-    const exited = new Promise<void>((resolve) => (markExited = resolve));
     const target: Live = {
       abort: new AbortController(),
       model,
@@ -842,14 +825,12 @@ export function createClaudeCodeConnection(): ClaudeCodeConnection {
       waiting: new Map(),
       ready: new Map(),
       step,
-      awaiting: [],
-      exited,
-      markExited,
+      handedOut: [],
       dir,
       session: randomUUID(),
       toolChoice: request.tool_choice,
       closed: false,
-      finished: false,
+      done: false,
     };
     slot.adopt(target);
     slot.bindAbort(target, streamOptions?.signal);
@@ -901,13 +882,13 @@ export function createClaudeCodeConnection(): ClaudeCodeConnection {
         onMessage(target, message);
         if (target.failure) break;
       }
-      if (!target.closed && !target.finished && !target.failure)
+      if (!target.closed && !target.done && !target.failure)
         throw apiFailure(target, "Claude Code ended without a result", undefined);
     } catch (error) {
-      if (target.closed || target.finished) swallow("claude-code: error after the query ended", error);
+      if (target.closed || target.done) swallow("claude-code: error after the query ended", error);
       else fail(target, error instanceof HarnessFailure ? error : apiFailure(target, errMessage(error), undefined));
     } finally {
-      if (target.failure || target.finished) await closeLive(target, "The Claude Code query ended");
+      if (target.failure || target.done) await closeLive(target, "The Claude Code query ended");
     }
   };
 

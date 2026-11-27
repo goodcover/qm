@@ -520,6 +520,16 @@ test("surface-config reports company ChatGPT OAuth without making it a Pi API cr
   }
 });
 
+test("surface-config counts the instance Antigravity login as a configured model provider", async () => {
+  const srv = start({ antigravityProfile: "/srv/agy-profile" });
+  try {
+    const surface = await fetch(`${srv.base}/v1/surface-config`);
+    assert.equal(((await surface.json()) as { modelProviderConfigured?: boolean }).modelProviderConfigured, true);
+  } finally {
+    await srv.close();
+  }
+});
+
 test("a Claude subscription token is reported as company subscription auth", async () => {
   const srv = start({ anthropicApiKey: "sk-ant-oat-test" });
   try {

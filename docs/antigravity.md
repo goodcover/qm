@@ -9,7 +9,7 @@ A QM instance can serve Gemini through Google's Antigravity CLI (`agy`), the way
 3. Sign in once into a dedicated profile directory, for example by running `agy acp --disable-telemetry --login` inside bubblewrap with `HOME` set to that directory. Don't use the profile interactively; its own history is visible to agy, though not to the model. It must be owned by the core user, mode `700`, and not a symbolic link.
 4. Start core with `ANTIGRAVITY_PROFILE` set to that directory's absolute path.
 
-Gemini 4 Neon (`antigravity/gemini-4-neon`) then appears wherever company models do. The organization's model allowlist and defaults apply as for any other company model, and the default model does not change. People on a personal AI account do not get it. The inner browser agent refuses it, as it refuses Claude subscription access.
+Gemini 4 Neon (`antigravity/gemini-4-neon`) then appears wherever company models do. The organization's model allowlist and defaults apply as for any other company model, and the default model does not change. People on a personal AI account do not get it. The inner browser agent can't use it: browser requests force a tool choice, which the Antigravity route can't send, so they fail before Antigravity starts.
 
 QM never reads, copies or stores the login. It mounts the profile read-only.
 
