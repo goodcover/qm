@@ -8,13 +8,8 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import {
   createAssistantMessageEventStream,
-  type Api,
-  type AssistantMessageEventStream,
-  type Context,
   type ImageContent,
   type Message,
-  type Model,
-  type SimpleStreamOptions,
   type TextContent,
   type ToolCall,
   type Usage,
@@ -38,20 +33,32 @@ import {
   holdFailure,
   mcpResult,
   qmToolServer,
+  refusalFailure,
   refuseUnsent,
   RESUMED_AT_TOOL_RESULTS,
+  servedTools,
   startStep,
+  trackProcess,
+  type HarnessConnection,
   type HarnessLive,
   type HarnessStep,
   type ServedTool,
 } from "./harness.ts";
-import { antigravityServedModelId } from "./pi-models.ts";
 import { zeroUsage } from "./model-runtime.ts";
 
 const AGY_TOOL_PREFIX = `mcp_${ANTIGRAVITY_MCP_SERVER}_`;
 const ALWAYS_LOAD = "antigravity/alwaysLoad";
 const SENT_FIELDS = new Set(["model", "thought_level", "system", "messages", "tools"]);
-const AUTH_REQUIRED = acp.RequestError.authRequired().code;
+const ACP_ERROR_TYPES = new Map<number, string>([
+  [acp.RequestError.authRequired().code, "authentication_error"],
+  [acp.RequestError.parseError().code, "invalid_request_error"],
+  [acp.RequestError.invalidRequest().code, "invalid_request_error"],
+  [acp.RequestError.methodNotFound("").code, "invalid_request_error"],
+  [acp.RequestError.invalidParams().code, "invalid_request_error"],
+  [acp.RequestError.resourceNotFound().code, "not_found_error"],
+  [acp.RequestError.internalError().code, "api_error"],
+  [acp.RequestError.requestCancelled().code, "api_error"],
+]);
 
 interface AntigravityRequest {
   model: string;
@@ -74,6 +81,7 @@ interface Step extends HarnessStep {
 
 interface Live extends HarnessLive<Step> {
   proc: AntigravityProcess;
+  exited: Promise<string>;
   http: Server;
   served: Set<string>;
   started: Set<string>;
@@ -132,11 +140,6 @@ function endStep(live: Live, reason: "stop" | "length" | "toolUse"): void {
   finishStep(step, reason);
 }
 
-function abandon(step: Step, error: Error, aborted: boolean): void {
-  closeBlock(step);
-  failStep(step, error, aborted);
-}
-
 function handOut(live: Live): void {
   const step = live.step;
   if (!step || !live.queued.length) return;
@@ -165,7 +168,7 @@ async function teardown(live: Live, reason: string): Promise<void> {
   live.closed = true;
   const step = live.step;
   live.step = undefined;
-  if (step) abandon(step, new Error(reason), true);
+  if (step) failStep(step, new Error(reason), true);
   settleAll(live, reason);
   live.connection?.close();
   live.http.closeAllConnections();
@@ -173,7 +176,7 @@ async function teardown(live: Live, reason: string): Promise<void> {
   if (live.done) live.proc.child.stdin.end();
   else {
     live.proc.child.kill("SIGKILL");
-    await live.proc.exited;
+    await live.exited;
   }
 }
 
@@ -184,7 +187,7 @@ function closeLive(live: Live, reason: string): Promise<void> {
 
 function fail(live: Live, error: Error): void {
   if (live.closed) return swallow("antigravity: failure after the turn closed", error);
-  holdFailure("antigravity", live, error, (step, failure) => abandon(step, failure, false));
+  holdFailure("antigravity", live, error);
   void closeLive(live, errMessage(live.failure));
 }
 
@@ -192,7 +195,7 @@ function acpFailure(error: unknown): Error {
   if (error instanceof HarnessFailure) return error;
   if (error instanceof acp.RequestError)
     return new HarnessFailure(`Antigravity: ${error.message}${detailOf(error.data)}`, {
-      type: error.code === AUTH_REQUIRED ? "authentication_error" : "api_error",
+      type: ACP_ERROR_TYPES.get(error.code) ?? "api_error",
       code: String(error.code),
       ...(error.data === undefined ? {} : { body: error.data }),
     });
@@ -213,7 +216,7 @@ function foreignTool(toolCall: acp.ToolCallUpdate): HarnessFailure {
   const named = (toolCall as { name?: unknown }).name;
   return new HarnessFailure(
     `Antigravity started ${String(named ?? toolCall.title ?? toolCall.toolCallId)}, which is not a tool QM serves; QM stopped the turn`,
-    { type: "permission_error", code: "foreign_tool" },
+    { type: "invalid_request_error", code: "foreign_tool" },
   );
 }
 
@@ -239,18 +242,12 @@ function callTool(live: Live, name: string, args: Record<string, unknown>): Prom
 }
 
 function toolServer(live: Live, tools: readonly ServedTool[], secret: string) {
-  const listed = tools.map((tool) => ({
-    name: tool.name,
-    description: tool.description,
-    inputSchema: tool.input_schema,
-    _meta: { [ALWAYS_LOAD]: true },
-  }));
   return async (req: IncomingMessage, res: ServerResponse) => {
     if (!constantTimeEqual(req.headers.authorization ?? "", `Bearer ${secret}`)) {
       res.writeHead(401).end();
       return;
     }
-    const server = qmToolServer(ANTIGRAVITY_MCP_SERVER, listed, (request) =>
+    const server = qmToolServer(ANTIGRAVITY_MCP_SERVER, tools, { [ALWAYS_LOAD]: true }, (request) =>
       callTool(live, request.params.name, request.params.arguments ?? {}),
     );
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
@@ -366,20 +363,28 @@ function finish(live: Live, response: acp.PromptResponse): void {
     void closeLive(live, "Antigravity ended the prompt before QM answered its tool calls");
     return;
   }
-  if (response.stopReason === "end_turn") endStep(live, "stop");
-  else if (response.stopReason === "max_tokens") endStep(live, "length");
-  else {
-    live.step = undefined;
-    const refusal = response.stopReason === "refusal";
-    if (refusal) step.output.rawStopReason = "refusal";
-    abandon(
-      step,
-      new HarnessFailure(
-        refusal ? "The model declined to continue (refusal)" : `Antigravity stopped the prompt: ${response.stopReason}`,
-        { type: refusal ? "refusal" : "api_error", code: response.stopReason },
-      ),
-      false,
-    );
+  switch (response.stopReason) {
+    case "end_turn":
+      endStep(live, "stop");
+      break;
+    case "max_tokens":
+      endStep(live, "length");
+      break;
+    case "refusal":
+      live.step = undefined;
+      failStep(step, refusalFailure(step), false);
+      break;
+    case "max_turn_requests":
+    case "cancelled":
+      live.step = undefined;
+      failStep(
+        step,
+        new HarnessFailure(`Antigravity stopped the prompt: ${response.stopReason}`, {
+          type: "api_error",
+          code: response.stopReason,
+        }),
+        false,
+      );
   }
   void closeLive(live, "The Antigravity prompt ended");
 }
@@ -398,24 +403,19 @@ function clientApp(live: Live) {
           ? foreignTool(params.toolCall)
           : new HarnessFailure(
               `Antigravity asked to run ${String((params.toolCall as { name?: unknown }).name)} without a one-time approval option (offered: ${params.options.map((option) => option.kind).join(", ")}); QM stopped the turn`,
-              { type: "permission_error", code: "no_allow_once" },
+              { type: "invalid_request_error", code: "no_allow_once" },
             ),
       );
       return { outcome: { outcome: "cancelled" } };
     });
 }
 
-interface AntigravityConnection {
-  streamSimple(model: Model<Api>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream;
-  close(): Promise<void>;
-}
-
-export function createAntigravityConnection(launch = launchAntigravity): AntigravityConnection {
+export function createAntigravityConnection(profile: string, launch = launchAntigravity): HarnessConnection {
   const slot = harnessSlot<Live>("antigravity", closeLive, fail);
 
   const attach = (target: Live, step: Step, messages: readonly Message[], signal: AbortSignal | undefined) => {
     target.handedOut = [];
-    if (target.failure) return abandon(step, target.failure, false);
+    if (target.failure) return failStep(step, target.failure, false);
     target.step = step;
     step.output.usage = target.unbilled;
     target.unbilled = zeroUsage();
@@ -440,14 +440,9 @@ export function createAntigravityConnection(launch = launchAntigravity): Antigra
     handOut(target);
   };
 
-  const start = async (
-    request: AntigravityRequest,
-    profile: string,
-    step: Step,
-    signal: AbortSignal | undefined,
-  ): Promise<void> => {
+  const start = async (request: AntigravityRequest, step: Step, signal: AbortSignal | undefined): Promise<void> => {
     await slot.supersede();
-    if (slot.closed) return abandon(step, new Error("QM ended the turn"), true);
+    if (slot.closed) return failStep(step, new Error("QM ended the turn"), true);
     let proc: AntigravityProcess;
     try {
       proc = launch(profile);
@@ -459,6 +454,7 @@ export function createAntigravityConnection(launch = launchAntigravity): Antigra
     const secret = randomBytes(32).toString("base64url");
     const target: Live = {
       proc,
+      exited: trackProcess("antigravity", proc.child, proc.cleanup),
       http: createServer(),
       served: new Set(request.tools.map((tool) => tool.name)),
       started: new Set(request.tools.map((tool) => AGY_TOOL_PREFIX + tool.name)),
@@ -474,13 +470,13 @@ export function createAntigravityConnection(launch = launchAntigravity): Antigra
     };
     slot.adopt(target);
     target.http.on("request", toolServer(target, request.tools, secret));
-    void proc.exited.then(({ started, how }) => {
+    void target.exited.then((how) => {
       if (target.closed || target.done) return;
       const reason = target.dropped === undefined ? "" : ` (${errMessage(target.dropped)})`;
       fail(
         target,
         new HarnessFailure(`Antigravity ${how} before the turn finished${reason}`, {
-          type: started ? "api_error" : "model_unavailable",
+          type: target.sessionId === undefined ? "model_unavailable" : "api_error",
         }),
       );
     });
@@ -531,33 +527,23 @@ export function createAntigravityConnection(launch = launchAntigravity): Antigra
     streamSimple(model, context, options) {
       const stream = createAssistantMessageEventStream();
       const step: Step = { stream, output: harnessOutput(model), started: false };
-      const profile = options?.apiKey;
-      const refusal = profile
-        ? undefined
-        : new HarnessFailure("The Antigravity route needs this instance's Antigravity login", {
-            type: "authentication_error",
-          });
       slot.run(
         step,
-        refusal,
+        undefined,
         async () => {
           const messages = context.messages;
           const current = slot.current;
           if (continues(current, messages)) return attach(current, step, messages, options?.signal);
           const thought = options?.reasoning ? model.thinkingLevelMap?.[options.reasoning] : undefined;
           const request: AntigravityRequest = {
-            model: antigravityServedModelId(model.id),
+            model: model.id,
             ...(thought ? { thought_level: thought } : {}),
             system: context.systemPrompt ?? "",
             messages: [{ role: "user", content: promptBlocks(messages) }],
-            tools: (context.tools ?? []).map((tool) => ({
-              name: tool.name,
-              description: tool.description,
-              input_schema: tool.parameters,
-            })),
+            tools: servedTools(context.tools),
           };
           const shaped = await options?.onPayload?.(request, model);
-          await start(sendable(shaped === undefined ? request : shaped), profile!, step, options?.signal);
+          await start(sendable(shaped === undefined ? request : shaped), step, options?.signal);
         },
         acpFailure,
       );

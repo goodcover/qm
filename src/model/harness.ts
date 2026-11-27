@@ -9,9 +9,11 @@ import type {
   Api,
   AssistantMessage,
   AssistantMessageEventStream,
+  Context,
   Message,
   Model,
   ProviderErrorInfo,
+  SimpleStreamOptions,
   ToolResultMessage,
 } from "@earendil-works/pi-ai";
 import type { ChildProcess } from "node:child_process";
@@ -90,40 +92,48 @@ export function refuseUnsent(label: string, unsent: readonly string[]): void {
     });
 }
 
-export function holdFailure<S extends HarnessStep>(
-  label: string,
-  live: HarnessLive<S>,
-  error: Error,
-  end: (step: S, failure: Error) => void = (step, failure) => failStep(step, failure, false),
-): void {
+export function holdFailure(label: string, live: HarnessLive, error: Error): void {
   if (live.failure) swallow(`${label}: later failure`, error);
   else live.failure = error;
   const step = live.step;
   live.step = undefined;
-  if (step) end(step, live.failure);
+  if (step) failStep(step, live.failure, false);
   else swallow(`${label}: failure held for the next step`, error);
 }
 
-export interface ProcessExit {
-  started: boolean;
-  how: string;
+export function refusalFailure(step: HarnessStep): HarnessFailure {
+  step.output.rawStopReason = "refusal";
+  return new HarnessFailure("The model declined to continue (refusal)", { type: "refusal" });
+}
+
+export interface HarnessConnection {
+  streamSimple(model: Model<Api>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream;
+  close(): Promise<void>;
+}
+
+export function servedTools(tools: Context["tools"], prefix = ""): ServedTool[] {
+  return (tools ?? []).map((tool) => ({
+    name: prefix + tool.name,
+    description: tool.description,
+    input_schema: tool.parameters,
+  }));
 }
 
 export function trackProcess(
   label: string,
   child: ChildProcess,
   cleanup: () => void = () => undefined,
-): Promise<ProcessExit> {
+): Promise<string> {
   child.stderr?.on("data", (data: Buffer) => console.error(`[${label}] ${data.toString().trimEnd()}`));
-  return new Promise<ProcessExit>((resolve) => {
-    const done = (started: boolean, how: string) => {
+  return new Promise<string>((resolve) => {
+    const done = (how: string) => {
       cleanup();
-      resolve({ started, how });
+      resolve(how);
     };
-    child.once("exit", (code, signal) => done(true, signal ? `was killed by ${signal}` : `exited with code ${code}`));
+    child.once("exit", (code, signal) => done(signal ? `was killed by ${signal}` : `exited with code ${code}`));
     child.once("error", (error) => {
-      if (child.pid === undefined) done(false, `could not start: ${errMessage(error)}`);
-      else if (error.name !== "AbortError") swallow(`${label}: the process reported an error`, error);
+      if (error.name !== "AbortError") swallow(`${label}: the process failed`, error);
+      if (child.pid === undefined) done(`could not start: ${errMessage(error)}`);
     });
   });
 }
@@ -212,12 +222,19 @@ export function mcpResult(result: ToolResultMessage): CallToolResult {
 
 export function qmToolServer(
   name: string,
-  tools: ReadonlyArray<{ name: string; description: string; inputSchema: unknown; _meta: Record<string, unknown> }>,
+  tools: readonly ServedTool[],
+  meta: Record<string, unknown>,
   call: (request: CallToolRequest) => CallToolResult | Promise<CallToolResult>,
+  prefix = "",
 ): McpServer {
   const server = new McpServer({ name, version: "1.0.0" }, { capabilities: { tools: {} } });
   server.server.setRequestHandler(ListToolsRequestSchema, () => ({
-    tools: tools.map((tool) => ({ ...tool, inputSchema: tool.inputSchema as { type: "object" } })),
+    tools: tools.map((tool) => ({
+      name: tool.name.slice(prefix.length),
+      description: tool.description,
+      inputSchema: tool.input_schema as { type: "object" },
+      _meta: meta,
+    })),
   }));
   server.server.setRequestHandler(CallToolRequestSchema, call);
   return server;

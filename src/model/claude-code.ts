@@ -28,7 +28,6 @@ import {
   EventStream,
   parseStreamingJson,
   type Api,
-  type AssistantMessage,
   type AssistantMessageEventStream,
   type CacheRetention,
   type Context,
@@ -54,6 +53,11 @@ import {
   harnessOutput,
   harnessSlot,
   holdFailure,
+  refusalFailure,
+  servedTools,
+  type HarnessConnection,
+  type HarnessLive,
+  type HarnessStep,
   mcpResult,
   qmToolServer,
   refuseUnsent,
@@ -168,10 +172,7 @@ const SENT_FIELDS: Record<keyof ClaudeCodeRequest, true> = {
   tool_choice: true,
 };
 
-interface Step {
-  stream: AssistantMessageEventStream;
-  output: AssistantMessage;
-  started: boolean;
+interface Step extends HarnessStep {
   open: Map<number, number>;
   json: Map<number, string>;
   calls: string[];
@@ -179,7 +180,7 @@ interface Step {
   current: Usage;
 }
 
-interface Live {
+interface Live extends HarnessLive<Step> {
   query?: Query;
   abort: AbortController;
   model: Model<Api>;
@@ -187,9 +188,6 @@ interface Live {
   served: Map<string, string>;
   waiting: Map<string, (result: CallToolResult) => void>;
   ready: Map<string, CallToolResult>;
-  step?: Step;
-  handedOut: string[];
-  failure?: Error;
   apiError?: { kind: SDKAssistantMessageError; text: string };
   authError?: string;
   child?: ChildProcess;
@@ -197,14 +195,6 @@ interface Live {
   dir: string;
   session: string;
   toolChoice: WireToolChoice | undefined;
-  closing?: Promise<void>;
-  closed: boolean;
-  done: boolean;
-}
-
-interface ClaudeCodeConnection {
-  streamSimple(model: Model<Api>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream;
-  close(): Promise<void>;
 }
 
 function newStep(stream: AssistantMessageEventStream, model: Model<Api>): Step {
@@ -342,24 +332,24 @@ function unservable(tools: readonly ServedTool[]): string[] {
 }
 
 function toolServer(tools: readonly ServedTool[], live: Live) {
-  const listed = tools.map((tool) => ({
-    name: tool.name.slice(TOOL_PREFIX.length),
-    description: tool.description,
-    inputSchema: tool.input_schema,
-    _meta: { [RESULT_SIZE_META]: MAX_TOOL_RESULT_CHARS },
-  }));
-  const server = qmToolServer(SERVER, listed, (request) => {
-    const id = request.params._meta?.[TOOL_USE_ID];
-    if (!live.served.has(TOOL_PREFIX + request.params.name))
-      throw new Error(`QM does not serve a tool named ${request.params.name}`);
-    if (typeof id !== "string") throw new Error(`${request.params.name}: tools/call is missing its tool_use id`);
-    const ready = live.ready.get(id);
-    if (ready) {
-      live.ready.delete(id);
-      return ready;
-    }
-    return new Promise<CallToolResult>((resolve) => live.waiting.set(id, resolve));
-  });
+  const server = qmToolServer(
+    SERVER,
+    tools,
+    { [RESULT_SIZE_META]: MAX_TOOL_RESULT_CHARS },
+    (request) => {
+      const id = request.params._meta?.[TOOL_USE_ID];
+      if (!live.served.has(TOOL_PREFIX + request.params.name))
+        throw new Error(`QM does not serve a tool named ${request.params.name}`);
+      if (typeof id !== "string") throw new Error(`${request.params.name}: tools/call is missing its tool_use id`);
+      const ready = live.ready.get(id);
+      if (ready) {
+        live.ready.delete(id);
+        return ready;
+      }
+      return new Promise<CallToolResult>((resolve) => live.waiting.set(id, resolve));
+    },
+    TOOL_PREFIX,
+  );
   return { type: "sdk" as const, name: SERVER, instance: server };
 }
 
@@ -571,7 +561,7 @@ function onStreamEvent(live: Live, event: Record<string, unknown> & { type: stri
     step.current = zeroUsage();
     if (output.rawStopReason === "refusal") {
       live.step = undefined;
-      failStep(step, new HarnessFailure("The model declined to continue (refusal)", { type: "refusal" }), false);
+      failStep(step, refusalFailure(step), false);
       return;
     }
     if (output.stopReason === "length") {
@@ -773,7 +763,7 @@ function refusalFor(token: string | undefined): HarnessFailure | undefined {
   return undefined;
 }
 
-export function createClaudeCodeConnection(): ClaudeCodeConnection {
+export function createClaudeCodeConnection(): HarnessConnection {
   const slot = harnessSlot<Live>("claude-code", closeLive, fail);
 
   const attach = (
@@ -903,11 +893,7 @@ export function createClaudeCodeConnection(): ClaudeCodeConnection {
           model: model.id,
           system: (context.systemPrompt ?? "").toWellFormed(),
           messages: claudeCodeTranscript(messages),
-          tools: (context.tools ?? []).map((tool) => ({
-            name: TOOL_PREFIX + tool.name,
-            description: tool.description,
-            input_schema: tool.parameters,
-          })),
+          tools: servedTools(context.tools, TOOL_PREFIX),
           ...thinkingFor(model, context, options),
         };
         const continuing = continues(slot.current, messages) ? slot.current : undefined;

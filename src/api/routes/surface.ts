@@ -29,6 +29,7 @@ import {
   modelOfferedInWebui,
   thinkingLevelsFor,
   fastModeModelIds,
+  serviceableModelIds,
 } from "../../model/pi-models.ts";
 import { builtInModelCatalog, selectableCatalog, selectableModelCatalog } from "../../model/model-catalog.ts";
 import { errMessage } from "../../util/errors.ts";
@@ -1261,14 +1262,10 @@ async function getSurfaceConfig(ctx: ApiCtx): Promise<void> {
     webuiModels: webuiModels != null ? configuredPicker : allowed,
     baseModel: resolvedBase,
     ...(providerStatus && {
-      modelProviderConfigured: Boolean(
-        providerStatus.anthropic ||
-        providerStatus.openai ||
-        providerStatus.openrouter ||
-        providerStatus.antigravity ||
-        providerStatus.modelIds?.size ||
-        deps.companySubscriptionAuth,
-      ),
+      modelProviderConfigured:
+        Boolean(deps.companySubscriptionAuth) ||
+        serviceableModelIds([...catalog.map((model) => model.id), ...(providerStatus.modelIds ?? [])], providerStatus)
+          .length > 0,
     }),
     externalSlackParticipants,
     ...(Object.keys(resolvedBranding).length ? { branding: resolvedBranding } : {}),

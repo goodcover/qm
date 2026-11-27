@@ -2,7 +2,6 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { lstatSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { trackProcess, type ProcessExit } from "./harness.ts";
 
 export const ANTIGRAVITY_MCP_SERVER = "qm";
 export const ANTIGRAVITY_WORKSPACE = "/work";
@@ -28,7 +27,7 @@ Use only the tools QM serves.
 
 export interface AntigravityProcess {
   child: ChildProcessWithoutNullStreams;
-  exited: Promise<ProcessExit>;
+  cleanup: () => void;
 }
 
 function assertOwnerOnlyProfile(profile: string): void {
@@ -94,8 +93,5 @@ export function launchAntigravity(profile: string): AntigravityProcess {
     [...boundaryArgs(cli, profile, workspace), "--", "/bin/agy", "acp", "--disable-telemetry", "--agent", AGENT],
     { stdio: ["pipe", "pipe", "pipe"] },
   );
-  return {
-    child,
-    exited: trackProcess("antigravity", child, () => rmSync(workspace, { recursive: true, force: true })),
-  };
+  return { child, cleanup: () => rmSync(workspace, { recursive: true, force: true }) };
 }

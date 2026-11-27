@@ -224,10 +224,6 @@ export function modelRequestOverrides(id: string): ModelEntry["request"] {
 
 const ANTIGRAVITY_PREFIX = `${ANTIGRAVITY_PROVIDER}/`;
 
-export function antigravityServedModelId(id: string): string {
-  return id.slice(ANTIGRAVITY_PREFIX.length);
-}
-
 function antigravityModel(id: string): PiModel | undefined {
   const entry = id.startsWith(ANTIGRAVITY_PREFIX) ? REGISTRY_BY_ID.get(id) : undefined;
   return entry

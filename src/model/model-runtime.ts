@@ -140,7 +140,8 @@ export async function buildModelRuntime(
   const modelsPath = customModelsPath();
   const runtime = await ModelRuntime.create({ credentials, modelsPath });
   const claudeCode = createClaudeCodeConnection();
-  const antigravity = apiKeys[ANTIGRAVITY_PROVIDER] ? createAntigravityConnection() : undefined;
+  const antigravityProfile = apiKeys[ANTIGRAVITY_PROVIDER];
+  const antigravity = antigravityProfile ? createAntigravityConnection(antigravityProfile) : undefined;
   if (antigravity)
     runtime.registerProvider(ANTIGRAVITY_PROVIDER, {
       api: ANTIGRAVITY_PROVIDER,

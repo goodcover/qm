@@ -4,7 +4,7 @@ export default {
   $schema: "https://unpkg.com/knip@6/schema.json",
   treatConfigHintsAsErrors: true,
   ignoreUnresolved: existsSync("/usr/bin/mount") ? [] : ["/usr/bin/mount"],
-  ignoreBinaries: ["tail", "cloudflared", "litestream"],
+  ignoreBinaries: ["tail", "cloudflared", "litestream", "bwrap"],
   ignoreIssues: {
     "scripts/migrate-principals-to-email.d.mts": ["files"],
     "src/slack/lib.ts": ["exports", "types"],

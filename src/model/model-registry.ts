@@ -7,7 +7,7 @@ export interface ModelEntry {
   buttonLabel?: string;
   base: boolean;
   auxiliary?: boolean;
-  request?: { model: string; service_tier: "ultrafast" };
+  request?: { model: string; service_tier?: "ultrafast" };
   clone?: {
     template: string;
     input: number;
@@ -318,7 +318,13 @@ export const MODEL_REGISTRY: readonly ModelEntry[] = [
     },
   },
   { id: "openrouter/auto", name: "OpenRouter Auto", fastMode: false, base: true },
-  { id: "antigravity/gemini-4-neon", name: "Gemini 4 Neon", fastMode: false, base: true },
+  {
+    id: "antigravity/gemini-4-neon",
+    name: "Gemini 4 Neon",
+    fastMode: false,
+    base: true,
+    request: { model: "gemini-4-neon" },
+  },
   { id: "claude-opus-4-7", name: "Claude Opus 4.7", fastMode: false, base: false },
   { id: "claude-opus-4-6", name: "Claude Opus 4.6", fastMode: false, base: false },
 ];
